@@ -23,7 +23,7 @@ import { mkdir, rename, rm, writeFile } from 'node:fs/promises'
 import { hostname } from 'node:os'
 import { dirname, join } from 'node:path'
 
-import { STORE_DIRNAME, workspaceKey } from './store.js'
+import { dataDir, workspaceKey } from './store.js'
 
 /** Directory under the store root that holds dispatch checkpoints. */
 export const DISPATCH_DIRNAME = 'dispatches'
@@ -35,7 +35,7 @@ export const DISPATCH_DIRNAME = 'dispatches'
  * space can never escape the store directory.
  */
 export function dispatchCheckpointPath(homeDir, workerSessionId) {
-  return join(homeDir, STORE_DIRNAME, DISPATCH_DIRNAME, `${workspaceKey(workerSessionId)}.json`)
+  return join(dataDir(homeDir), DISPATCH_DIRNAME, `${workspaceKey(workerSessionId)}.json`)
 }
 
 /**

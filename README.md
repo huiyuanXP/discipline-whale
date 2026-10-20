@@ -10,6 +10,16 @@ DSH 里已经有 `subagent`（同一会话内的子代理）和 `dsh-webhook`（
 
 这个插件补的就是这条线，并且把「必须回报」做成结构性约束而不是提示词自觉。
 
+## 侧边栏入口
+
+自律鲸鱼在 Web 左侧边栏有一个独立入口「自律鲸鱼」，位于「上下文洞察」正上方，和「插件 / 自动化任务 / 上下文洞察 / 记忆」同级。点进去直接打开鲸鱼的**主会话**。
+
+主会话的工作目录是鲸鱼自己的 home：`$DSH_HOME/discipline-whale/home`。它是插件的后台目录，不注册成工作区，也不出现在工作区列表里；鲸鱼工作中产生的文件写在这里。
+
+- 插件启动时（profile 级的 `discipline-whale` 行，即 `home.js`）创建 home，并提供接口 `/api/discipline-whale/home`：`GET` 返回 home 路径和主会话 id，`POST` 新建主会话
+- 主会话 id 记录在 `$DSH_HOME/discipline-whale/state.json`，换浏览器也是同一个主会话
+- 入口打开时：记录的主会话仍在且未归档就直接打开；否则由 Host 以 `discipline-whale` preset、cwd = home 新建一个，标题「自律鲸鱼」，并立即发一条**唤醒**消息（自我介绍 + `list_dispatches` 汇报）。不属于任何工作区的会话要有过一轮才能在 Web 里输入，唤醒这一轮正好满足
+
 ## 两个 preset，两种角色
 
 安装后，Web GUI 的 preset 选择器里会多出两项：
@@ -74,23 +84,29 @@ worker 每次即将结束回合时，插件会检查本轮是否调用过 `repor
 ## 安装
 
 ```bash
-# 从本地目录
-plugin_manager install_bundle  target: /absolute/path/to/discipline-whale
+# 从 GitHub
+dsh plugin --profile web add github:huiyuanXP/discipline-whale
 
-# 或 CLI
-dsh plugin --profile web add /absolute/path/to/discipline-whale
+# 从本地源码：打包成 tarball 放进 $DSH_HOME/plugins/packages 再安装
+scripts/install-local.sh          # 默认 profile: web
 ```
+
+`install-local.sh` 装进 profile 的是一份打包副本，运行中的插件不指向开发目录；源码改动后重新跑一次脚本即可。
 
 安装后**需要重启 DSH**：preset 内的插件行不受 HMR 管理（`restart-required: unmanaged-plugin`）。
 
-源码改动后的热更新：如果装了 `dsh-motion-ui` 那种 HMR 机制，本包因为以 symlink 安装、实体文件在 watch root 之外（`**/node_modules` 被忽略），**改代码不会自动重载**。切走再切回插件行无效，必须重启进程。
+## 数据目录
 
-## 回报存储
+插件的全部数据都在 `$DSH_HOME/discipline-whale/`，和其他 DSH 插件的数据目录并列：
 
 ```
-$DSH_HOME/discipline-whale/<workspaceId>/<reportId>.json     ← 报告
-$DSH_HOME/discipline-whale/dispatches/<workerSessionId>.json ← 派工检查点
+$DSH_HOME/discipline-whale/state.json                               ← 插件状态（主会话 id）
+$DSH_HOME/discipline-whale/home/                                    ← 主会话的工作目录
+$DSH_HOME/discipline-whale/reports/<workspaceId>/<reportId>.json    ← 报告
+$DSH_HOME/discipline-whale/dispatches/<workerSessionId>.json        ← 派工检查点
 ```
+以后新增的状态（自动记忆、唤醒计划等）各占一个子目录。
+
 每个报告一个 JSON 文件，原子写入（temp + rename）。损坏的文件会被列表跳过，不会拖垮整个 listing。
 
 检查点是**路由事实**（dispatchId / 主会话 id / 工作区 / 派工时间），不含任务正文——正文在 worker 会话日志里。
@@ -103,7 +119,7 @@ $DSH_HOME/discipline-whale/dispatches/<workerSessionId>.json ← 派工检查点
 node test/contract.mjs
 ```
 
-17 项契约测试，用假 Host 分别挂载两半：
+18 项契约测试，用假 Host 分别挂载两半：
 
 1. 存储往返、长度截断、路径穿越防护
 2. 主会话行注册 5 个工具，schema 在受支持子集内（遍历注册表，未列入清单的工具会直接失败）
@@ -123,6 +139,7 @@ node test/contract.mjs
 15b. 检查点写失败只加 warning，**派工照常成功**
 16. 看板能吃下 worker 侧写入的 `recoveredFrom` / `orphaned` / 脏时间戳
 17. 已投递的派工不会被后续生命周期事件「复活」成第二个检查点
+18. home 目录被创建；连点两次也只新建、唤醒、记录一个主会话（`state.json`）
 
 假 `prompt` **故意模仿真实实现**，会解引用 `signal` —— 这条强化曾抓出三个真实缺陷（信号未传、`exec` 参数缺失、dispatch 未标记已报）。
 
@@ -132,7 +149,8 @@ node test/contract.mjs
 
 ## 已知限制
 
-- **看板只有工具，没有 GUI 面板**。`list_dispatches` 是给主会话调的工具（也可靠 `present` 渲染），Web GUI 侧边栏里没有一张常驻的派工看板。要看状态还得问主会话，或在会话列表里找 worker。
+- **看板只有工具，没有 GUI 面板**。`list_dispatches` 是给主会话调的工具（也可靠 `present` 渲染）；侧边栏入口打开的是主会话，不是派工看板。要看状态还得问主会话，或在会话列表里找 worker。
+- **主会话出现在会话列表的「未分组」里**。它不属于任何工作区，DSH 把这类会话归到「未分组」；日常从侧边栏「自律鲸鱼」入口进入即可。
 - **工作区无描述字段**。路由只能靠标题/路径判断，准确性有限。
 - **派工记录跨重启靠检查点文件，不靠内存**。`dispatch_task` 会在返回前把路由事实（dispatchId / 主会话 id / 工作区）写到 `$DSH_HOME/discipline-whale/dispatches/<workerSessionId>.json`，worker 首次生命周期事件会再写一次同一路径，所以「派工返回后、worker 首个事件前」重启也不会丢。投递成功后删除该文件。仍有边界：**worker 会话被删除/归档后再报告**，检查点可能已被清理，此时退化为 orphan 路径；**检查点写失败**时派工会照常成功但只在本次进程内有效，并在结果里给出 warning。
   `list_dispatches` 看的是**进程内**注册表，重启后为空 —— 它回答「现在谁在飞」，检查点回答「重启后这条派工还能不能找回」。两者分工不同，不要互相替代。

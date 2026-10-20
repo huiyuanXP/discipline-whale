@@ -10,7 +10,7 @@
 
 ```
 node test/contract.mjs
-→ 17 项全过（含 15b）
+→ 18 项全过（含 15b）
 ```
 
 覆盖两半的挂载隔离、schema 合法性、派工、回报投递、强制回报重试与升级、重启后的检查点恢复、看板三态与脏数据。
@@ -245,15 +245,27 @@ SMOKE PASS
 
 ## 10. 交付状态
 
-- 主包 `discipline-whale` 已安装到 web profile（`link:/Users/huiyuan/Developer/test/soc-api-test/discipline-whale`）
-- `node test/contract.mjs` **17 项全过**（含 15b）
+- 主包 `discipline-whale` 以打包副本安装到 web profile（`file:$DSH_HOME/plugins/packages/discipline-whale-<version>.tgz`，由 `scripts/install-local.sh` 生成）
+- `node test/contract.mjs` **18 项全过**（含 15b）
 - **需要重启 DSH 一次**：`cordis.patch.yml` 的权限收紧和 preset 内的模块代码都要重启才在已加载的插件行上生效。**本次没有重启验证**。
+
+## 11. 侧边栏入口与 home（0.2.0）
+
+在隔离的 `DSH_HOME`（同一 web profile，独立端口 3099）上实测，dsh 0.2.1-rc.2：
+
+- 侧边栏顺序：插件 → 自动化任务 → **自律鲸鱼** → 上下文洞察 → 记忆（`order: 15`）
+- 启动后 `$DSH_HOME/discipline-whale/home` 存在；工作区注册表里**没有**它
+- 首次点入口：Host 新建会话 `agentPreset: discipline-whale`、`cwd: $DSH_HOME/discipline-whale/home`、标题「自律鲸鱼」，唤醒消息跑完一轮（模型回复了派工板状态），输入框可用；`state.json` 记录了主会话 id
+- 再次点入口：打开同一个主会话，没有新建
+- 会话出现在会话列表「未分组」下；浏览器控制台无本插件报错
+
+客户端模块只对**名字等于包名**的 loader 行注入，所以 home 行用 `name: 'discipline-whale'`，包根入口 `.` 指向 `home.js`。
 
 ## 复验命令
 
 ```bash
 cd discipline-whale
-node test/contract.mjs        # 17 项契约测试
+node test/contract.mjs        # 18 项契约测试
 node test/smoke-restart.mjs  # 模拟重启冒烟（非单测）
 ```
 

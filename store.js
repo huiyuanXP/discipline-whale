@@ -19,8 +19,14 @@ import { mkdir, readdir, readFile, rename, rm, writeFile } from 'node:fs/promise
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 
-/** Directory name under $DSH_HOME that holds every workspace's reports. */
+/** Directory name under $DSH_HOME that holds all of the plugin's data. */
 export const STORE_DIRNAME = 'discipline-whale'
+
+/** The main session's private working directory: backend storage, never a registered workspace. */
+export const HOME_DIRNAME = 'home'
+
+/** Every workspace's report folders live under this directory. */
+export const REPORTS_DIRNAME = 'reports'
 
 /** Set once a caller pins the store root, so late resolution cannot clobber it. */
 let pinnedRoot
@@ -62,9 +68,19 @@ export function workspaceKey(workspaceId) {
   return String(workspaceId).replace(/[^A-Za-z0-9._-]/g, '_')
 }
 
+/** The plugin's data directory: `$DSH_HOME/discipline-whale`. */
+export function dataDir(homeDir) {
+  return join(homeDir, STORE_DIRNAME)
+}
+
+/** The main session's private working directory: `$DSH_HOME/discipline-whale/home`. */
+export function whaleHomeDir(homeDir) {
+  return join(dataDir(homeDir), HOME_DIRNAME)
+}
+
 /** The report directory for one workspace. */
 export function reportDir(homeDir, workspaceId) {
-  return join(homeDir, STORE_DIRNAME, workspaceKey(workspaceId))
+  return join(dataDir(homeDir), REPORTS_DIRNAME, workspaceKey(workspaceId))
 }
 
 /** One report's file path. */

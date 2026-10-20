@@ -18,7 +18,7 @@
  */
 
 import assert from 'node:assert/strict'
-import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -27,6 +27,7 @@ import {
   validateJsonSchemaValue,
 } from '/Users/huiyuan/.npm/_npx/b86ed90107c62dab/node_modules/@deepseek-ai/dsh-tools/lib/index.js'
 
+import { HOME_ROUTE, MAIN_PRESET, MAIN_TITLE, WAKE_PROMPT, ensureHome, homeHandler, readState } from '../home.js'
 import * as mainRow from '../main.js'
 import * as workerRow from '../worker.js'
 import { resetRegistry } from '../registry.js'
@@ -146,7 +147,7 @@ const execAs = (sessionId) => ({ agent: { session: { id: sessionId } } })
   assert.deepEqual(await listReports(home, 'ws-unknown'), [], 'an unknown workspace lists empty')
 
   // A hand-corrupted file must not break the listing.
-  await writeFile(join(home, 'discipline-whale', 'ws-soc', 'r-broken.json'), '{not json', 'utf8')
+  await writeFile(join(home, 'discipline-whale', 'reports', 'ws-soc', 'r-broken.json'), '{not json', 'utf8')
   assert.equal((await listReports(home, 'ws-soc')).length, 1, 'corrupt file skipped, good one kept')
 
   assert.equal(await deleteReport(home, 'ws-soc', 'r-test-1'), true)
@@ -991,6 +992,57 @@ const checkpointPath = (workerSessionId) =>
     'a delivered dispatch must not be recoverable as a fresh one',
   )
   console.log('ok 17 — a delivered checkpoint is never re-created by a later lifecycle event')
+}
+
+// --- 18. the whale's home ------------------------------------------------
+
+{
+  const homePath = await ensureHome()
+  assert.equal(homePath, join(home, 'discipline-whale', 'home'))
+  assert.equal((await stat(homePath)).isDirectory(), true)
+
+  const calls = { create: [], rename: [], prompt: [] }
+  let release
+  const gate = new Promise((resolve) => {
+    release = resolve
+  })
+  const controller = {
+    create: async (request) => {
+      calls.create.push(request)
+      await gate
+      return { sessionId: `session-main-${calls.create.length}`, agentPreset: request.agentPreset }
+    },
+    rename: async (request) => {
+      calls.rename.push(request)
+      return { title: request.title }
+    },
+    prompt: async (request, signal) => {
+      assert.ok(signal instanceof AbortSignal)
+      calls.prompt.push(request)
+    },
+  }
+  const handle = homeHandler(controller)
+  const request = (method) => handle(new Request(`http://dsh${HOME_ROUTE}`, { method }))
+
+  assert.deepEqual(await (await request('GET')).json(), { home: homePath, mainSessionId: null })
+
+  // Two POSTs racing (a double click) create exactly one main session.
+  const first = request('POST')
+  const second = request('POST')
+  release()
+  const [a, b] = await Promise.all([first, second])
+  assert.deepEqual(await a.json(), { home: homePath, mainSessionId: 'session-main-1' })
+  assert.deepEqual(await b.json(), { home: homePath, mainSessionId: 'session-main-1' })
+  assert.equal(calls.create.length, 1)
+  assert.deepEqual(calls.create[0], { cwd: homePath, agentPreset: MAIN_PRESET })
+  assert.deepEqual(calls.rename[0], { sessionId: 'session-main-1', title: MAIN_TITLE })
+  assert.equal(calls.prompt.length, 1, 'a new main session is woken with its first turn')
+  assert.equal(calls.prompt[0].sessionId, 'session-main-1')
+  assert.equal(calls.prompt[0].content[0].text, WAKE_PROMPT)
+
+  assert.equal((await request('GET')).headers.get('cache-control'), 'no-store')
+  assert.deepEqual(await readState(), { mainSessionId: 'session-main-1' })
+  console.log('ok 18 — the home exists and one main session is created, woken and recorded')
 }
 
 await rm(home, { recursive: true, force: true })

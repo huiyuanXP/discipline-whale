@@ -72,7 +72,7 @@ console.log('   read_report ->', JSON.stringify({ id: read.report?.id, status: r
 console.log('7) checkpoint cleanup')
 console.log('   checkpoint after delivery:', await readFile(ckpt, 'utf8').then(() => 'STILL THERE (bad)').catch(() => 'removed'))
 
-const reportFiles = await readdir(join(home, 'discipline-whale', WS.id))
+const reportFiles = await readdir(join(home, 'discipline-whale', 'reports', WS.id))
 console.log('8) store contents:', reportFiles)
 
 const problems = []

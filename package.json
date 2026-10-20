@@ -1,25 +1,29 @@
 {
   "name": "discipline-whale",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Discipline Whale for DeepSeek Harness: one main conversation routes work into workspaces, workers report back as pushed messages, and a turn-end check makes the report contract real.",
   "license": "MIT",
   "author": "huiyuanXP",
   "type": "module",
-  "main": "main.js",
+  "main": "home.js",
   "exports": {
-    ".": "./main.js",
+    ".": "./home.js",
     "./main": "./main.js",
     "./worker": "./worker.js",
+    "./home": "./home.js",
     "./store": "./store.js",
     "./registry": "./registry.js",
     "./locale/*.json": "./locale/*.json",
     "./icon": "./icon.svg",
     "./package.json": "./package.json",
-    "./checkpoint": "./checkpoint.js"
+    "./checkpoint": "./checkpoint.js",
+    "./client": "./client.js"
   },
   "files": [
     "main.js",
     "worker.js",
+    "home.js",
+    "client.js",
     "store.js",
     "checkpoint.js",
     "registry.js",
@@ -58,6 +62,9 @@
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web"
     }
   }
 }
