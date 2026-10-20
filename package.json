@@ -28,7 +28,8 @@
     "icon.svg",
     "README.md",
     "VERIFICATION.md",
-    "LICENSE"
+    "LICENSE",
+    "test/*.mjs"
   ],
   "keywords": [
     "dsh",
@@ -51,7 +52,8 @@
     "dsh": ">=0.2.0-rc.1 <0.3.0-0"
   },
   "scripts": {
-    "test": "node test/contract.mjs"
+    "test": "node test/contract.mjs",
+    "test:smoke": "node test/smoke-restart.mjs"
   },
   "dsh": {
     "bundle": {

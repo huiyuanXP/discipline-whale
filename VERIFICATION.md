@@ -210,7 +210,7 @@ TURN/END completed
 
 ## 9b. 模拟重启冒烟（非单测）
 
-一个独立脚本，用真实的两半模块跑完整链路：派工 → `resetRegistry()` 清空全部内存 → 换一个全新的 main 行实例 → worker 报告。断言落在**主会话真的读了哪个文件**上，而不是内部返回值。
+脚本在仓库里：`node test/smoke-restart.mjs`。用真实的两半模块跑完整链路：派工 → `resetRegistry()` 清空全部内存 → 换一个全新的 main 行实例 → worker 报告。断言落在**主会话真的读了哪个文件**上，而不是内部返回值。
 
 ```
 1) main session dispatches
@@ -253,7 +253,8 @@ SMOKE PASS
 
 ```bash
 cd discipline-whale
-node test/contract.mjs      # 17 项契约测试
+node test/contract.mjs        # 17 项契约测试
+node test/smoke-restart.mjs  # 模拟重启冒烟（非单测）
 ```
 
 真实端到端复验：**重启 DSH 后**，选 Discipline Whale preset 新建一个会话，先确认工具面符合预期（没有 `write` / `edit` / `bash`，主会话没有 `create_session`），再让它 `dispatch_task` 到一个工作区，观察 worker 完成后主会话是否自动收到一条 `[Discipline Whale] Worker report` 消息。
