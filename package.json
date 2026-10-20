@@ -1,0 +1,59 @@
+{
+  "name": "discipline-whale",
+  "version": "0.1.0",
+  "description": "Discipline Whale for DeepSeek Harness: one main conversation routes work into workspaces, workers report back as pushed messages, and a turn-end check makes the report contract real.",
+  "license": "MIT",
+  "author": "huiyuanXP",
+  "type": "module",
+  "main": "main.js",
+  "exports": {
+    ".": "./main.js",
+    "./main": "./main.js",
+    "./worker": "./worker.js",
+    "./store": "./store.js",
+    "./registry": "./registry.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "main.js",
+    "worker.js",
+    "store.js",
+    "registry.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "README.md",
+    "VERIFICATION.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "discipline-whale",
+    "multi-agent",
+    "orchestration",
+    "session"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/huiyuanXP/discipline-whale.git"
+  },
+  "homepage": "https://github.com/huiyuanXP/discipline-whale#readme",
+  "bugs": {
+    "url": "https://github.com/huiyuanXP/discipline-whale/issues"
+  },
+  "engines": {
+    "dsh": ">=0.2.0-rc.1 <0.3.0-0"
+  },
+  "scripts": {
+    "test": "node test/contract.mjs"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}

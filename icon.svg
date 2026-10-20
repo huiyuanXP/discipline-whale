@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="Discipline Whale">
+  <rect x="4" y="4" width="56" height="56" rx="14" fill="#E7F0FB"/>
+  <rect x="4" y="4" width="56" height="56" rx="14" fill="none" stroke="#2F6BD8" stroke-width="2"/>
+  <path d="M16 30c0-5 4-9 9-9h12c4 0 7 2 9 5l4-4v10l-4-4c-2 3-5 5-9 5H25c-5 0-9-4-9-9z" fill="#2F6BD8"/>
+  <circle cx="24" cy="28" r="1.8" fill="#FFFFFF"/>
+  <path d="M30 39h16c2.5 0 4.5 2 4.5 4.5S48.5 48 46 48H30" fill="none" stroke="#7FA8E8" stroke-width="2.4" stroke-linecap="round"/>
+  <path d="M14 52c2-2 4-2 6 0s4 2 6 0 4-2 6 0 4 2 6 0 4-2 6 0 4 2 6 0" fill="none" stroke="#BCD0F0" stroke-width="2" stroke-linecap="round"/>
+</svg>

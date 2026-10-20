@@ -1,0 +1,190 @@
+# discipline-whale bundle patch: the two agent presets and their plugin rows.
+#
+# Presets are profile-level declarations, so this bundle's patch inserts them
+# directly. Installing the bundle therefore adds "Discipline Whale" and
+# "Discipline Whale Worker" to the Web GUI's existing preset picker; no client
+# code is required.
+#
+# The `main` row injects tools + sessionController + workspaceRegistry, and the
+# `worker` row injects tools + sessionController. Each row is mounted only from
+# its own preset, which is what keeps dispatch powers out of workers.
+
+- insert:
+    - id: preset-discipline-whale
+      name: '@deepseek-ai/dsh-agent-preset'
+      config:
+        id: discipline-whale
+        name: Discipline Whale
+        description: Talks to the user, routes work into workspaces, and reports results. Does not write code.
+        order: 10
+        plugins:
+          - id: persona
+            name: '@deepseek-ai/dsh-persona'
+            config:
+              prefix: |-
+                You are Discipline Whale, the main conversation of a multi-workspace agent system.
+
+                Your four jobs:
+                1. Dispatch work. Read the workspace list, decide where a task belongs, and call
+                   dispatch_task with a complete brief. One dispatch per separable piece of work.
+                2. Report what actually happened. Worker reports arrive as pushed messages with no
+                   tool call needed. Relay them to the user honestly, including failures and
+                   partial results. Never invent a result you did not receive.
+                3. Discuss content, architecture, and decisions with the user, and turn a new
+                   decision into an instruction for an existing worker with send_to_session.
+                4. Do not write the implementation yourself. You may write summary documents and
+                   render interactive UI, and run small read-only checks, but the feature work
+                   belongs to a dispatched worker.
+
+                A report id in a pushed message names a stored document. Call read_report only
+                when the summary is not enough to answer the user.
+
+                When you dispatch, tell the user which workspace you chose and why, in one line.
+              includeRuntimeContext: true
+          - id: agent-instructions
+            name: '@deepseek-ai/dsh-agent-instructions'
+            config:
+              maxBytes: 65536
+          - id: time-context
+            name: '@deepseek-ai/dsh-time-context'
+          - id: discipline-whale-main
+            name: 'discipline-whale/main'
+            config:
+              workerPreset: discipline-whale-worker
+          - id: tool-fs
+            name: '@deepseek-ai/dsh-tool-fs'
+            config:
+              read: true
+              readImage: true
+              write: true
+              edit: false
+          - id: tool-fs-search
+            name: '@deepseek-ai/dsh-tool-fs-search'
+            config:
+              sampleOverCapGlobResults: false
+          - id: tool-bash
+            name: '@deepseek-ai/dsh-tool-bash'
+            disabled: !!js process.platform === 'win32'
+          - id: tool-pwsh
+            name: '@deepseek-ai/dsh-tool-pwsh'
+            disabled: !!js process.platform !== 'win32'
+          - id: tool-jobs
+            name: '@deepseek-ai/dsh-tool-jobs'
+          - id: tool-ask-user
+            name: '@deepseek-ai/dsh-tool-ask-user'
+          - id: tool-todo
+            name: '@deepseek-ai/dsh-tool-todo'
+            config:
+              allowParallelInProgress: true
+          - id: tool-web
+            name: '@deepseek-ai/dsh-tool-web'
+            config:
+              fetch: true
+              searchTimeoutMs: 60000
+          - id: present
+            name: '@deepseek-ai/dsh-tool-present'
+          - id: skill-filesystem
+            name: '@deepseek-ai/dsh-skill-filesystem'
+          - id: tool-skill
+            name: '@deepseek-ai/dsh-tool-skill'
+          - id: compaction
+            name: cordis:group
+            group: true
+            isolate:
+              compaction: true
+              toolResultPruner: true
+            config:
+              - id: compaction-basic
+                name: '@deepseek-ai/dsh-compaction-basic'
+              - id: command-compact
+                name: '@deepseek-ai/dsh-command-compact'
+              - id: tool-result-pruner
+                name: '@deepseek-ai/dsh-compaction-tool-result-pruner'
+                config:
+                  thresholdChars: 8192
+
+    - id: preset-discipline-whale-worker
+      name: '@deepseek-ai/dsh-agent-preset'
+      config:
+        id: discipline-whale-worker
+        name: Discipline Whale Worker
+        description: Executes a dispatched task in one workspace, then reports back to the main session.
+        order: 11
+        plugins:
+          - id: persona
+            name: '@deepseek-ai/dsh-persona'
+            config:
+              prefix: |-
+                You are a Discipline Whale worker. A main session dispatched you to do one concrete
+                piece of work in this workspace.
+
+                Do the work, verify it, then report. You must call `report_to_main` exactly once
+                before you finish: a short `summary` the main session reads directly, and a detailed
+                `document` with what you changed, what you verified, and what is left.
+
+                If the task cannot be completed, report that honestly with `status: "blocked"`
+                rather than stopping silently. If you stop without reporting, you will be steered
+                back and asked for it.
+
+                You cannot dispatch further work: this preset has no dispatch tools, and your
+                sub-agents inherit it.
+          - id: agent-instructions
+            name: '@deepseek-ai/dsh-agent-instructions'
+            config:
+              maxBytes: 65536
+          - id: time-context
+            name: '@deepseek-ai/dsh-time-context'
+          - id: discipline-whale-worker
+            name: 'discipline-whale/worker'
+          - id: tool-bash
+            name: '@deepseek-ai/dsh-tool-bash'
+            disabled: !!js process.platform === 'win32'
+          - id: tool-pwsh
+            name: '@deepseek-ai/dsh-tool-pwsh'
+            disabled: !!js process.platform !== 'win32'
+          - id: tool-fs
+            name: '@deepseek-ai/dsh-tool-fs'
+          - id: tool-fs-search
+            name: '@deepseek-ai/dsh-tool-fs-search'
+            config:
+              sampleOverCapGlobResults: false
+          - id: tool-jobs
+            name: '@deepseek-ai/dsh-tool-jobs'
+          - id: skill-filesystem
+            name: '@deepseek-ai/dsh-skill-filesystem'
+          - id: tool-skill
+            name: '@deepseek-ai/dsh-tool-skill'
+          - id: tool-ask-user
+            name: '@deepseek-ai/dsh-tool-ask-user'
+          - id: tool-todo
+            name: '@deepseek-ai/dsh-tool-todo'
+            config:
+              allowParallelInProgress: true
+          - id: delegation
+            name: cordis:group
+            group: true
+            config:
+              - id: tool-subagent
+                name: '@deepseek-ai/dsh-tool-subagent'
+                config:
+                  provider: spawn
+              - id: tool-subagent-fork
+                name: '@deepseek-ai/dsh-tool-subagent'
+                config:
+                  provider: fork
+                  toolName: subagent_fork
+          - id: compaction
+            name: cordis:group
+            group: true
+            isolate:
+              compaction: true
+              toolResultPruner: true
+            config:
+              - id: compaction-basic
+                name: '@deepseek-ai/dsh-compaction-basic'
+              - id: command-compact
+                name: '@deepseek-ai/dsh-command-compact'
+              - id: tool-result-pruner
+                name: '@deepseek-ai/dsh-compaction-tool-result-pruner'
+                config:
+                  thresholdChars: 8192

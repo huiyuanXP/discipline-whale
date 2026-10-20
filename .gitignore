@@ -1,0 +1,13 @@
+node_modules/
+.DS_Store
+*.log
+*.tgz
+
+# Local audit artefact (generated review page, not part of the package)
+problems.html
+
+# Local runtime state / credentials must never be committed
+.credentials*
+config.yaml
+*.session.json
+.dsh/
