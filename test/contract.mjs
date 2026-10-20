@@ -51,6 +51,15 @@ const workspaces = [
   { id: 'ws-fuzz', title: 'soc-api-fuzz', path: '/Users/huiyuan/Developer/test/soc-api-fuzz', sessionIds: [] },
 ]
 
+/**
+ * Session ids the fake Host hands out.
+ *
+ * Deliberately process-unique, not per-mount: checkpoints are keyed by session
+ * id on disk, so a per-mount counter that restarts at 1 would let one test block
+ * read a file an earlier block wrote and mask a real path mismatch.
+ */
+let sessionSeq = 0
+
 /** Mount one row against a fresh fake Host and capture what it registers. */
 function mount(row, config = {}) {
   const tools = new Map()
@@ -70,7 +79,8 @@ function mount(row, config = {}) {
     sessionController: {
       create: async (request) => {
         calls.create.push(request)
-        return { sessionId: `worker-${calls.create.length}` }
+        sessionSeq += 1
+        return { sessionId: `worker-${sessionSeq}` }
       },
       rename: async (request) => {
         calls.rename.push(request)
@@ -148,15 +158,23 @@ const execAs = (sessionId) => ({ agent: { session: { id: sessionId } } })
 
 {
   const { tools } = mount(mainRow)
-  const expected = ['list_workspaces', 'dispatch_task', 'read_report', 'send_to_session']
+  const expected = [
+    'list_workspaces',
+    'dispatch_task',
+    'read_report',
+    'send_to_session',
+    'list_dispatches',
+  ]
   assert.deepEqual([...tools.keys()].sort(), [...expected].sort())
-  for (const name of expected) {
-    const tool = tools.get(name)
+  // Every registered tool must be covered by this check, not just the ones this
+  // list happens to name: an unchecked row could carry an unsupported schema.
+  for (const [name, tool] of tools) {
+    assert.ok(expected.includes(name), `tool ${name} is registered but not covered by the schema check`)
     assertSupportedJsonSchema(tool.parameters)
     assertSupportedJsonSchema(tool.output.schema)
     assert.equal(typeof tool.output.render, 'function')
   }
-  console.log('ok 2 — main row registers four tools with supported schemas')
+  console.log('ok 2 — main row registers five tools with supported schemas')
 }
 
 // --- 3. worker row surface: no upward powers ------------------------------
@@ -164,7 +182,15 @@ const execAs = (sessionId) => ({ agent: { session: { id: sessionId } } })
 {
   const { tools } = mount(workerRow)
   assert.deepEqual([...tools.keys()], ['report_to_main'], 'the worker gets exactly one tool')
-  for (const forbidden of ['dispatch_task', 'list_workspaces', 'read_report', 'send_to_session']) {
+  // `list_dispatches` is a main-session board: a worker that could read the
+  // dispatch board would learn about other workers' tasks. It must stay absent.
+  for (const forbidden of [
+    'dispatch_task',
+    'list_workspaces',
+    'read_report',
+    'send_to_session',
+    'list_dispatches',
+  ]) {
     assert.equal(tools.get(forbidden), undefined, `worker must not have ${forbidden}`)
   }
   assertSupportedJsonSchema(tools.get('report_to_main').parameters)
@@ -357,6 +383,614 @@ const execAs = (sessionId) => ({ agent: { session: { id: sessionId } } })
     /`message` is empty/,
   )
   console.log('ok 9 — send_to_session delivers a new decision to an existing session')
+}
+
+
+// --- 10. restart: the dispatch record survives on disk ---------------------
+//
+// Reproduced defect: the dispatch registry is a process-local Map, so a Host
+// restart empties it while the worker Session itself is durable. A worker that
+// outlives its dispatch record could not report at all. The worker half now
+// checkpoints the routing record it can see, and falls back to that file when
+// the in-memory lookup misses.
+
+const settle = (ms = 40) => new Promise((resolve) => setTimeout(resolve, ms))
+
+// New tests only: keeps every line above this block byte-identical to the
+// original nine checks (which import no reader).
+const { readFile } = await import('node:fs/promises')
+
+/** The checkpoint path the worker half owns (same key rule as a report dir). */
+const checkpointPath = (workerSessionId) =>
+  join(home, 'discipline-whale', 'dispatches', `${workspaceKey(workerSessionId)}.json`)
+
+{
+  resetRegistry()
+  const mainMount = mount(mainRow)
+  const workerMount = mount(workerRow)
+  const dispatched = await run(
+    mainMount.tools,
+    'dispatch_task',
+    { workspace: 'soc-api-test', task: 'Survive a Host restart.' },
+    execAs('main-restart'),
+  )
+  const workerId = dispatched.workerSessionId
+
+  // The worker starts its first turn while the dispatch is still in memory.
+  for (const handler of workerMount.listeners.get('agent/status') ?? []) {
+    handler({ agent: { session: { id: workerId } }, status: 'running' })
+  }
+  await settle()
+
+  // Restart: every in-memory dispatch record is gone, the Session is not.
+  resetRegistry()
+
+  // This is the field defect, stated plainly: the report must still arrive.
+  const value = await run(
+    workerMount.tools,
+    'report_to_main',
+    { summary: 'Finished after the restart.', document: 'body', status: 'done' },
+    execAs(workerId),
+  )
+  assert.equal(value.deliveredToMain, true, 'a restarted worker must still be able to report')
+
+  assert.equal(value.orphaned, undefined, 'a recovered dispatch is not an orphan')
+  const warnings = (value.warnings ?? []).join('\n')
+  assert.match(warnings, /restart/i, 'the recovery must be disclosed, not silent')
+
+  // The routing facts the worker rebuilt came from its own checkpoint.
+  const pushes = workerMount.calls.prompt.map((call) => call.sessionId)
+  assert.equal(pushes.at(-1), 'main-restart', 'the checkpoint supplied the target session')
+
+  // A delivered report leaves nothing behind to recover twice.
+  await assert.rejects(
+    () => readFile(checkpointPath(workerId), 'utf8'),
+    /ENOENT/,
+    'the checkpoint is dropped once the report is delivered',
+  )
+
+  const stored = await readReport(home, 'ws-soc', value.reportId)
+  assert.equal(stored.status, 'delivered')
+  assert.equal(stored.mainSessionId, 'main-restart')
+  assert.deepEqual(stored.deliveredTo, ['main-restart'])
+  const pushed = workerMount.calls.prompt.at(-1)
+  assert.equal(pushed.sessionId, 'main-restart', 'the report is pushed to the recorded main session')
+  assert.match(pushed.content[0].text, /Finished after the restart\./)
+  console.log('ok 10 — a restarted worker recovers its dispatch from disk and reports')
+}
+
+// --- 11. no record at all: store the report as an orphan ------------------
+//
+// When even the checkpoint is gone, the worker half must not invent a main
+// session. It writes the report to the store under the workspace it can prove
+// from its own Session log, and says plainly that nobody was told.
+
+{
+  resetRegistry()
+  const brief = [
+    'You are a Discipline Whale worker. Complete the task below in this workspace.',
+    '',
+    '## Task',
+    'Do a thing.',
+    '',
+    '## Mandatory closing step',
+    'Before your turn ends you MUST call `report_to_main` exactly once:',
+  ].join('\n')
+  const workerMount = mount(workerRow)
+  // A real Host can replay the Session log, which is where the dispatch brief lives.
+  workerMount.ctx.sessionController.inspect = async (sessionId) => ({
+    meta: { id: sessionId, cwd: '/Users/huiyuan/Developer/test/soc-api-test', createdAt: 0 },
+    inheritedEventCount: 0,
+    events: [
+      {
+        type: 'user/message',
+        seq: 0,
+        time: 0,
+        data: { role: 'user', content: [{ type: 'text', text: brief }] },
+        surfaceOp: 'append',
+      },
+    ],
+  })
+
+  const value = await run(
+    workerMount.tools,
+    'report_to_main',
+    { summary: 'Done, but nobody is listening.', document: 'orphan body', status: 'partial' },
+    execAs('session-orphan-1'),
+  )
+  assert.ok(value, 'a dispatched Session with no recoverable record must still be able to report')
+  assert.equal(value.deliveredToMain, false, 'an orphan must not claim delivery')
+  assert.equal(value.orphaned, true, 'the result must be marked orphaned')
+  const warnings = (value.warnings ?? []).join('\n')
+  assert.match(warnings, /restart/i, 'the cause must be named')
+  assert.match(warnings, /read_report/, 'the operator must be told how to retrieve it')
+
+  const stored = await readReport(home, 'ws-soc', value.reportId)
+  assert.equal(stored.status, 'reported')
+  assert.equal(stored.orphaned, true)
+  assert.equal(stored.document, 'orphan body')
+  assert.deepEqual(stored.deliveredTo, [], 'nothing was pushed')
+  assert.equal(workerMount.calls.prompt.length, 0, 'an orphan never guesses a target session')
+  console.log('ok 11 — a report with no recoverable dispatch is stored and marked orphaned')
+}
+
+// --- 12. an errored turn still checkpoints, and nudges once on recovery ---
+//
+// agent-loop dispatches `agent/turn-stopping` only on a normal close
+// (lib/index.js: turnEnds && inbox empty, inside the step loop). An `error`
+// (TRANSPORT) or `aborted` turn leaves through the catch at ~1010 and never
+// reaches it, so enforcement used to miss exactly the turns that fail. The
+// outage itself cannot be pushed through — the goal is not to report while the
+// network is down, it is to lose nothing once it is back.
+
+{
+  resetRegistry()
+  const mainMount = mount(mainRow)
+  const workerMount = mount(workerRow, { maxReportRetries: 3 })
+  const dispatched = await run(
+    mainMount.tools,
+    'dispatch_task',
+    { workspace: 'soc-api-test', task: 'Work through an outage.' },
+    execAs('main-outage'),
+  )
+  const workerId = dispatched.workerSessionId
+
+  const steered = []
+  const agent = { session: { id: workerId }, steer: (message) => steered.push(message) }
+  const emit = (name, ...payload) => {
+    for (const handler of workerMount.listeners.get(name) ?? []) handler(...payload)
+  }
+
+  emit('agent/error', { agent, turn: 1, step: 2, error: new Error('Connection error.') })
+  await settle()
+  assert.equal(steered.length, 0, 'nothing is steered while the transport is down')
+  const pushes = workerMount.calls.prompt.filter((call) => call.sessionId === 'main-outage')
+  assert.equal(pushes.length, 0, 'nothing is pushed while the transport is down')
+  const checkpoint = await readFile(checkpointPath(workerId), 'utf8').catch(() => undefined)
+  assert.ok(checkpoint, 'the errored turn still leaves a recoverable record')
+  assert.equal(JSON.parse(checkpoint).mainSessionId, 'main-outage')
+
+  // The transport comes back: the driver drains to idle with no report.
+  emit('agent/status', { agent, status: 'running' })
+  emit('agent/status', { agent, status: 'idle' })
+  await settle()
+  assert.equal(steered.length, 1, 'recovery nudges exactly once')
+
+  // A later idle from the same (already answered) turn must not nudge again.
+  emit('agent/status', { agent, status: 'idle' })
+  await settle()
+  assert.equal(steered.length, 1, 'one abnormal turn is counted once, not once per idle transition')
+  assert.equal(steered.length, 1, 'recovery nudges exactly once, not once per idle transition')
+  assert.match(steered[0].content[0].text, /report_to_main/)
+  assert.match(steered[0].content[0].text, /restart|recover|transport|error/i)
+
+  // A normal close is answered by turn-stopping; the following idle must not
+  // count the same turn a second time.
+  const turnStopping = (payload) => emit('agent/turn-stopping', payload)
+  const second = await run(
+    mainMount.tools,
+    'dispatch_task',
+    { workspace: 'soc-api-test', task: 'Close normally.' },
+    execAs('main-outage'),
+  )
+  const agent2 = { session: { id: second.workerSessionId }, steer: (m) => steered.push(m) }
+  turnStopping({ agent: agent2, turn: 1, signal: new AbortController().signal })
+  emit('agent/status', { agent: agent2, status: 'idle' })
+  await settle()
+  assert.equal(steered.length, 2, 'a normal close is enforced once, not twice')
+
+  // An aborted turn never reaches agent/error either; only the log records it.
+  const abortWorker = await run(
+    mainMount.tools,
+    'dispatch_task',
+    { workspace: 'soc-api-test', task: 'Abort mid-turn.' },
+    execAs('main-outage'),
+  )
+  const agent3 = { session: { id: abortWorker.workerSessionId }, steer: (m) => steered.push(m) }
+  emit('session/event', { id: abortWorker.workerSessionId }, {
+    type: 'turn/end',
+    seq: 3,
+    time: 0,
+    data: { turn: 1, reason: { kind: 'aborted', reason: { kind: 'user' } } },
+  })
+  emit('agent/status', { agent: agent3, status: 'idle' })
+  await settle()
+  assert.equal(steered.length, 3, 'an aborted turn is enforced on idle too')
+  assert.match(steered[2].content[0].text, /aborted/i)
+
+  // `blocked` returns from the step loop before turn-stopping as well.
+  const blockedWorker = await run(
+    mainMount.tools,
+    'dispatch_task',
+    { workspace: 'soc-api-test', task: 'Blocked before a step.' },
+    execAs('main-outage'),
+  )
+  const agent4 = { session: { id: blockedWorker.workerSessionId }, steer: (m) => steered.push(m) }
+  emit('session/event', { id: blockedWorker.workerSessionId }, {
+    type: 'turn/end',
+    seq: 3,
+    time: 0,
+    data: { turn: 1, reason: { kind: 'blocked' } },
+  })
+  emit('agent/status', { agent: agent4, status: 'idle' })
+  await settle()
+  assert.equal(steered.length, 4, 'a blocked turn is enforced on idle too')
+  assert.match(steered[3].content[0].text, /blocked/i)
+  console.log('ok 12 — failed turns checkpoint without pushing, then nudge once per turn on idle')
+}
+
+
+// --- 13. enforcement survives the restart too -----------------------------
+//
+// Recovery is pointless if only the report tool knows about it: a worker whose
+// dispatch was lost must still be nudged to report. The checkpoint is read back
+// on the first lifecycle event after the restart.
+
+{
+  resetRegistry()
+  const mainMount = mount(mainRow)
+  const workerMount = mount(workerRow, { maxReportRetries: 2 })
+  const dispatched = await run(
+    mainMount.tools,
+    'dispatch_task',
+    { workspace: 'soc-api-test', task: 'Restart, then stay silent.' },
+    execAs('main-r1'),
+  )
+  const workerId = dispatched.workerSessionId
+
+  const emit = (name, ...payload) => {
+    for (const handler of workerMount.listeners.get(name) ?? []) handler(...payload)
+  }
+  emit('agent/status', { agent: { session: { id: workerId } }, status: 'running' })
+  await settle()
+
+  // Restart again: memory is empty, only the checkpoint remains.
+  resetRegistry()
+
+  const steered = []
+  const agent = { session: { id: workerId }, steer: (message) => steered.push(message) }
+
+  // `agent/turn-stopping` is the FIRST lifecycle event after this restart and it
+  // is a `serial` event: a handler that recovers must hand back a promise, or
+  // enforcement runs before the record exists. Pending handler values are
+  // awaited here exactly as the loop awaits them.
+  const stopping = (workerMount.listeners.get('agent/turn-stopping') ?? []).map((handler) =>
+    handler({ agent, turn: 2, signal: new AbortController().signal }),
+  )
+  await Promise.all(stopping)
+
+  assert.equal(steered.length, 1, 'a recovered dispatch is still enforced after a restart')
+  assert.match(steered[0].content[0].text, /report_to_main/)
+
+  // Reporting then works without any further recovery step.
+  const value = await run(
+    workerMount.tools,
+    'report_to_main',
+    { summary: 'Reported after the restart nudge.' },
+    execAs(workerId),
+  )
+  assert.equal(value.deliveredToMain, true)
+  assert.equal(workerMount.calls.prompt.at(-1).sessionId, 'main-r1')
+
+  // And a reported worker is no longer nudged.
+  const before = steered.length
+  await Promise.all(
+    (workerMount.listeners.get('agent/turn-stopping') ?? []).map((handler) =>
+      handler({ agent, turn: 3, signal: new AbortController().signal }),
+    ),
+  )
+  assert.equal(steered.length, before, 'a reported worker is left alone after a restart')
+  console.log('ok 13 — enforcement reads the checkpoint back, nudges, then stands down')
+}
+
+// --- 14. list_dispatches: the board --------------------------------------------------
+//
+// The board is a read-only projection of the process-local registry. It must be
+// usable with nothing dispatched, must not disagree with the registry about the
+// three states, and must never emit a negative or non-finite duration from a
+// record whose timestamps are missing or dirty.
+
+{
+  resetRegistry()
+  const { tools } = mount(mainRow)
+
+  const empty = await run(tools, 'list_dispatches', {}, execAs('main-board'))
+  assert.deepEqual(empty.dispatches, [], 'an empty registry lists an empty board')
+  assert.deepEqual(empty.counts, { total: 0, running: 0, reported: 0, abandoned: 0 })
+  assert.match(empty.note, /no dispatch has been recorded/)
+  assert.deepEqual(
+    validateJsonSchemaValue(tools.get('list_dispatches').output.schema, empty, 'value'),
+    [],
+  )
+
+  // One running, one reported, one abandoned.
+  const mainMount = mount(mainRow)
+  const workerMount = mount(workerRow, { maxReportRetries: 0 })
+  const running = await run(
+    mainMount.tools,
+    'dispatch_task',
+    { workspace: 'soc-api-test', task: 'Still in flight.' },
+    execAs('main-board'),
+  )
+  const reported = await run(
+    mainMount.tools,
+    'dispatch_task',
+    { workspace: 'soc-api-test', task: 'Reported cleanly.' },
+    execAs('main-board'),
+  )
+  const abandoned = await run(
+    mainMount.tools,
+    'dispatch_task',
+    { workspace: 'ws-harness', task: 'Never reports.' },
+    execAs('main-board'),
+  )
+
+  await run(
+    workerMount.tools,
+    'report_to_main',
+    { summary: 'done', status: 'done' },
+    execAs(reported.workerSessionId),
+  )
+
+  // `maxReportRetries: 0` makes the first silent turn the terminal one.
+  const agent = { session: { id: abandoned.workerSessionId }, steer() {} }
+  for (const handler of workerMount.listeners.get('agent/turn-stopping') ?? []) {
+    await handler({ agent, turn: 1, signal: new AbortController().signal })
+  }
+  await settle()
+
+  const board = await run(tools, 'list_dispatches', {}, execAs('main-board'))
+  assert.equal(board.counts.total, 3)
+  assert.equal(board.counts.running, 1)
+  assert.equal(board.counts.reported, 1)
+  assert.equal(board.counts.abandoned, 1)
+
+  const byWorker = new Map(board.dispatches.map((row) => [row.workerSessionId, row]))
+  assert.equal(byWorker.get(running.workerSessionId).status, 'running')
+  assert.equal(byWorker.get(reported.workerSessionId).status, 'reported')
+  assert.equal(byWorker.get(abandoned.workerSessionId).status, 'abandoned')
+  for (const row of board.dispatches) {
+    assert.ok(Number.isInteger(row.elapsed.ms), `elapsed.ms must be an integer: ${row.elapsed.ms}`)
+    assert.ok(row.elapsed.ms >= 0, `elapsed must never be negative: ${row.elapsed.ms}`)
+    assert.ok(!/NaN|Infinity/.test(row.elapsed.human), `elapsed.human must be printable: ${row.elapsed.human}`)
+    assert.ok(!Number.isNaN(Date.parse(row.lastActivityAt)), 'lastActivityAt must parse')
+  }
+  assert.deepEqual(
+    validateJsonSchemaValue(tools.get('list_dispatches').output.schema, board, 'value'),
+    [],
+  )
+
+  // Newest first, and the optional workspace filter narrows without throwing.
+  const onlyHarness = await run(tools, 'list_dispatches', { workspace: 'harness' }, execAs('main-board'))
+  assert.equal(onlyHarness.counts.total, 3, 'counts describe the whole board, not the filter')
+  assert.equal(onlyHarness.dispatches.length, 1)
+  assert.equal(onlyHarness.dispatches[0].workspaceId, 'ws-harness')
+
+  const limited = await run(tools, 'list_dispatches', { limit: 1 }, execAs('main-board'))
+  assert.equal(limited.dispatches.length, 1)
+  assert.equal(limited.counts.total, 3, 'the limit truncates rows, not the counts')
+  assert.match(limited.note, /1 of 3/)
+
+  await assert.rejects(() => run(tools, 'list_dispatches', { limit: 2.5 }, execAs('m')), /must be an integer/)
+  console.log('ok 14 — list_dispatches: empty board, three states, no negative or NaN elapsed')
+}
+
+// --- 15. the dispatch record reaches disk when dispatch_task returns --------
+//
+// Reproduced gap: the worker half checkpoints on its FIRST lifecycle event, so a
+// restart in the window between `dispatch_task` returning and that first event
+// still lost the record and fell back to the orphan path. The main half now
+// writes the same checkpoint file itself, at the moment it knows the routing
+// facts, so the two halves cannot disagree.
+
+{
+  resetRegistry()
+  const { dispatchCheckpointPath } = await import('../worker.js')
+  assert.equal(
+    dispatchCheckpointPath(home, 'session/with:odd chars'),
+    checkpointPath('session/with:odd chars'),
+    'both halves must derive the same checkpoint path from the same session id',
+  )
+
+  const mainMount = mount(mainRow)
+  const workerMount = mount(workerRow)
+  const dispatched = await run(
+    mainMount.tools,
+    'dispatch_task',
+    { workspace: 'soc-api-test', task: 'Restart before the first turn.' },
+    execAs('main-persist'),
+  )
+  const workerId = dispatched.workerSessionId
+
+  // No lifecycle event is delivered here on purpose: this is exactly the window
+  // where the worker has not yet spoken and the old checkpoint never existed.
+  const onDisk = JSON.parse(await readFile(checkpointPath(workerId), 'utf8'))
+  assert.equal(onDisk.mainSessionId, 'main-persist')
+  assert.equal(onDisk.dispatchId, dispatched.dispatchId)
+  assert.equal(onDisk.workerSessionId, workerId)
+  assert.equal(onDisk.workspaceId, 'ws-soc')
+  assert.equal(onDisk.workspaceTitle, 'soc-api-test')
+
+  // Restart: memory emptied, disk untouched.
+  resetRegistry()
+  const value = await run(
+    workerMount.tools,
+    'report_to_main',
+    { summary: 'Reported from the dispatch-time checkpoint.', status: 'done' },
+    execAs(workerId),
+  )
+  assert.equal(value.deliveredToMain, true, 'a restart before the first turn must not orphan the report')
+  assert.equal(value.orphaned, undefined)
+  assert.equal(workerMount.calls.prompt.at(-1).sessionId, 'main-persist')
+  assert.match(workerMount.calls.prompt.at(-1).content[0].text, /main-persist|Worker report/)
+  assert.deepEqual(
+    validateJsonSchemaValue(workerMount.tools.get('report_to_main').output.schema, value, 'value'),
+    [],
+  )
+
+  // Delivery drops the checkpoint, once, from whichever half wrote it.
+  await assert.rejects(
+    () => readFile(checkpointPath(workerId), 'utf8'),
+    /ENOENT/,
+    'the dispatch-time checkpoint is removed after delivery',
+  )
+  const stored = await readReport(home, 'ws-soc', value.reportId)
+  assert.equal(stored.status, 'delivered')
+  assert.equal(stored.recoveredFrom, 'checkpoint')
+  console.log('ok 15 — dispatch_task persists the checkpoint itself, so a restart before turn 1 still reports')
+}
+
+// --- 15b. a failed checkpoint write must never fail the dispatch -----------
+
+{
+  resetRegistry()
+  const { mkdir, writeFile: write } = await import('node:fs/promises')
+  const brokenHome = await mkdtemp(join(tmpdir(), 'dw-broken-'))
+  // A regular file where the checkpoint directory must be: `mkdir` then fails
+  // with ENOTDIR, exactly the shape of an unwritable store.
+  await mkdir(join(brokenHome, 'discipline-whale'), { recursive: true })
+  await write(join(brokenHome, 'discipline-whale', 'dispatches'), 'not a directory', 'utf8')
+
+  try {
+    setStoreRoot(brokenHome)
+    const { tools, calls } = mount(mainRow)
+    const value = await run(
+      tools,
+      'dispatch_task',
+      { workspace: 'soc-api-test', task: 'The store is unwritable.' },
+      execAs('main-broken'),
+    )
+    assert.equal(value.status, 'dispatched', 'a checkpoint failure must not fail the dispatch')
+    assert.equal(calls.prompt.length, 1, 'the worker is still briefed')
+    const warnings = (value.warnings ?? []).join('\n')
+    assert.match(warnings, /checkpoint|restart/i, 'the lost durability must be disclosed as a warning')
+    assert.deepEqual(
+      validateJsonSchemaValue(tools.get('dispatch_task').output.schema, value, 'value'),
+      [],
+    )
+  } finally {
+    setStoreRoot(home)
+    await rm(brokenHome, { recursive: true, force: true })
+  }
+  console.log('ok 15b — an unwritable store warns but still dispatches')
+}
+
+// --- 16. the board tolerates records the worker half wrote -----------------
+//
+// After a recovery the same record carries fields `dispatch_task` never wrote
+// (`recoveredFrom`, `orphaned`, and a `mainSessionId` that may be missing), and
+// after a hand-edited store its timestamps may be junk. A read-only board must
+// survive all of it instead of throwing inside a tool call.
+
+{
+  resetRegistry()
+  const { recordDispatch } = await import('../registry.js')
+  recordDispatch({
+    dispatchId: 'dispatch-recovered',
+    mainSessionId: 'main-recovered',
+    workerSessionId: 'worker-recovered',
+    workspaceId: 'ws-soc',
+    workspaceTitle: 'soc-api-test',
+    startedAt: new Date(Date.now() - 5000).toISOString(),
+    reportedAt: new Date().toISOString(),
+    status: 'reported',
+    reportId: 'r-recovered',
+    recoveredFrom: 'checkpoint',
+  })
+  recordDispatch({
+    dispatchId: 'dispatch-orphaned',
+    workerSessionId: 'worker-orphaned',
+    workspaceId: 'ws-soc',
+    workspaceTitle: 'soc-api-test',
+    startedAt: 'soon',
+    orphaned: true,
+    recoveredFrom: 'session-log',
+  })
+
+  const { tools } = mount(mainRow)
+  const board = await run(tools, 'list_dispatches', {}, execAs('main-board'))
+  const byId = new Map(board.dispatches.map((row) => [row.dispatchId, row]))
+
+  assert.equal(byId.get('dispatch-recovered').status, 'reported')
+  assert.ok(byId.get('dispatch-recovered').elapsed.ms >= 0)
+  assert.equal(byId.get('dispatch-recovered').lastActivitySource, 'reported')
+  assert.equal(byId.get('dispatch-recovered').recoveredFrom, 'checkpoint')
+  assert.equal(byId.get('dispatch-recovered').orphaned, undefined, 'a recovered dispatch with a main session is not orphaned')
+  assert.match((byId.get('dispatch-recovered').warnings ?? []).join('\n'), /checkpoint/)
+
+  // No main session id at all: the board still renders the row, no crash.
+  const orphanRow = byId.get('dispatch-orphaned')
+  assert.equal(orphanRow.status, 'running')
+  assert.equal(orphanRow.elapsed.ms, 0, 'an unparseable startedAt reports 0, never NaN')
+  assert.equal(orphanRow.recoveredFrom, 'session-log', 'the board keeps the recovery source visible')
+  assert.equal(orphanRow.orphaned, true, 'a record with no main session is reported as orphaned')
+  assert.match((orphanRow.warnings ?? []).join('\n'), /startedAt/)
+  assert.match((orphanRow.warnings ?? []).join('\n'), /will not be pushed/)
+  assert.deepEqual(
+    validateJsonSchemaValue(tools.get('list_dispatches').output.schema, board, 'value'),
+    [],
+  )
+  console.log('ok 16 — the board survives recovered/orphaned records and dirty timestamps')
+}
+
+// --- 17. a delivered dispatch must not come back to life --------------------
+//
+// The two halves now share one file, which introduces a gap neither half had
+// alone: `report_to_main` drops the checkpoint on delivery, but the dispatch is
+// still in memory and the Session keeps emitting lifecycle events. A later
+// `agent/status` used to re-create the file for an already-delivered dispatch,
+// so the next restart recovered it and enforced/pushed a SECOND report.
+
+{
+  resetRegistry()
+  const mainMount = mount(mainRow)
+  const workerMount = mount(workerRow)
+  const dispatched = await run(
+    mainMount.tools,
+    'dispatch_task',
+    { workspace: 'soc-api-test', task: 'Report once, then go quiet.' },
+    execAs('main-once'),
+  )
+  const workerId = dispatched.workerSessionId
+
+  const first = await run(
+    workerMount.tools,
+    'report_to_main',
+    { summary: 'First and only report.' },
+    execAs(workerId),
+  )
+  assert.equal(first.deliveredToMain, true)
+  await assert.rejects(() => readFile(checkpointPath(workerId), 'utf8'), /ENOENT/)
+
+  // The Session is still alive: its driver keeps reporting status transitions.
+  const pushesBefore = workerMount.calls.prompt.length
+  for (const handler of workerMount.listeners.get('agent/status') ?? []) {
+    await handler({ agent: { session: { id: workerId } }, status: 'running' })
+    await handler({ agent: { session: { id: workerId } }, status: 'idle' })
+  }
+  for (const handler of workerMount.listeners.get('agent/turn-stopping') ?? []) {
+    await handler({ agent: { session: { id: workerId }, steer() {} }, turn: 2, signal: new AbortController().signal })
+  }
+  await settle()
+
+  // Nothing may re-create the checkpoint for a dispatch that already delivered.
+  await assert.rejects(
+    () => readFile(checkpointPath(workerId), 'utf8'),
+    /ENOENT/,
+    'a later lifecycle event must not resurrect a delivered checkpoint',
+  )
+  assert.equal(workerMount.calls.prompt.length, pushesBefore, 'a delivered dispatch is never pushed twice')
+
+  // And after a restart nothing is recoverable, so the next turn cannot enforce
+  // a second report against the same Session.
+  resetRegistry()
+  await assert.rejects(
+    () =>
+      run(workerMount.tools, 'report_to_main', { summary: 'duplicate' }, execAs(workerId)),
+    /no active dispatch/,
+    'a delivered dispatch must not be recoverable as a fresh one',
+  )
+  console.log('ok 17 — a delivered checkpoint is never re-created by a later lifecycle event')
 }
 
 await rm(home, { recursive: true, force: true })

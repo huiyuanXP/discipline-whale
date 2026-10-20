@@ -14,7 +14,8 @@
 
 import { randomUUID } from 'node:crypto'
 
-import { recordDispatch } from './registry.js'
+import { writeDispatchCheckpoint } from './checkpoint.js'
+import { listDispatches, recordDispatch } from './registry.js'
 import { isReportId, listReports, readReport, storeRoot } from './store.js'
 
 /**
@@ -62,6 +63,62 @@ export function resolveWorkspace(registry, selector) {
   throw new Error(
     `no registered workspace matches "${selector}"; registered workspaces:\n- ${all.map(describeWorkspace).join('\n- ')}`,
   )
+}
+
+/* ------------------------------------------------------------------ *
+ * dispatch board helpers
+ * ------------------------------------------------------------------ */
+
+/**
+ * Parse an ISO timestamp into epoch milliseconds, or `undefined` when the value
+ * is absent or not a real date.
+ *
+ * Records are plain mutable objects written by two different rows, so this must
+ * tolerate junk (`startedAt: 'soon'`, a missing field) without throwing inside a
+ * read-only board tool.
+ */
+function timeOf(value) {
+  if (typeof value !== 'string' || value === '') return undefined
+  // Both rows always write `new Date().toISOString()`, so require the shape
+  // before parsing. `Date.parse` alone is far too lenient: it happily turns
+  // garbage like "bad-1" into the year 2000, which would surface as a bogus
+  // ~25-year elapsed time instead of the warning this case deserves.
+  if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/.test(value)) return undefined
+  const parsed = Date.parse(value)
+  return Number.isFinite(parsed) ? parsed : undefined
+}
+
+/** Human-readable duration: `450ms`, `12s`, `3m 12s`, `2h 05m`. */
+function humanDuration(ms) {
+  if (!Number.isFinite(ms) || ms < 1000) return `${Math.max(0, Math.round(ms) || 0)}ms`
+  const totalSeconds = Math.floor(ms / 1000)
+  const seconds = totalSeconds % 60
+  const minutes = Math.floor(totalSeconds / 60) % 60
+  const hours = Math.floor(totalSeconds / 3600)
+  if (hours > 0) return `${hours}h ${String(minutes).padStart(2, '0')}m`
+  if (minutes > 0) return `${minutes}m ${seconds}s`
+  return `${seconds}s`
+}
+
+/** Collapse whitespace and cut a task brief down to a scannable excerpt. */
+function excerpt(text, max = 120) {
+  const flat = String(text ?? '')
+    .replace(/\s+/g, ' ')
+    .trim()
+  return flat.length <= max ? flat : `${flat.slice(0, max - 1)}…`
+}
+
+/**
+ * Derive the three-state board status from what the two rows actually write.
+ *
+ * The worker row sets `status` only on a terminal transition, so an absent field
+ * is the running signal. Any value that is not one of the two known terminal
+ * markers is treated as running rather than inventing a fourth state.
+ */
+function boardStatus(record) {
+  if (record.status === 'reported') return 'reported'
+  if (record.status === 'abandoned') return 'abandoned'
+  return 'running'
 }
 
 /* ------------------------------------------------------------------ *
@@ -202,7 +259,7 @@ function dispatchTaskTool(ctx, config) {
       if (mainSessionId === undefined) {
         warnings.push('no calling Session id; the worker cannot push a report back to it')
       }
-      recordDispatch({
+      const dispatch = recordDispatch({
         dispatchId,
         mainSessionId,
         workerSessionId,
@@ -211,6 +268,28 @@ function dispatchTaskTool(ctx, config) {
         task,
         startedAt: new Date().toISOString(),
       })
+
+      // Persist the routing facts now, to the same file the worker half reads.
+      //
+      // The worker checkpoints on its first lifecycle event, which leaves a
+      // window: a restart after this tool returns but before that first event
+      // would still lose the record and degrade the report to the orphan path.
+      // Writing here closes that window — the two halves are then aligned by
+      // construction, not by timing.
+      //
+      // A failed write must never fail the dispatch: the worker is already
+      // created and about to be briefed, and the in-memory record still routes
+      // the report for the lifetime of this process. The cost is only that this
+      // particular dispatch would not survive a restart, which is disclosed as
+      // a warning instead of silently.
+      try {
+        await writeDispatchCheckpoint(storeRoot(), workerSessionId, dispatch)
+      } catch (error) {
+        warnings.push(
+          `the dispatch record could not be written to disk (${String(error?.message ?? error)}); ` +
+            'the report will still be delivered in this process, but this dispatch would not survive a Harness restart',
+        )
+      }
 
       // The brief carries the report contract so enforcement has something to
       // point at even when the worker preset's persona is terse.
@@ -368,6 +447,255 @@ function sendToSessionTool(ctx) {
   }
 }
 
+const BOARD_LIMIT_DEFAULT = 50
+const BOARD_LIMIT_MAX = 200
+
+/**
+ * Best-effort read of each worker Session's last user-authored prompt time.
+ *
+ * `sessionController.list()` is the only public way to see per-Session activity,
+ * and what it exposes is `SessionSummary.updatedAt = max(createdAt, lastPromptAt)`
+ * — the latest *human/user* message, NOT the latest message of any kind. A worker
+ * produces assistant turns and tool calls after that prompt, so this value stays
+ * pinned at dispatch time for a busy worker. It is therefore reported under its
+ * own name, never as `lastActivityAt`.
+ *
+ * Never throws: a board read must survive a Host whose list call is slow, absent,
+ * or rejects. Failures come back as a warning instead.
+ */
+async function readLastPromptTimes(ctx, exec) {
+  const bySession = new Map()
+  const warnings = []
+  if (typeof ctx.sessionController?.list !== 'function') {
+    warnings.push('`sessionController.list` is unavailable, so lastPromptAt is omitted for every row')
+    return { bySession, warnings }
+  }
+  try {
+    const listed = await ctx.sessionController.list({}, signalOf(exec))
+    for (const item of listed?.items ?? []) {
+      if (typeof item?.sessionId !== 'string') continue
+      if (!Number.isFinite(item.updatedAt)) continue
+      bySession.set(item.sessionId, new Date(item.updatedAt).toISOString())
+    }
+  } catch (error) {
+    warnings.push(`could not read Session activity: ${String(error?.message ?? error)}`)
+  }
+  return { bySession, warnings }
+}
+
+function listDispatchesTool(ctx) {
+  return {
+    name: 'list_dispatches',
+    description:
+      'Show the current dispatch board: every dispatch this process recorded, with its worker session, state (running / reported / abandoned), and how long it has been out. Use it to answer "what is still in flight?" before dispatching more work, or to see which workers never reported. A running dispatch whose worker never reports is the case worth acting on.',
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        workspace: {
+          type: 'string',
+          description: 'Optional filter: case-insensitive fragment of a workspace id or title. Unknown values simply match nothing.',
+        },
+        limit: {
+          type: 'integer',
+          description: `Maximum rows to return (1-${BOARD_LIMIT_MAX}, default ${BOARD_LIMIT_DEFAULT}). Newest dispatch first.`,
+        },
+      },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['dispatches', 'counts'],
+        properties: {
+          dispatches: {
+            type: 'array',
+            items: {
+              type: 'object',
+              additionalProperties: false,
+              required: ['dispatchId', 'workerSessionId', 'status', 'elapsed', 'lastActivityAt'],
+              properties: {
+                dispatchId: { type: 'string' },
+                workerSessionId: { type: 'string' },
+                status: { type: 'string', enum: ['running', 'reported', 'abandoned'] },
+                elapsed: {
+                  type: 'object',
+                  additionalProperties: false,
+                  required: ['ms', 'human'],
+                  properties: {
+                    ms: { type: 'integer' },
+                    human: { type: 'string' },
+                    /** Which timestamp closed the interval: a report, or "now". */
+                    until: { type: 'string', enum: ['reported', 'abandoned', 'now'] },
+                  },
+                },
+                /**
+                 * NOT "the last message time". See `lastActivitySource`: this is
+                 * the last registry-visible transition (report/abandon) or, for a
+                 * dispatch with none, its start.
+                 */
+                lastActivityAt: { type: 'string', description: 'Last registry-visible transition (reported/abandoned), else the dispatch start. Not the last message time.' },
+                lastActivitySource: { type: 'string', enum: ['reported', 'abandoned', 'started'] },
+                /** Latest user-authored prompt in the worker Session, when the Host can supply it. Never post-dispatch progress. */
+                lastPromptAt: { type: 'string' },
+                /** Set when the record was rebuilt after a restart; `session-log` means no checkpoint existed. */
+                recoveredFrom: { type: 'string', enum: ['checkpoint', 'session-log'] },
+                /** True when no main session could be recovered: a report from this worker will not be pushed. */
+                orphaned: { type: 'boolean' },
+                workspaceId: { type: 'string' },
+                workspaceTitle: { type: 'string' },
+                taskExcerpt: { type: 'string' },
+                startedAt: { type: 'string' },
+                reportedAt: { type: 'string' },
+                reportId: { type: 'string' },
+                warnings: { type: 'array', items: { type: 'string' } },
+              },
+            },
+          },
+          counts: {
+            type: 'object',
+            additionalProperties: false,
+            required: ['total', 'running', 'reported', 'abandoned'],
+            properties: {
+              total: { type: 'integer' },
+              running: { type: 'integer' },
+              reported: { type: 'integer' },
+              abandoned: { type: 'integer' },
+            },
+          },
+          note: { type: 'string' },
+          warnings: { type: 'array', items: { type: 'string' } },
+        },
+      },
+      render: (_args, value) => [{ type: 'text', text: JSON.stringify(value, null, 2) }],
+    },
+    presentCall: () => ({ card: 'generic', title: 'Dispatch board', kind: 'read' }),
+    async execute(args, exec) {
+      const rawLimit = args.limit === undefined ? BOARD_LIMIT_DEFAULT : Number(args.limit)
+      if (!Number.isInteger(rawLimit)) throw new Error('`limit` must be an integer')
+      const limit = Math.min(Math.max(rawLimit, 1), BOARD_LIMIT_MAX)
+
+      const needle =
+        typeof args.workspace === 'string' && args.workspace.trim() !== ''
+          ? args.workspace.trim().toLowerCase()
+          : undefined
+
+      const { bySession, warnings } = await readLastPromptTimes(ctx, exec)
+      const now = Date.now()
+
+      const all = listDispatches().map((record) => {
+        const rowWarnings = []
+        const status = boardStatus(record)
+        const startedMs = timeOf(record.startedAt)
+        const reportedMs = timeOf(record.reportedAt)
+
+        // The interval closes at the terminal timestamp when there is one, else now.
+        const closedByReport = status !== 'running' && reportedMs !== undefined
+        const rawElapsed = startedMs === undefined ? 0 : (closedByReport ? reportedMs : now) - startedMs
+        if (startedMs === undefined) {
+          rowWarnings.push('`startedAt` is missing or unparseable; elapsed and lastActivityAt are unknown')
+        } else if (rawElapsed < 0) {
+          // Dirty data: a report timestamp earlier than the dispatch start. A
+          // negative duration is never meaningful, so it is clamped, not shown.
+          rowWarnings.push('`reportedAt` precedes `startedAt`; elapsed clamped to 0')
+        }
+        const elapsedMs = Number.isFinite(rawElapsed) ? Math.max(0, Math.round(rawElapsed)) : 0
+
+        const lastActivityAt = closedByReport
+          ? record.reportedAt
+          : (record.startedAt ?? record.reportedAt)
+        const lastActivitySource =
+          status === 'reported' || status === 'abandoned'
+            ? (reportedMs === undefined ? 'started' : status === 'reported' ? 'reported' : 'abandoned')
+            : 'started'
+
+        // A recovered record is not a normal dispatch: it carries no task brief,
+        // and a `session-log` recovery proves no main session at all. Both are
+        // stated on the row instead of being flattened into a plain "running".
+        if (record.recoveredFrom !== undefined) {
+          rowWarnings.push(
+            record.recoveredFrom === 'session-log'
+              ? "rebuilt from this Session's own log after a restart — no checkpoint existed"
+              : 'rebuilt from the checkpoint written before a restart',
+          )
+        }
+        // `orphaned` is derived, not stored: the worker half decides "nobody to
+        // push to" from a missing main session id, and the board must use the
+        // same rule rather than trusting a flag only one path sets.
+        const orphaned = record.mainSessionId === undefined || record.orphaned === true
+        if (orphaned) {
+          rowWarnings.push('no main session is recorded; a report from this worker will not be pushed')
+        }
+
+        const lastPromptAt = bySession.get(String(record.workerSessionId))
+
+        return {
+          dispatchId: String(record.dispatchId ?? ''),
+          workerSessionId: String(record.workerSessionId ?? ''),
+          status,
+          elapsed: { ms: elapsedMs, human: humanDuration(elapsedMs), until: closedByReport ? status : 'now' },
+          lastActivityAt: String(lastActivityAt ?? ''),
+          lastActivitySource,
+          ...(lastPromptAt === undefined ? {} : { lastPromptAt }),
+          ...(record.recoveredFrom === undefined ? {} : { recoveredFrom: String(record.recoveredFrom) }),
+          ...(orphaned ? { orphaned: true } : {}),
+          ...(record.workspaceId === undefined ? {} : { workspaceId: String(record.workspaceId) }),
+          ...(record.workspaceTitle === undefined ? {} : { workspaceTitle: String(record.workspaceTitle) }),
+          ...(record.task === undefined ? {} : { taskExcerpt: excerpt(record.task) }),
+          ...(record.startedAt === undefined ? {} : { startedAt: String(record.startedAt) }),
+          ...(record.reportedAt === undefined ? {} : { reportedAt: String(record.reportedAt) }),
+          ...(record.reportId === undefined ? {} : { reportId: String(record.reportId) }),
+          ...(rowWarnings.length === 0 ? {} : { warnings: rowWarnings }),
+        }
+      })
+
+      const filtered =
+        needle === undefined
+          ? all
+          : all.filter(
+              (row) =>
+                String(row.workspaceId ?? '').toLowerCase().includes(needle) ||
+                String(row.workspaceTitle ?? '').toLowerCase().includes(needle),
+            )
+
+      // Newest dispatch first: a board is read from "what just went out" down.
+      // Undated rows sort last and keep insertion order. Compared explicitly
+      // instead of subtracting, because two undated rows would subtract to
+      // `-Infinity - -Infinity = NaN` and only sort stably by accident.
+      const ordered = filtered
+        .map((row, index) => ({ row, index, at: timeOf(row.startedAt) }))
+        .sort((left, right) => {
+          if (left.at === undefined || right.at === undefined) {
+            if (left.at !== right.at) return left.at === undefined ? 1 : -1
+            return left.index - right.index
+          }
+          return right.at - left.at || left.index - right.index
+        })
+        .slice(0, limit)
+        .map((entry) => entry.row)
+
+      const counts = { total: all.length, running: 0, reported: 0, abandoned: 0 }
+      for (const row of all) counts[row.status] += 1
+
+      const visible = { total: ordered.length, running: 0, reported: 0, abandoned: 0 }
+      for (const row of ordered) visible[row.status] += 1
+
+      return {
+        dispatches: ordered,
+        counts,
+        note:
+          (all.length === 0
+            ? 'no dispatch has been recorded in this process yet'
+            : `${visible.total} of ${counts.total} dispatch(es) shown; ` +
+              `${counts.running} running, ${counts.reported} reported, ${counts.abandoned} abandoned`) +
+          '. `lastActivityAt` is the last registry-visible transition (report, abandonment, or start), NOT the last message time; ' +
+          '`lastPromptAt`, when present, is the latest user-authored prompt and does not track worker progress.',
+        ...(warnings.length === 0 ? {} : { warnings }),
+      }
+    },
+  }
+}
+
 /* ------------------------------------------------------------------ *
  * activation
  * ------------------------------------------------------------------ */
@@ -410,4 +738,5 @@ export function apply(ctx, config = {}) {
   ctx.effect(() => ctx.tools.register(dispatchTaskTool(ctx, resolved)))
   ctx.effect(() => ctx.tools.register(readReportTool(ctx)))
   ctx.effect(() => ctx.tools.register(sendToSessionTool(ctx)))
+  ctx.effect(() => ctx.tools.register(listDispatchesTool(ctx)))
 }

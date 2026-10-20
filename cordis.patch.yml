@@ -8,6 +8,52 @@
 # The `main` row injects tools + sessionController + workspaceRegistry, and the
 # `worker` row injects tools + sessionController. Each row is mounted only from
 # its own preset, which is what keeps dispatch powers out of workers.
+#
+# One power is NOT owned by this bundle, so no preset can remove it:
+# `create_session` is registered by the profile-level bundle `dsh-session-kit`
+# into the HOST tree. See the patch row below for why only a profile-layer
+# disable reaches it.
+
+# ── Profile-layer policy: no Session-minting tool, anywhere ───────────────────
+#
+# `create_session` mints a user-visible Session and can hand it a first prompt,
+# which is dispatch by another name. A worker must not hold it.
+#
+# It cannot be disabled from inside a preset. Mechanisms checked, each with the
+# reason it fails:
+#   * A preset `plugins` entry is mounted by agent-preset-registry into its own
+#     PresetTree (mountPreset), a composition separate from the Host tree. An
+#     `- id: dsh-session-kit` row there addresses nothing outside itself; at
+#     best it mounts a second, disabled copy inside the preset realm while the
+#     host instance keeps running.
+#   * A preset row without `name` is rejected by entryListProblem ("names no
+#     plugin"), which fails the entire preset mount — so
+#     `- id: ... ` + `disabled: true` is not even a legal preset row.
+#   * `ctx.tools.restrict()` is correctly per-agent and would work, but it needs
+#     a plugin that calls it on the agent's context. This bundle ships no such
+#     row, and adding one goes beyond a two-file change.
+#
+# What does work: a profile-layer patch by id, applied after the bundle that
+# inserts the row (`dsh-session-kit` precedes this bundle in
+# dsh.profile.bundles). `name` is asserted, not used to rename. On a profile
+# without that bundle the patch warns "patch: entry <id> not found" and is
+# skipped, so this stays safe to install on its own.
+#
+# Consequence: create_session is gone process-wide — for workers AND for the
+# main conversation (and for their sub-agents, which share this tree). The main
+# conversation keeps its own dispatch path (dispatch_task / send_to_session /
+# read_report / list_workspaces / list_dispatches), so it loses nothing it
+# needs. Delete this row to restore the tool everywhere.
+#
+# VERIFIED HOW FAR: `dsh --profile web --dump-config` shows this row composed as
+# `disabled: true` (see VERIFICATION.md §1b), which proves the patch applies to
+# the composition. It does NOT prove the running process dropped the tool:
+# preset rows are not HMR-managed, so the runtime effect is only visible after
+# restarting `dsh web` and opening a new Session. That restart check has NOT
+# been done — treat this as "config correct", not "verified live".
+- id: dsh-session-kit
+  name: 'dsh-session-kit'
+  disabled: true
 
 - insert:
     - id: preset-discipline-whale
@@ -32,8 +78,9 @@
                    partial results. Never invent a result you did not receive.
                 3. Discuss content, architecture, and decisions with the user, and turn a new
                    decision into an instruction for an existing worker with send_to_session.
-                4. Do not write the implementation yourself. You may write summary documents and
-                   render interactive UI, and run small read-only checks, but the feature work
+                4. Do not write the implementation yourself. You have no shell and cannot create or
+                   edit files: your filesystem access is read-only. You may read, search, render
+                   interactive UI, and ask the user questions, but the feature work
                    belongs to a dispatched worker.
 
                 A report id in a pushed message names a stored document. Call read_report only
@@ -56,20 +103,32 @@
             config:
               read: true
               readImage: true
-              write: true
+              write: false
               edit: false
           - id: tool-fs-search
             name: '@deepseek-ai/dsh-tool-fs-search'
             config:
               sampleOverCapGlobResults: false
+          # No shell, so no shell-mediated writes. `write: false` above only
+          # closes the tool-fs entry point; bash redirects, `tee`, and `sed -i`
+          # all write files, which is why both shell stacks are pinned disabled
+          # instead of keeping their platform expressions.
           - id: tool-bash
             name: '@deepseek-ai/dsh-tool-bash'
-            disabled: !!js process.platform === 'win32'
+            disabled: true
           - id: tool-pwsh
             name: '@deepseek-ai/dsh-tool-pwsh'
-            disabled: !!js process.platform !== 'win32'
+            disabled: true
+          # Disabled with the shells. `job_*` exist to observe and stop
+          # background work, and the tools that start background jobs are
+          # tool-bash, tool-pwsh, tool-terminal and tool-workflow. This preset
+          # never mounts the last two, so with bash and pwsh gone the main
+          # session cannot create a job of its own and `job_*` could only ever
+          # report an empty list. (The job registry itself stays on the host
+          # plane; that is unaffected.)
           - id: tool-jobs
             name: '@deepseek-ai/dsh-tool-jobs'
+            disabled: true
           - id: tool-ask-user
             name: '@deepseek-ai/dsh-tool-ask-user'
           - id: tool-todo

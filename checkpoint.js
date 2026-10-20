@@ -1,0 +1,86 @@
+/**
+ * discipline-whale — the dispatch checkpoint file, shared by both rows.
+ *
+ * The dispatch registry is a process-local Map, so a Harness restart empties it
+ * while worker Sessions stay durable. The checkpoint is the on-disk record that
+ * lets a worker rebuild "who is waiting for me" after that restart.
+ *
+ * Both halves write it, which is why it lives here rather than in either row:
+ *
+ *   main   writes at `dispatch_task` time, so the window between the dispatch
+ *          returning and the worker's first lifecycle event is already covered
+ *   worker re-writes on its first lifecycle event, and drops the file once the
+ *          dispatch reaches a terminal state (delivered or abandoned)
+ *
+ * One path rule, one record shape, both callers: a duplicated formula in the
+ * two rows is exactly how "the worker reads a file nobody wrote" happens.
+ *
+ * @module discipline-whale/checkpoint
+ */
+
+import { randomUUID } from 'node:crypto'
+import { mkdir, rename, rm, writeFile } from 'node:fs/promises'
+import { hostname } from 'node:os'
+import { dirname, join } from 'node:path'
+
+import { STORE_DIRNAME, workspaceKey } from './store.js'
+
+/** Directory under the store root that holds dispatch checkpoints. */
+export const DISPATCH_DIRNAME = 'dispatches'
+
+/**
+ * One worker Session's checkpoint path.
+ *
+ * Keyed like a report directory (`workspaceKey`), so an id with a slash or a
+ * space can never escape the store directory.
+ */
+export function dispatchCheckpointPath(homeDir, workerSessionId) {
+  return join(homeDir, STORE_DIRNAME, DISPATCH_DIRNAME, `${workspaceKey(workerSessionId)}.json`)
+}
+
+/**
+ * The durable subset of a dispatch record.
+ *
+ * Deliberately narrower than the in-memory record: the task brief stays in the
+ * Session log, and only the routing facts a restarted worker needs are copied.
+ * Both writers produce this exact shape, so either may read the other's file.
+ */
+export function checkpointRecord(dispatch, workerSessionId) {
+  return {
+    dispatchId: dispatch.dispatchId,
+    workerSessionId,
+    mainSessionId: dispatch.mainSessionId,
+    workspaceId: dispatch.workspaceId,
+    workspaceTitle: dispatch.workspaceTitle,
+    startedAt: dispatch.startedAt,
+    checkpointedAt: new Date().toISOString(),
+    checkpointedBy: hostname(),
+  }
+}
+
+/**
+ * Persist one dispatch's routing facts atomically (temp file then rename).
+ *
+ * A reader may therefore see either the previous file or the complete new one,
+ * never a half-written JSON body. The temp name carries a random suffix because
+ * both rows can write the same target: a shared `${pid}.tmp` name would let two
+ * concurrent writers interleave into one temp file.
+ */
+export async function writeDispatchCheckpoint(homeDir, workerSessionId, dispatch) {
+  const target = dispatchCheckpointPath(homeDir, workerSessionId)
+  await mkdir(dirname(target), { recursive: true })
+  const temp = `${target}.${process.pid}.${randomUUID()}.tmp`
+  await writeFile(temp, `${JSON.stringify(checkpointRecord(dispatch, workerSessionId), null, 2)}\n`, 'utf8')
+  await rename(temp, target)
+  return target
+}
+
+/**
+ * Remove one checkpoint file.
+ *
+ * `force: true` makes this idempotent: the two rows can both decide a dispatch
+ * is finished, and a missing file is the desired end state either way.
+ */
+export function dropDispatchCheckpoint(homeDir, workerSessionId) {
+  return rm(dispatchCheckpointPath(homeDir, workerSessionId), { force: true }).catch(() => {})
+}

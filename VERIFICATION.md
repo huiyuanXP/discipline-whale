@@ -10,10 +10,62 @@
 
 ```
 node test/contract.mjs
-→ 9 项全过
+→ 17 项全过（含 15b）
 ```
 
-覆盖两半的挂载隔离、schema 合法性、派工、回报投递、强制回报重试与升级。
+覆盖两半的挂载隔离、schema 合法性、派工、回报投递、强制回报重试与升级、重启后的检查点恢复、看板三态与脏数据。
+
+> 本文件其余各节是 **2026-10-20 早先那次**真实端到端验证的记录，当时是 9 项契约测试、主会话还能写文件。那些结论没有被本次改动推翻的部分继续有效（派工、投递、强制回报），但工具面和测试数量以本节为准。第 9 节列出的缺口已按现状更新。
+
+---
+
+## 1b. 配置组合核对（不是运行时验证）
+
+用 `dsh --profile web --dump-config` 把整个 profile 的 patch 层组合出来，确认本包的改动真的进了最终配置树，而不只是写在 YAML 里：
+
+```
+$ DSH_HOME=<tmp copy> node .../dsh/lib/bin.js --profile web --dump-config
+exit=0，stderr 为空
+```
+
+关键片段（原样摘自 dump 输出）：
+
+```yaml
+# == dsh-session-kit, patched by discipline-whale
+- id: dsh-session-kit
+  name: dsh-session-kit
+  disabled: true
+```
+
+```yaml
+      - id: tool-fs
+        name: '@deepseek-ai/dsh-tool-fs'
+        config:
+          read: true
+          readImage: true
+          write: false
+          edit: false
+      - id: tool-fs-search
+        name: '@deepseek-ai/dsh-tool-fs-search'
+        config:
+          sampleOverCapGlobResults: false
+      - id: tool-bash
+        name: '@deepseek-ai/dsh-tool-bash'
+        disabled: true
+      - id: tool-pwsh
+        name: '@deepseek-ai/dsh-tool-pwsh'
+        disabled: true
+      - id: tool-jobs
+        name: '@deepseek-ai/dsh-tool-jobs'
+        disabled: true
+```
+
+**这只证明配置组合正确，不证明运行时生效。** preset 行不受 HMR 管理，实际工具面必须重启 `dsh web` 后新建两个 preset 的会话各看一眼才算实测 —— 那一步没做。
+
+顺带核对到的两个实现细节（读源码，不是推测）：
+
+- `applyEntryPatches`（`dsh-app-boot`）对非 insert patch 的顺序是：找不到 id → warn `patch: entry %C not found` 并跳过；`name` 与目标不符 → warn 并跳过。所以「未装 `dsh-session-kit` 的 profile 上安全跳过」成立，`name` 是断言而非改名。
+- `entryListProblem`（`dsh-agent-preset-registry`）要求 preset 内每一行都有非空 `name`，否则整个 preset 装载失败。所以「在 preset 里写一行只有 id + `disabled: true`」不是合法写法，README 里那条说法是对的。
 
 ---
 
@@ -148,25 +200,60 @@ TURN/END completed
 | 项 | 状态 |
 |---|---|
 | 真实 worker 连续三次不报告 → 升级通知 | 仅逻辑测试，未做真实复现 |
-| 派发后 Harness 重启，报告仍可读 | 设计如此（磁盘存储），未实测重启场景 |
+| 派工 → 清空内存注册表 → worker 报告 | **已做**，见第 9b 节（模拟重启，非真实进程重启） |
+| 真实 Harness 进程重启（`dsh web` 真被杀掉再起） | **未做**。检查点路径与恢复逻辑由测试和冒烟覆盖，但没有真的重启一次进程 |
+| `cordis.patch.yml` 的权限收紧在运行时生效 | **未做**，只核对了 `--dump-config` 的组合结果（第 1b 节）。**需重启后实测** |
+| 真实断网（TRANSPORT 错误）下的行为 | **未做**。测试里用合成的 `agent/error` 事件模拟，真实网络栈未中断过 |
 | 多 worker 并发派工 | 未测（注册表支持多条，但未构造并发场景） |
-| GUI 看板 | 未实现（按你的选择勾掉） |
+| GUI 看板面板 | 未实现（无侧边栏面板；`list_dispatches` 是主会话可调的工具） |
 | 工作区描述字段 | 未实现，路由仍靠标题/路径 |
+
+## 9b. 模拟重启冒烟（非单测）
+
+一个独立脚本，用真实的两半模块跑完整链路：派工 → `resetRegistry()` 清空全部内存 → 换一个全新的 main 行实例 → worker 报告。断言落在**主会话真的读了哪个文件**上，而不是内部返回值。
+
+```
+1) main session dispatches
+   dispatch: {"dispatchId":"dispatch-01ab6f68-...","workerSessionId":"session-1792508938731-1","status":"dispatched"}
+   checkpoint on disk before worker ever runs: session-main-smoke
+2) the board sees it as running
+    1 of 1 dispatch(es) shown; 1 running, 0 reported, 0 abandoned. ...
+3) RESTART — every in-memory record is destroyed
+   board after restart (process-local registry is empty): 0 row(s)
+4) worker reports with no live dispatch record
+   result: {"reportId":"r-38d55222-...","deliveredToMain":true,"warnings":["this Session has no live dispatch record — the Harness most likely restarted, ..."]}
+5) did the report actually reach the main session?
+   pushes to main session: 1
+   message:
+     | [Discipline Whale] Worker report — soc-api-test (done)
+     |
+     | Parser refactor done; tests green.
+     |
+     | report id: r-38d55222-...
+     | Call read_report with that id for the full document.
+6) the main session reads the stored document
+   read_report -> {"status":"delivered","document":"Changed 3 files.","deliveredTo":["session-main-smoke"],"recoveredFrom":"checkpoint"}
+7) checkpoint cleanup
+   checkpoint after delivery: removed
+
+SMOKE PASS
+```
+
+和单测的区别：单测验证的是每个断言点；这个脚本验证的是**链路**——报告文件被 `read_report` 读到、推送真的进到主会话、检查点被删干净。它仍然不是真实 Host：`sessionController` 是假的，重启是 `resetRegistry()` 而不是杀进程。
 
 ---
 
 ## 10. 交付状态
 
 - 主包 `discipline-whale` 已安装到 web profile（`link:/Users/huiyuan/Developer/test/soc-api-test/discipline-whale`）
-- 所有修复已回写主包，`node test/contract.mjs` 9 项全过
-- **需要重启 DSH 一次**，让修复后的模块代码在 preset 行上生效
-- 临时验证副本 `dw-livecheck` / `dw-livecheck2` 已卸载并删除
+- `node test/contract.mjs` **17 项全过**（含 15b）
+- **需要重启 DSH 一次**：`cordis.patch.yml` 的权限收紧和 preset 内的模块代码都要重启才在已加载的插件行上生效。**本次没有重启验证**。
 
 ## 复验命令
 
 ```bash
 cd discipline-whale
-node test/contract.mjs      # 9 项契约测试
+node test/contract.mjs      # 17 项契约测试
 ```
 
-真实端到端复验：安装后重启 DSH，选 Discipline Whale preset 新建会话，让它 `dispatch_task` 到一个工作区，观察 worker 完成后主会话是否自动收到一条 `[Discipline Whale] Worker report` 消息。
+真实端到端复验：**重启 DSH 后**，选 Discipline Whale preset 新建一个会话，先确认工具面符合预期（没有 `write` / `edit` / `bash`，主会话没有 `create_session`），再让它 `dispatch_task` 到一个工作区，观察 worker 完成后主会话是否自动收到一条 `[Discipline Whale] Worker report` 消息。

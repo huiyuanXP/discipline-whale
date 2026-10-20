@@ -14,12 +14,14 @@
     "./registry": "./registry.js",
     "./locale/*.json": "./locale/*.json",
     "./icon": "./icon.svg",
-    "./package.json": "./package.json"
+    "./package.json": "./package.json",
+    "./checkpoint": "./checkpoint.js"
   },
   "files": [
     "main.js",
     "worker.js",
     "store.js",
+    "checkpoint.js",
     "registry.js",
     "cordis.patch.yml",
     "locale/*.json",
