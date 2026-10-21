@@ -139,13 +139,17 @@
               watchdogCounting: all
           # Output discipline (adhd.js): the ADHD ruleset as a prompt section,
           # the same file registered as the `whale-brevity` skill into this
-          # preset's scope, and a next-step correction when one reply's prose
-          # runs long. Main preset only — a worker's report must stay detailed,
+          # preset's scope, a next-step reminder when a turn's prose runs long,
+          # and a turn-end rewrite when the final answer does. Main preset only — a worker's report must stay detailed,
           # so this row must never be copied into the worker preset below.
           #
-          #   maxProseChars     visible prose characters per reply (0 = no prose)
-          #   maxCorrections    corrections per user turn (0 = never inject)
-          #   enabled           false turns the whole discipline off
+          #   maxProseChars        plain-chat prose limit (0 = no prose)
+          #   decisionProseChars   limit for option/explanation turns. An
+          #                        explicit value is used verbatim; omit it to
+          #                        derive max(400, maxProseChars * 5).
+          #   maxCorrections       per user turn, for each of the reminder and
+          #                        the rewrite (0 = never inject)
+          #   enabled              false turns the whole discipline off
           #
           # Omit any key to keep its default. Invalid values fall back, exactly
           # like the guard's knobs; a bad number never takes the main row down.
@@ -153,6 +157,7 @@
             name: 'discipline-whale/adhd'
             config:
               maxProseChars: 1200
+              decisionProseChars: 400
               maxCorrections: 1
               enabled: true
           # Memory (memory-row.js): Soul / User / Memory and the workspace cards

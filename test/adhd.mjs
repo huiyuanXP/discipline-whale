@@ -10,9 +10,10 @@
  *   2. the scope — the main preset assembles the rules and can load the skill,
  *      the worker preset gets neither, and a worker Agent reaching a hook is
  *      passed straight through `next()` without a counter being created;
- *   3. the mechanism is an injection, never a rewrite: over-long prose earns
- *      one reminder on the *next* step, a UI turn earns none, and the tool gate
- *      never denies anything (it must not touch the guard's brakes).
+ *   3. the mechanism is two injections: over-long prose earns one reminder on
+ *      the *next* step, an over-long final answer earns one rewrite at turn end,
+ *      a UI turn earns neither, and the tool gate never denies anything (it
+ *      must not touch the guard's brakes).
  *
  * Run: node test/adhd.mjs
  */
@@ -25,13 +26,17 @@ import { fileURLToPath } from 'node:url'
 import {
   DEFAULT_MAX_CORRECTIONS,
   DEFAULT_MAX_PROSE_CHARS,
+  REWRITE_NOTICE_SUMMARY,
   RULES_SECTION_NAME,
   SKILL_NAME,
   TEXT_CHANNEL_TOOLS,
   UI_EXEMPT_TOOLS,
   apply,
+  brevityNotice,
   countTextInArgs,
+  decisionShapeContract,
   installBrevity,
+  isDecisionTurn,
   isBrevityInstalled,
   isUiTurn,
   loadRules,
@@ -364,11 +369,26 @@ function mountBrevity(config = {}) {
   const userTurn = (agent, message = { source: { kind: 'user' } }) =>
     emit('agent/inbox/claimed', { agent, message })
 
-  return { handle, second, registrations, listeners, emit, say, callTool, preStep, userTurn }
+  /** The opening frame of one model attempt (a new step, or a retry). */
+  const start = (agent, step = 1) => emit('agent/assistant-stream', { agent, frame: { type: 'start', turn: 1, step } })
+
+  /** The serial turn-end hook, awaited the way `agent-loop` awaits it. */
+  const turnStopping = async (agent, signal = new AbortController().signal) => {
+    for (const handler of listeners.get('agent/turn-stopping') ?? []) await handler({ agent, turn: 1, signal })
+  }
+
+  return { handle, second, registrations, listeners, emit, say, callTool, preStep, userTurn, start, turnStopping }
 }
 
 const mainAgent = (id = 'main-adhd') => ({ session: { id, header: { agentPreset: 'discipline-whale' } } })
 const workerAgent = (id = 'worker-adhd') => ({ session: { id, header: { agentPreset: 'discipline-whale-worker' } } })
+
+/** An Agent with a live steer channel, recording what reaches `next-step`. */
+const steerable = (agent) => {
+  const steered = []
+  agent.steer = (message) => steered.push(message)
+  return { agent, steered }
+}
 
 {
   // --- the worker is never touched -----------------------------------
@@ -409,7 +429,8 @@ const workerAgent = (id = 'worker-adhd') => ({ session: { id, header: { agentPre
   const first = await host.preStep(main)
   assert.equal(first.length, 1, 'the over-long turn earns exactly one injected reminder')
   const notice = first[0].content?.[0]?.text ?? ''
-  assert.ok(notice.includes('简洁'), `the reminder must be about brevity, got: ${notice.slice(0, 80)}`)
+  assert.ok(notice.includes('超过'), `the reminder must name the overrun, got: ${notice.slice(0, 80)}`)
+  assert.ok(notice.includes('3 行'), 'the plain-chat reminder carries the countable target')
   assert.equal(first[0].role, 'user', 'the reminder is a user-role context message')
   assert.equal(first[0].source.kind, 'plugin:discipline-whale:brevity', 'the reminder is attributable')
 
@@ -642,6 +663,10 @@ const workerAgent = (id = 'worker-adhd') => ({ session: { id, header: { agentPre
     listeners.some((entry) => entry.event === 'agent/pre-step'),
     'main.apply wires the correction injection',
   )
+  assert.ok(
+    listeners.some((entry) => entry.event === 'agent/turn-stopping'),
+    'main.apply wires the turn-end rewrite',
+  )
   // Both rows now share `agent/assistant-stream` and `tools/pre-execute`; they
   // must be separate listeners, not one merged handler: the guard counts reads,
   // this counts characters.
@@ -681,9 +706,536 @@ const workerAgent = (id = 'worker-adhd') => ({ session: { id, header: { agentPre
     1,
     'and exactly one agent/pre-step listener across both rows',
   )
+  assert.equal(
+    host.registrations.get('agent/turn-stopping') ?? 0,
+    1,
+    'and exactly one agent/turn-stopping listener across both rows',
+  )
   assert.equal(host.second.installed, false, 'the sibling row reports a no-op install')
 
   console.log('ok 9b — two rows, one brevity listener on each event; the sibling install is a no-op')
+}
+
+/* ------------------------------------------------------------------ *
+ * 10. isDecisionTurn — "compress hard" vs "structure is allowed"
+ * ------------------------------------------------------------------ */
+
+{
+  // Plain chat / judgement / boundary / pending decision → compress hard.
+  // `为什么` is deliberately NOT here: asking why is asking for an explanation,
+  // which belongs to the structured group below.
+  for (const text of ['现在进度怎么样了', '你觉得这个方向行吗', '好', '继续', '这个能不能做', '接下来呢']) {
+    assert.equal(isDecisionTurn(text), false, `plain chat must compress: ${JSON.stringify(text)}`)
+  }
+
+  // A turn that needs options or evidence on the table → numbered structure.
+  for (const text of [
+    '我有哪些选项',
+    '有哪些方案，各自利弊',
+    '对比一下这两种做法',
+    '给我几个选择',
+    '列出 pros and cons',
+    'what are my options',
+    'compare the two approaches',
+    'explain how this works',
+    '为什么',
+  ]) {
+    assert.equal(isDecisionTurn(text), true, `option/evidence request allows structure: ${JSON.stringify(text)}`)
+  }
+
+  assert.equal(isDecisionTurn(undefined), false, 'no turn text means no exception')
+  assert.equal(isDecisionTurn(''), false)
+
+  // The exception must still honour the shape rule: structured, not prose.
+  const contract = decisionShapeContract()
+  assert.ok(contract.includes('编号'), 'the exception still demands numbering')
+  assert.ok(contract.includes('一行'), 'the exception still demands one line per item')
+  assert.ok(contract.includes('不是散文'), 'the exception still forbids prose paragraphs')
+
+  console.log('ok 10 — isDecisionTurn separates plain chat (compress) from option/evidence turns (structure allowed)')
+}
+
+{
+  // The classification must not weaken the UI exemption: a render turn stays
+  // exempt regardless of what the user asked.
+  const config = resolveBrevityConfig({ maxProseChars: 50 })
+  const uiDecision = shouldEnforceBrevity({
+    toolCalls: ['render_canvas'],
+    chars: 5000,
+    config,
+    userText: '我有哪些选项',
+  })
+  assert.equal(uiDecision.enforce, false, 'UI still wins over every other rule')
+  assert.equal(uiDecision.reason, 'ui-deliverable')
+
+  // `render_text` is still measured, but on a decision turn it is measured
+  // against the larger decision budget — it never becomes exempt.
+  const textToolDecision = shouldEnforceBrevity({
+    toolCalls: ['render_text'],
+    chars: 5000,
+    config,
+    userText: '我有哪些选项',
+  })
+  assert.equal(textToolDecision.reason, 'over-limit', 'the larger budget is still a budget')
+  assert.equal(textToolDecision.limit, config.decisionProseChars, 'the decision limit is the one applied')
+
+  console.log('ok 10b — the decision exception raises the limit; it never cancels the UI exemption or render_text counting')
+}
+
+{
+  // A decision turn gets the larger budget; plain chat gets the tight one.
+  const config = resolveBrevityConfig({ maxProseChars: 80, decisionProseChars: 400 })
+  const plain = shouldEnforceBrevity({ toolCalls: [], chars: 200, config, userText: '好' })
+  assert.equal(plain.enforce, true, 'plain chat is held to the tight limit')
+  assert.equal(plain.limit, 80)
+
+  const decision = shouldEnforceBrevity({ toolCalls: [], chars: 200, config, userText: '我有哪些选项' })
+  assert.equal(decision.enforce, false, 'the same length is fine when the user asked for options')
+  assert.equal(decision.limit, 400)
+
+  // The notice differs: a decision turn is told to structure, not merely cut.
+  const plainNotice = brevityNotice({ limit: 80, overBy: 120, decision: false })
+  const decisionNotice = brevityNotice({ limit: 400, overBy: 20, decision: true })
+  assert.ok(plainNotice.includes('删到'), 'plain chat is told to cut')
+  assert.ok(decisionNotice.includes('编号'), 'a decision turn is told to number the options')
+  assert.notEqual(plainNotice, decisionNotice, 'the two paths do not share one notice')
+
+  // Config fallback: an invalid or omitted decision limit derives a larger
+  // budget from the plain one instead of throwing.
+  assert.equal(resolveBrevityConfig({ maxProseChars: 100, decisionProseChars: -5 }).decisionProseChars > 100, true)
+  assert.equal(resolveBrevityConfig({ maxProseChars: 100 }).decisionProseChars > 100, true)
+
+  console.log('ok 10c — decision turns get a larger budget and a different notice; invalid values fall back')
+}
+
+/* ------------------------------------------------------------------ *
+ * 11. the prompt carries the countable anchor, not a character count
+ * ------------------------------------------------------------------ */
+
+{
+  const { body } = loadRules()
+  // The model cannot count characters reliably; it can count lines and items.
+  assert.ok(body.includes('3 行'), 'the rules give a countable anchor (3 lines)')
+  assert.ok(body.includes('结论 + 下一个动作'), 'the rules name what the short form must contain')
+  assert.ok(!body.includes('1200'), 'the prompt must not ask the model to count to a raw character budget')
+
+  const { assemblePresetPrompt } = await import('../prompt-probe.mjs')
+  const main = await assemblePresetPrompt('discipline-whale')
+  assert.ok(main.includes('3 行'), 'the assembled main prompt carries the countable anchor')
+  assert.ok(main.includes('发出前'), 'the assembled main prompt carries the pre-send self-check')
+
+  const worker = await assemblePresetPrompt('discipline-whale-worker')
+  assert.ok(!worker.includes('3 行'), 'the worker prompt must not carry the brevity anchor')
+
+  console.log('ok 11 — the prompt teaches a countable anchor and a pre-send check, main preset only')
+}
+
+/* ------------------------------------------------------------------ *
+ * 12. the decision budget actually reaches the decision
+ * ------------------------------------------------------------------ */
+
+{
+  // Regression: `installBrevity` resolves its own config. A decision turn must
+  // be judged against `decisionProseChars`, not the chat budget — a caller that
+  // only passes `maxProseChars` must still get the larger decision limit.
+  const host = mountBrevity({ maxProseChars: 80 })
+  const main = mainAgent('main-decision')
+
+  host.userTurn(main, {
+    source: { kind: 'user' },
+    content: [{ type: 'text', text: '给我详细讲讲你自己' }],
+  })
+  host.say(main, 'x'.repeat(300)) // 300 < 400 (derived decision budget)
+  assert.equal(
+    (await host.preStep(main)).length,
+    0,
+    '300 chars on a decision turn is inside the 400-char decision budget',
+  )
+
+  // The same 300 chars on a plain-chat turn is over the 80-char budget.
+  const plain = mainAgent('main-plain')
+  host.userTurn(plain, { source: { kind: 'user' }, content: [{ type: 'text', text: '这个能不能做' }] })
+  host.say(plain, 'x'.repeat(300))
+  assert.equal((await host.preStep(plain)).length, 1, 'the same length is over budget for plain chat')
+
+  console.log('ok 12 — the decision budget reaches the decision: 300 chars passes on a decision turn, fails on chat')
+}
+
+/* ------------------------------------------------------------------ *
+ * 13. every resolver key survives the schema — the whole class, not one key
+ * ------------------------------------------------------------------ */
+
+{
+  // The defect: `decisionProseChars` was honoured by the resolver, dropped by
+  // `Config`, and no test noticed, because every test of it called the resolver
+  // directly. The fix is not one more assertion — it is asserting the *class*:
+  // for each key a resolver reads, a config carrying it must arrive intact at
+  // the resolver through the real `Config.validate` path.
+  const mainRow = await import('../main.js')
+  const { GUARD_CONFIG_KEYS, resolveGuardConfig } = await import('../guard.js')
+  const { BREVITY_CONFIG_KEYS } = await import('../adhd.js')
+
+  // A representative, distinct value per key. `0` and `false` are included
+  // where legal: they are the values a truthiness bug would drop.
+  const SAMPLES = {
+    watchdogThreshold: 7,
+    readQuota: 3,
+    maxInterventions: 0,
+    watchdogCounting: 'read-only',
+    maxProseChars: 120,
+    decisionProseChars: 700,
+    maxCorrections: 0,
+    enabled: false,
+  }
+
+  const allKeys = [...GUARD_CONFIG_KEYS, ...BREVITY_CONFIG_KEYS]
+  for (const key of allKeys) {
+    assert.ok(Object.hasOwn(SAMPLES, key), `no sample value for key ${key}; add one to keep this exhaustive`)
+  }
+
+  // 1. Each key alone survives the schema.
+  for (const key of allKeys) {
+    const validated = mainRow.Config['~standard'].validate({ [key]: SAMPLES[key] })
+    assert.equal(validated.issues, undefined, `Config must accept ${key}`)
+    assert.equal(
+      validated.value[key],
+      SAMPLES[key],
+      `${key} must survive Config validation (this is the check whose absence let decisionProseChars go inert)`,
+    )
+  }
+
+  // 2. All of them together survive: a later key must not shadow an earlier one.
+  const all = mainRow.Config['~standard'].validate({ ...SAMPLES })
+  assert.equal(all.issues, undefined)
+  for (const key of allKeys) {
+    assert.equal(all.value[key], SAMPLES[key], `${key} must survive alongside every other key`)
+  }
+
+  // 3. The schema carries nothing the resolvers ignore, and ignores nothing
+  //    they read. This is the direction that catches a key added to a resolver
+  //    and forgotten in the schema — the exact shape of the original defect.
+  const carried = Object.keys(all.value).filter((key) => key !== 'workerPreset').sort()
+  assert.deepEqual(carried, [...allKeys].sort(), 'Config must carry exactly the keys the resolvers read')
+
+  // 4. The values reach the resolvers, not merely the object.
+  const guardCfg = resolveGuardConfig(all.value)
+  assert.equal(guardCfg.watchdogThreshold, SAMPLES.watchdogThreshold)
+  assert.equal(guardCfg.readQuota, SAMPLES.readQuota)
+  assert.equal(guardCfg.maxInterventions, SAMPLES.maxInterventions)
+  assert.equal(guardCfg.watchdogCounting, SAMPLES.watchdogCounting)
+
+  const brevityCfg = resolveBrevityConfig(all.value)
+  assert.equal(brevityCfg.maxProseChars, SAMPLES.maxProseChars)
+  assert.equal(brevityCfg.decisionProseChars, SAMPLES.decisionProseChars, 'the configured decision budget is the effective one')
+  assert.equal(brevityCfg.maxCorrections, SAMPLES.maxCorrections)
+  assert.equal(brevityCfg.enabled, SAMPLES.enabled)
+
+  console.log('ok 13 — every key both resolvers read survives Config; nothing extra is carried')
+}
+
+/* ------------------------------------------------------------------ *
+ * 14. an explicit decisionProseChars is honoured, and never silently replaced
+ * ------------------------------------------------------------------ */
+
+{
+  // The shipped pair is the case that was wrong: `1200 / 400` used to resolve
+  // to 6000, fifteen times the documented number, with no warning.
+  const shipped = resolveBrevityConfig({ maxProseChars: 1200, decisionProseChars: 400 })
+  assert.equal(shipped.decisionProseChars, 400, 'an explicit value is the effective value')
+  assert.equal(shipped.decisionDerived, false, 'and it is reported as explicit, not derived')
+  // An adopted value is not an error, so it produces a NOTE, not a warning —
+  // but the note is what makes "400 is in effect" observable, which is the
+  // whole point. Silence is what made the old rule expensive.
+  assert.equal(shipped.warnings.length, 0, 'an honoured explicit value is not a failure')
+  assert.equal(shipped.notes.length, 1, 'it is still reported')
+  assert.ok(shipped.notes[0].includes('400'), 'the note names the value the operator wrote')
+  assert.ok(shipped.notes[0].includes('in effect'), 'and says it is in effect')
+  assert.ok(shipped.notes[0].includes('1200'), 'and names the budget it sits below')
+
+  // Omission is the only path that derives.
+  const omitted = resolveBrevityConfig({ maxProseChars: 1200 })
+  assert.equal(omitted.decisionProseChars, 6000, 'omitting the key derives max(400, 1200*5)')
+  assert.equal(omitted.decisionDerived, true)
+  assert.equal(omitted.warnings.length, 0, 'deriving is normal, not a warning')
+
+  // Any positive explicit value wins, above or below the chat budget — the
+  // whole point of the user's ruling: a written number is the number.
+  for (const value of [1, 400, 800, 1200, 1201, 8000]) {
+    const cfg = resolveBrevityConfig({ maxProseChars: 1200, decisionProseChars: value })
+    assert.equal(cfg.decisionProseChars, value, `explicit ${value} must win`)
+    assert.equal(cfg.decisionDerived, false)
+    assert.equal(cfg.decisionSource, 'explicit', `explicit ${value} must be reported as explicit`)
+  }
+  // The three numbers from the ruling, verbatim.
+  assert.equal(resolveBrevityConfig({ maxProseChars: 1200, decisionProseChars: 400 }).decisionProseChars, 400)
+  assert.equal(resolveBrevityConfig({ maxProseChars: 1200 }).decisionProseChars, 6000)
+  assert.equal(resolveBrevityConfig({ maxProseChars: 1200, decisionProseChars: 1201 }).decisionProseChars, 1201)
+
+  // A value that is not a positive integer derives — and SAYS SO. This is the
+  // one rejection path left, so it is the one that most needs to be visible:
+  // an operator who typed `0` or `-5` must not be left believing it applied.
+  for (const bad of [0, -1, 1.5, 'x', null, Number.NaN]) {
+    const cfg = resolveBrevityConfig({ maxProseChars: 1200, decisionProseChars: bad })
+    assert.equal(cfg.decisionProseChars, 6000, `invalid ${JSON.stringify(bad)} derives`)
+    assert.equal(cfg.decisionDerived, true)
+    assert.equal(cfg.decisionSource, 'derived')
+    assert.equal(cfg.warnings.length, 1, `invalid ${JSON.stringify(bad)} must be reported, not swallowed`)
+    assert.ok(
+      cfg.warnings[0].includes('not a positive integer'),
+      `the warning must say why ${JSON.stringify(bad)} was rejected`,
+    )
+  }
+
+  // The warning reaches a log line, not just the return value: an unread
+  // warning is the same blindness that made the old rule expensive.
+  const logged = []
+  const ctx = { logger: { warn: (...args) => logged.push(args.join(' ')) }, on: () => () => {}, get: () => undefined }
+  installBrevity(ctx, { maxProseChars: 1200, decisionProseChars: 0 })
+  assert.ok(
+    logged.some((line) => line.includes('decisionProseChars') && line.includes('not a positive integer')),
+    `a rejected value must be logged at install, got: ${JSON.stringify(logged)}`,
+  )
+
+  // An honoured value logs nothing to `warn` (it is not a problem) but the
+  // handle still reports it, so "400 is in effect" is observable from code.
+  const quiet = []
+  const ctx2 = { logger: { warn: (...args) => quiet.push(args.join(' ')) }, on: () => () => {}, get: () => undefined }
+  const handle = installBrevity(ctx2, { maxProseChars: 1200, decisionProseChars: 400 })
+  assert.equal(quiet.length, 0, 'an honoured explicit value is not a warning')
+  assert.equal(handle.config.decisionProseChars, 400, 'but the effective value is on the handle')
+  assert.equal(handle.config.decisionSource, 'explicit', 'and its provenance is too')
+  assert.ok(
+    (handle.config.notes ?? []).some((n) => n.includes('400') && n.includes('in effect')),
+    'the note states that 400 is in effect',
+  )
+
+  console.log('ok 14 — an explicit decision budget wins verbatim; only omission derives; a rejected value warns')
+}
+
+/* ------------------------------------------------------------------ *
+ * 15. the shipped preset config and the documented numbers agree
+ * ------------------------------------------------------------------ */
+
+{
+  const { readFile } = await import('node:fs/promises')
+  const yamlModule = await import(join(HOST_MODULES, 'js-yaml/index.js'))
+  const yaml = yamlModule.default ?? yamlModule
+  const JsExpr = new yaml.Type('tag:yaml.org,2002:js', {
+    kind: 'scalar',
+    resolve: (data) => typeof data === 'string',
+    construct: (data) => ({ __jsExpr: data }),
+  })
+  const text = await readFile(new URL('../cordis.patch.yml', import.meta.url), 'utf8')
+  const patches = yaml.load(text, { schema: yaml.DEFAULT_SCHEMA.extend([JsExpr]) }) ?? []
+  const inserted = patches.flatMap((entry) => (Array.isArray(entry?.insert) ? entry.insert : []))
+  const preset = inserted.find((entry) => entry?.config?.id === 'discipline-whale')
+  const row = preset.config.plugins.find((r) => r?.name === 'discipline-whale/adhd')
+  assert.ok(row, 'the main preset declares the brevity row')
+
+  const configured = row.config ?? {}
+  assert.equal(configured.decisionProseChars, 400, 'the shipped decision budget is the user-ruled 400')
+  assert.equal(configured.maxProseChars, 1200, 'and the shipped chat budget is 1200')
+
+  const effective = resolveBrevityConfig(configured)
+  // The defect this proves fixed: whatever the preset says must be what runs.
+  assert.equal(
+    effective.decisionProseChars,
+    400,
+    'the shipped 400 must be the effective value, not the derived 6000 the old rule substituted',
+  )
+  assert.equal(effective.decisionSource, 'explicit', 'and it must be reported as an explicit value')
+  assert.equal(effective.warnings.length, 0, 'a deliberate explicit pair is not a failure')
+  assert.ok(
+    effective.notes.some((n) => n.includes('400') && n.includes('in effect')),
+    'the shipped 400 is observable as "in effect"',
+  )
+
+  // The decisive consequence, stated as a behavior: a 500-char decision reply
+  // is over 400 (fires) and would NOT be over the derived 6000 (silent).
+  const fiveHundred = shouldEnforceBrevity({
+    toolCalls: [],
+    chars: 500,
+    config: effective,
+    userText: '解释一下这个仓库',
+  })
+  assert.equal(fiveHundred.enforce, true, 'the shipped config must fire on a 500-char decision reply')
+  assert.equal(fiveHundred.limit, 400, 'because the limit in force is 400, not 6000')
+
+  // And the prompt's own countable anchor must not contradict the numbers.
+  const { body } = loadRules()
+  assert.ok(body.includes('3 行'), 'the prompt still teaches the countable anchor')
+  assert.ok(!body.includes('6000'), 'the prompt must not carry the derived number')
+
+  console.log('ok 15 — the shipped 400 is the effective decision budget, and a 500-char decision reply fires')
+}
+
+/* ------------------------------------------------------------------ *
+ * 16. turn end: a single-step over-long answer is rewritten
+ * ------------------------------------------------------------------ */
+
+{
+  // The case the user hit: one step streams the whole answer and the turn
+  // ends. No pre-step follows it, so the turn-end hook is the one boundary
+  // that sees it. Its steer lands in `next-step`, which is what makes
+  // `agent-loop` run one more step instead of closing the turn.
+  const host = mountBrevity({ maxProseChars: 100 })
+  const { agent: main, steered } = steerable(mainAgent('main-single-step'))
+
+  host.userTurn(main)
+  host.start(main)
+  host.say(main, 'x'.repeat(5000)) // one enormous answer
+  await host.turnStopping(main)
+
+  assert.equal(steered.length, 1, 'the over-long answer earns exactly one rewrite steer')
+  const text = steered[0].content?.[0]?.text ?? ''
+  assert.ok(text.includes('5000'), `the rewrite names the real length, got: ${text.slice(0, 80)}`)
+  assert.ok(text.includes('重写'), 'the notice asks for a rewrite, not for a shorter next reply')
+  assert.ok(text.includes('100 字以内'), 'the notice states the budget the rewrite must fit')
+  assert.ok(text.includes('折叠'), 'the notice tells the model the draft folds away, so the rewrite stands alone')
+  assert.ok(text.includes('3 行'), 'a plain-chat rewrite carries the countable target')
+  assert.equal(steered[0].role, 'user')
+  assert.equal(steered[0].source.kind, 'plugin:discipline-whale:brevity', 'the rewrite steer is attributable')
+  assert.equal(steered[0].source.form, 'notice', 'it renders as a notice row, not as a user bubble')
+  assert.equal(steered[0].source.summary, REWRITE_NOTICE_SUMMARY, 'readers of the log key on this summary')
+
+  // The rewrite is a fresh attempt. Still too long: the budget is spent and
+  // the turn is allowed to close — no loop.
+  host.start(main, 2)
+  host.say(main, 'y'.repeat(300))
+  await host.turnStopping(main)
+  assert.equal(steered.length, 1, 'one rewrite per user turn: a second over-long answer closes the turn')
+
+  // The next user turn re-arms it.
+  host.userTurn(main)
+  host.start(main)
+  host.say(main, 'z'.repeat(300))
+  await host.turnStopping(main)
+  assert.equal(steered.length, 2, 'a new user turn can be rewritten again')
+
+  console.log('ok 16 — a single-step over-long answer is rewritten at turn end, once per user turn')
+}
+
+/* ------------------------------------------------------------------ *
+ * 17. turn end measures the answer, not the process
+ * ------------------------------------------------------------------ */
+
+{
+  // Only the final attempt stays unfolded once the turn completes, so only its
+  // prose decides the rewrite. A long process with a short answer is fine; a
+  // short process with a long answer is not.
+  const host = mountBrevity({ maxProseChars: 100, maxCorrections: 0 })
+  const { agent: main, steered } = steerable(mainAgent('main-answer-only'))
+  host.userTurn(main)
+  host.start(main, 1)
+  host.say(main, 'p'.repeat(90))
+  host.start(main, 2)
+  host.say(main, 'a'.repeat(90)) // turn total 180, answer 90
+  await host.turnStopping(main)
+  assert.equal(steered.length, 0, '`maxCorrections: 0` means the turn end never injects either')
+
+  const live = mountBrevity({ maxProseChars: 100 })
+  const { agent: other, steered: otherSteered } = steerable(mainAgent('main-answer-measure'))
+  live.userTurn(other)
+  live.start(other, 1)
+  live.say(other, 'p'.repeat(90))
+  live.start(other, 2)
+  live.say(other, 'a'.repeat(90))
+  await live.turnStopping(other)
+  assert.equal(otherSteered.length, 0, 'a 90-char answer fits even though the turn streamed 180')
+
+  live.userTurn(other)
+  live.start(other, 1)
+  live.say(other, 'p'.repeat(20))
+  live.start(other, 2)
+  live.say(other, 'a'.repeat(150))
+  await live.turnStopping(other)
+  assert.equal(otherSteered.length, 1, 'a 150-char answer is rewritten')
+  assert.ok((otherSteered[0].content?.[0]?.text ?? '').includes('150'), 'the notice counts the answer only')
+
+  // A retried attempt replaces the failed one: its own `start` restarts the count.
+  live.userTurn(other)
+  live.start(other, 1)
+  live.say(other, 'f'.repeat(500)) // attempt fails mid-stream
+  live.start(other, 1) // retry of the same step
+  live.say(other, 'r'.repeat(50))
+  await live.turnStopping(other)
+  assert.equal(otherSteered.length, 1, 'the answer is the retried attempt, not the failed one')
+
+  console.log('ok 17 — the turn end measures the final attempt; process prose and failed attempts do not count')
+}
+
+{
+  // --- the two boundaries keep separate budgets -----------------------
+  //
+  // A mid-turn reminder must leave the rewrite available: the answer the user
+  // reads after the fold is the one that matters most.
+  const host = mountBrevity({ maxProseChars: 100, maxCorrections: 1 })
+  const { agent: main, steered } = steerable(mainAgent('main-both'))
+  host.userTurn(main)
+  host.start(main, 1)
+  host.say(main, 'p'.repeat(300))
+  await host.callTool(main, 'list_workspaces')
+  await host.preStep(main) // mid-turn reminder fires, through the steer channel
+  assert.equal(steered.length, 1, 'the mid-turn reminder fires')
+  assert.ok((steered[0].content?.[0]?.text ?? '').includes('下一条回复'), 'that one is the mid-turn reminder')
+
+  host.start(main, 2)
+  host.say(main, 'a'.repeat(300))
+  await host.turnStopping(main)
+  assert.equal(steered.length, 2, 'the turn-end rewrite still has its own budget')
+  assert.ok((steered[1].content?.[0]?.text ?? '').includes('重写'), 'the second one is the rewrite')
+
+  // After the rewrite the next pre-step starts clean: no double reminder.
+  await host.preStep(main)
+  assert.equal(steered.length, 2, 'the rewrite step is not reminded about the draft it replaces')
+
+  console.log('ok 17b — the mid-turn reminder and the turn-end rewrite keep separate budgets')
+}
+
+{
+  // --- scope and exemptions hold at turn end --------------------------
+  const host = mountBrevity({ maxProseChars: 10 })
+
+  const { agent: worker, steered: workerSteered } = steerable(workerAgent('worker-end'))
+  host.start(worker)
+  host.say(worker, 'w'.repeat(5000))
+  await host.turnStopping(worker)
+  assert.equal(workerSteered.length, 0, 'a worker turn never gets a rewrite')
+  assert.equal(host.handle.sessions.has('worker-end'), false, 'and never gets a counter')
+
+  const { agent: ui, steered: uiSteered } = steerable(mainAgent('main-ui-end'))
+  host.userTurn(ui)
+  await host.callTool(ui, 'render_ui', { document: {} })
+  host.start(ui, 2)
+  host.say(ui, 'c'.repeat(500))
+  await host.turnStopping(ui)
+  assert.equal(uiSteered.length, 0, 'a turn that delivered a UI is exempt at turn end too')
+
+  const { agent: aborted, steered: abortedSteered } = steerable(mainAgent('main-aborted-end'))
+  host.userTurn(aborted)
+  host.start(aborted)
+  host.say(aborted, 'x'.repeat(500))
+  const controller = new AbortController()
+  controller.abort()
+  await host.turnStopping(aborted, controller.signal)
+  assert.equal(abortedSteered.length, 0, 'an aborted turn is left to close')
+
+  const off = mountBrevity({ enabled: false, maxProseChars: 1 })
+  const { agent: quiet, steered: quietSteered } = steerable(mainAgent('main-off-end'))
+  off.userTurn(quiet)
+  off.start(quiet)
+  off.say(quiet, 'x'.repeat(500))
+  await off.turnStopping(quiet)
+  assert.equal(quietSteered.length, 0, '`enabled: false` turns the rewrite off')
+
+  // No steer channel: the hook stays quiet instead of throwing into the turn.
+  const bare = mainAgent('main-bare-end')
+  host.userTurn(bare)
+  host.start(bare)
+  host.say(bare, 'x'.repeat(500))
+  await host.turnStopping(bare)
+
+  console.log('ok 17c — the turn end leaves workers, UI turns, aborted turns and a disabled row alone')
 }
 
 console.log('\nAll discipline-whale brevity checks passed.')

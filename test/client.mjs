@@ -32,6 +32,7 @@ import {
   createCallGuard,
   speechLevelDbfs,
 } from '../voice-silence.js'
+import { REWRITE_NOTICE_SUMMARY } from '../adhd.js'
 
 // --- load the browser half ------------------------------------------------
 
@@ -123,8 +124,8 @@ delete globalThis.window
 {
   const { zh, en } = module.exports.DICTIONARIES
   const voiceKeys = [
-    'callStart', 'callHangup', 'statusReady', 'statusListening', 'statusTranscribing',
-    'statusThinking', 'statusSpeaking', 'statusError', 'privacy',
+    'callStart', 'callHangup', 'statusReady', 'statusListening', 'statusSending',
+    'statusListeningBusy', 'statusThinking', 'statusSpeaking', 'statusError', 'privacy',
     'speakOn', 'speakOff', 'speakHint', 'speakNote',
     'errPermission', 'errMissingKey', 'errInvalidKey', 'errNoModel', 'errUnreachable',
     'errTimeout', 'errTooLarge', 'errEmptyTranscript', 'errNoMainSession', 'errUnsupported',
@@ -151,54 +152,81 @@ delete globalThis.window
   console.log('ok 3 — both dictionaries carry every voice key; read-aloud is described as a browser fallback')
 }
 
-// --- 3. the reply reader --------------------------------------------------
+// --- 3. the reply follower ------------------------------------------------
 
 {
   const now = Date.now()
-  const entries = [
-    { type: 'event', event: { type: 'turn/start', seq: 1, time: now - 5_000, data: { turn: 1 } } },
-    {
-      type: 'event',
-      event: {
-        type: 'assistant/message',
-        seq: 2,
-        time: now - 4_900,
-        data: { turn: 1, step: 1, message: { id: 'm1', role: 'assistant', content: [{ type: 'text', text: '旧的回复' }] } },
-      },
-    },
-    { type: 'event', event: { type: 'turn/end', seq: 3, time: now - 4_800, data: { turn: 1, reason: { kind: 'completed' } } } },
-    { type: 'event', event: { type: 'turn/start', seq: 4, time: now, data: { turn: 2 } } },
-    {
-      type: 'event',
-      event: {
-        type: 'assistant/message',
-        seq: 5,
-        time: now + 100,
-        data: {
-          turn: 2,
-          step: 1,
-          message: {
-            id: 'm2',
-            role: 'assistant',
-            content: [
-              { type: 'text', text: '第一段回复。' },
-              { type: 'tool-call', id: 'c', name: 'list_dispatches', arguments: '{}' },
-              { type: 'text', text: '第二段回复。' },
-            ],
-          },
-        },
-      },
-    },
-    { type: 'event', event: { type: 'turn/end', seq: 6, time: now + 200, data: { turn: 2, reason: { kind: 'completed' } } } },
+  const event = (seq, type, data) => ({ type: 'event', event: { type, seq, time: now + seq, data } })
+  const said = (seq, turn, ...texts) => event(seq, 'assistant/message', {
+    turn,
+    step: 1,
+    message: { role: 'assistant', content: texts.map((text) => (typeof text === 'string' ? { type: 'text', text } : text)) },
+  })
+  const older = [
+    event(1, 'turn/start', { turn: 1 }),
+    said(2, 1, '旧的回复'),
+    event(3, 'turn/end', { turn: 1, reason: { kind: 'completed' } }),
   ]
-  // At call start the window holds only the older turn, so turn 1 is the
-  // baseline; the reply is whatever appears above it afterwards.
-  const before = entries.slice(0, 3)
-  const baseline = module.exports.baselineTurnOf(before)
-  assert.equal(baseline, 1, 'the turn already on screen is the baseline')
-  assert.equal(module.exports.replyTextOf(before, baseline), '', 'the old turn is never spoken')
-  const text = module.exports.replyTextOf(entries, baseline)
-  assert.equal(text, '第一段回复。第二段回复。', 'only the new turn is spoken, text blocks only')
+  // The reader takes text blocks after a mark, by event seq, never tool calls.
+  assert.equal(module.exports.eventMarkOf(older), 3)
+  assert.equal(module.exports.replyTextAfter(older, 3), '', 'nothing after the mark is nothing to say')
+  assert.equal(module.exports.replyTextAfter([
+    ...older,
+    event(4, 'turn/start', { turn: 2 }),
+    said(5, 2, '第一段回复。', { type: 'tool-call', id: 'c', name: 'list_dispatches', arguments: '{}' }, '第二段回复。'),
+  ], 3), '第一段回复。第二段回复。', 'text blocks only, tool calls skipped')
+  const raw = '## 结论\n\n- `dispatch_task` 已派工'
+  assert.equal(module.exports.replyTextAfter([said(9, 3, raw)], 8), raw, 'the dock shows the reply verbatim')
+
+  const follower = (graceMs = 10_000) => module.exports.createReplyFollower({ graceMs })
+  let t = 0
+
+  // Idle whale: the call starts, an utterance wakes a turn, the reply comes
+  // once that turn has closed — and the turn on screen before the call never does.
+  const idle = follower()
+  let window = [...older]
+  assert.deepEqual(idle.observe({ running: false, entries: window, now: t }), { busy: false, reply: null })
+  idle.sent(t += 100, window)
+  assert.deepEqual(idle.observe({ running: false, entries: window, now: t += 700 }), { busy: true, reply: null },
+    'a sent utterance counts as work before its turn shows up')
+  window = [...window, event(4, 'turn/start', { turn: 2 }), said(5, 2, '好的，我去派工。')]
+  assert.deepEqual(idle.observe({ running: true, entries: window, now: t += 700 }), { busy: true, reply: null })
+  assert.deepEqual(idle.observe({ running: false, entries: window, now: t += 700 }), { busy: false, reply: null },
+    'a turn whose turn/end has not arrived is not over yet')
+  window = [...window, event(6, 'turn/end', { turn: 2 })]
+  assert.deepEqual(idle.observe({ running: false, entries: window, now: t += 700 }), { busy: false, reply: '好的，我去派工。' })
+  assert.deepEqual(idle.observe({ running: false, entries: window, now: t += 700 }), { busy: false, reply: null },
+    'a reply is handed over once')
+
+  // Working whale: the utterance is an interjection into the running turn,
+  // and what the whale says after it inside that turn is the reply.
+  const busy = follower()
+  window = [...older, event(4, 'turn/start', { turn: 2 }), said(5, 2, '我先读一下文件。')]
+  assert.deepEqual(busy.observe({ running: true, entries: window, now: t += 700 }), { busy: true, reply: null })
+  busy.sent(t += 100, window)
+  window = [...window, event(6, 'user/message', { turn: 2 }), said(7, 2, '收到插话，改成先看测试。'), event(8, 'turn/end', { turn: 2 })]
+  assert.deepEqual(busy.observe({ running: false, entries: window, now: t += 700 }), { busy: false, reply: '收到插话，改成先看测试。' },
+    'the reply is the text written after the call began watching, inside the same turn')
+
+  // Two turns in a row (a sentence that arrived just as a turn closed wakes
+  // the next one): each closed turn gives its own reply.
+  window = [...window, event(9, 'turn/start', { turn: 3 }), said(10, 3, '第二轮。')]
+  assert.deepEqual(busy.observe({ running: true, entries: window, now: t += 700 }), { busy: true, reply: null })
+  window = [...window, event(11, 'turn/end', { turn: 3 })]
+  assert.deepEqual(busy.observe({ running: false, entries: window, now: t += 700 }), { busy: false, reply: '第二轮。' })
+
+  // A turn with no text says nothing, and a sent utterance whose turn never
+  // shows up stops counting as work after the grace period.
+  const quiet = follower(1_000)
+  window = [...older]
+  quiet.observe({ running: false, entries: window, now: t })
+  quiet.sent(t, window)
+  assert.equal(quiet.observe({ running: false, entries: window, now: t + 500 }).busy, true)
+  assert.deepEqual(quiet.observe({ running: false, entries: window, now: t + 1_500 }), { busy: false, reply: null })
+
+  // No event window yet: the session row alone says whether the whale works.
+  const blind = follower()
+  assert.deepEqual(blind.observe({ running: true, entries: null, now: t }), { busy: true, reply: null })
 
   // The fallback read-aloud path keeps its markdown→speech shaper.
   const spoken = module.exports.speakable('## 结论\n\n- `dispatch_task` 已派工\n\n```js\nconst x = 1\n```\n完成。')
@@ -209,31 +237,71 @@ delete globalThis.window
   // The speech tag stays BCP-47 for the synthesizer, while the transcription
   // hint stays the bare two-letter form.
   assert.match(module.exports.speechLanguage(), /^(zh-CN|en-US)$/)
-  // The raw reply still carries its markdown: the dock shows it verbatim.
-  const raw = '## 结论\n\n- `dispatch_task` 已派工'
-  assert.equal(module.exports.replyTextOf([
-    { type: 'event', event: { type: 'assistant/message', data: { turn: 3, message: { content: [{ type: 'text', text: raw }] } } } },
-  ], 2), raw)
-
-  // No new turn means nothing to say.
-  assert.equal(module.exports.replyTextOf(before, baseline), '')
-  // A turn that closed with no assistant text yields nothing to read.
-  assert.equal(module.exports.replyTextOf([{ type: 'event', event: { type: 'turn/start', seq: 9, data: { turn: 9 } } }], baseline), '')
-  console.log('ok 4 — the reply reader takes only the new turn; the fallback speech shaper is restored')
+  console.log('ok 4 — the reply follower shows each closed turn once, interjections included; the speech shaper stays')
 }
 
-// --- 3a. half-duplex: off must not wait, on must not hang ----------------
+// --- 4b. a turn-end rewrite replaces its draft in the reply -------------
 
 {
-  // Two separate failure modes live here, and both must stay covered:
+  // The copy in client.js must name the same notice adhd.js steers.
+  assert.equal(module.exports.REWRITE_NOTICE.summary, REWRITE_NOTICE_SUMMARY, 'the rewrite summary matches adhd.js')
+  assert.equal(module.exports.REWRITE_NOTICE.kind, 'plugin:discipline-whale:brevity')
+
+  const say = (seq, turn, step, text) => ({
+    type: 'event',
+    event: { type: 'assistant/message', seq, data: { turn, step, message: { content: [{ type: 'text', text }] } } },
+  })
+  const notice = (seq, summary) => ({
+    type: 'event',
+    event: {
+      type: 'user/message',
+      seq,
+      data: { role: 'user', content: [{ type: 'text', text: '[Discipline Whale] …' }], source: { kind: 'plugin:discipline-whale:brevity', form: 'notice', summary } },
+    },
+  })
+  const start = (seq, turn) => ({ type: 'event', event: { type: 'turn/start', seq, data: { turn } } })
+
+  // One turn: a long draft, the rewrite notice, the short answer.
+  const rewritten = [start(1, 2), say(2, 2, 1, '长稿'.repeat(50)), notice(3, REWRITE_NOTICE_SUMMARY), say(4, 2, 2, '短答案。')]
+  assert.equal(module.exports.replyTextAfter(rewritten, 0), '短答案。', 'only the rewrite is shown and read aloud')
+
+  // Two new turns, the second rewritten: the first turn's reply is kept.
+  const twoTurns = [start(1, 2), say(2, 2, 1, '第一轮。'), start(3, 3), say(4, 3, 1, '长稿'), notice(5, REWRITE_NOTICE_SUMMARY), say(6, 3, 2, '重写。')]
+  assert.equal(module.exports.replyTextAfter(twoTurns, 0), '第一轮。重写。', 'a rewrite drops only its own turn’s draft')
+
+  // The mid-turn reminder is not a rewrite: the multi-step reply stays whole.
+  const reminded = [start(1, 2), say(2, 2, 1, '前半。'), notice(3, 'revision: over-long prose'), say(4, 2, 2, '后半。')]
+  assert.equal(module.exports.replyTextAfter(reminded, 0), '前半。后半。', 'a mid-turn reminder keeps every step')
+
+  // The follower hands over the rewrite once the turn closes.
+  const follower = module.exports.createReplyFollower({ graceMs: 10_000 })
+  follower.observe({ running: false, entries: [], now: 0 })
+  const closed = [...rewritten, { type: 'event', event: { type: 'turn/end', seq: 5, data: { turn: 2, reason: { kind: 'completed' } } } }]
+  assert.equal(follower.observe({ running: false, entries: closed, now: 1 }).reply, '短答案。', 'the follower shows the rewrite')
+
+  console.log('ok 4b — a turn-end rewrite replaces its draft in the dock reply; a mid-turn reminder does not')
+}
+
+// --- 3a. never waiting: sending does not wait, reading aloud cannot hang -
+
+{
+  // Three things must stay true, each with its own failure mode:
+  //
+  //   SENDING never waits for the whale — after a sentence is handed over the
+  //   microphone keeps listening, so the next sentence can follow at once.
   //
   //   OFF (the default) — there is no speech event at all, so the reply path
-  //   must not await one. Awaiting would park every call in "speaking" and
-  //   never reopen the microphone.
+  //   must not touch the speech engine or pause the microphone.
   //
-  //   ON — awaiting is correct, but the engine may never fire `onend`. The
-  //   bounded timer must settle the promise anyway, or an opted-in call hangs.
+  //   ON — the reply is read with detection paused, but the engine may never
+  //   fire `onend`. The bounded timer must settle the promise anyway.
   const source = await readFile(new URL('../client.js', import.meta.url), 'utf8')
+  const codeOf = (from, to) => {
+    const begin = source.indexOf(from)
+    const end = source.indexOf(to, begin + from.length)
+    assert.ok(begin > 0 && end > begin, `${from} exists`)
+    return source.slice(begin, end).split('\n').filter((line) => !line.trimStart().startsWith('//') && !line.trimStart().startsWith('*')).join('\n')
+  }
 
   // --- DEFAULT OFF -------------------------------------------------------
   assert.match(source, /const \[speak, setSpeak\] = React\.useState\(false\)/,
@@ -241,19 +309,28 @@ delete globalThis.window
   assert.match(source, /const speakRef = React\.useRef\(false\)/,
     'the ref read by the async reply path must default to false')
 
-  // --- ASSERTION 1: OFF returns to ready without touching speech ---------
-  const offStart = source.indexOf('if (!speakRef.current) {')
-  const offEnd = source.indexOf('setPhase("speaking");', offStart)
-  assert.ok(offStart > 0 && offEnd > offStart, 'the off-default branch exists before the speaking phase')
-  const offBranch = source.slice(offStart, offEnd)
-  assert.match(offBranch, /setPhase\("ready"\)/, 'off returns to ready')
-  assert.match(offBranch, /void listen\(\)/, 'off reopens the microphone')
-  const offCode = offBranch.split('\n').filter((line) => !line.trimStart().startsWith('//')).join('\n')
-  assert.equal(/await/.test(offCode), false, 'the off branch must not await anything')
-  assert.equal(/onend|speakReply|speechSynthesis|SpeechSynthesisUtterance/.test(offCode), false,
-    'the off branch must not touch speech APIs at all')
+  // --- ASSERTION 1: a finished sentence never pauses listening -----------
+  const done = codeOf('async function utteranceDone(', 'async function refuseUtterance(')
+  assert.equal(/hold\(\)|mute\(\)/.test(done), false, 'a finished sentence leaves the microphone listening')
+  assert.match(done, /enqueue\(/, 'it is queued for sending, not awaited')
+  const submit = codeOf('async function submit(', 'async function followReplies(')
+  assert.equal(/readAloud|speakReply|sleep\(|running/.test(submit), false, 'sending never waits for the whale or its reply')
+  assert.equal(/listen\(\)/.test(submit), false, 'sending has no microphone to reopen: it never closed it')
+  const listen = codeOf('async function listen(', 'async function utteranceDone(')
+  assert.equal(/running/.test(listen), false, 'listening never waits for the whale to finish')
 
-  // --- ASSERTION 2: ON awaits, but the wait is bounded -------------------
+  // --- ASSERTION 2: OFF shows the reply without touching speech ----------
+  const follow = codeOf('async function followReplies(', 'async function readAloud(')
+  const shown = follow.indexOf('setReply(seen.reply)')
+  const gated = follow.indexOf('if (speakRef.current) await readAloud(')
+  assert.ok(shown > 0 && gated > shown, 'the reply is shown first, and read aloud only when the switch is on')
+  assert.equal(/speakReply|speechSynthesis|SpeechSynthesisUtterance|hold\(\)|mute\(\)/.test(follow), false,
+    'following replies never touches speech or the microphone itself')
+  const reading = codeOf('async function readAloud(', 'async function stopTalking(')
+  assert.match(reading, /userSpeakingRef\.current/, 'reading aloud waits while the person is mid-sentence')
+  assert.match(reading, /mute\(\)[\s\S]*speakReply[\s\S]*void listen\(\)/, 'detection pauses for the reading and resumes after it')
+
+  // --- ASSERTION 3: ON awaits, but the wait is bounded -------------------
   // Behavioural, not textual: drive the real speakReply with a fake engine
   // that accepts speak() and NEVER fires onend. Only the timeout can settle it.
   assert.equal(typeof module.exports.speakReply, 'function', 'speakReply is reachable for testing')
@@ -314,12 +391,7 @@ delete globalThis.window
   assert.equal(spoke, 0, 'disabled read-aloud never reaches the engine')
   assert.equal(off.speech, null)
 
-  // --- the reply is always rendered, whatever speech does ----------------
-  const replyIndex = source.indexOf('setReply(answer.text);')
-  assert.ok(replyIndex > 0, 'the reply is still rendered')
-  assert.match(source.slice(replyIndex, replyIndex + 900), /setPhase\("ready"\)/,
-    'every reply path returns to ready')
-  console.log('ok 3a — off returns to ready without awaiting; on is bounded by a timeout backstop')
+  console.log('ok 3a — sending never waits for the whale; off never touches speech; on is bounded by a timeout backstop')
 }
 
 // --- 3b. the session watcher ---------------------------------------------

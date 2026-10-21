@@ -274,6 +274,23 @@ const NOTICE_SOURCE = Object.freeze({
 
 export const DEFAULT_MAIN_PRESET = 'discipline-whale'
 
+/**
+ * The row-config keys this module reads.
+ *
+ * Exported so `main.js` and the tests share one list. A hand-copied list in the
+ * schema is exactly how `decisionProseChars` was silently dropped once: the
+ * resolver accepted it, the schema never carried it, and every test still
+ * passed because none of them went through the schema.
+ *
+ * @type {ReadonlyArray<string>}
+ */
+export const GUARD_CONFIG_KEYS = Object.freeze([
+  'watchdogThreshold',
+  'readQuota',
+  'maxInterventions',
+  'watchdogCounting',
+])
+
 function positiveInteger(value, fallback) {
   return Number.isInteger(value) && value > 0 ? value : fallback
 }

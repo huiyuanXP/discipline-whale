@@ -22,9 +22,9 @@ import {
 } from './checkpoint.js'
 import { dispatchBootstrap, noteDispatch } from './memory-row.js'
 import { dispatchForWorker, listDispatches, recordDispatch } from './registry.js'
-import { installGuard, resolveGuardConfig } from './guard.js'
-import { installBrevity } from './adhd.js'
-import { isReportId, listReports, readReport, storeRoot } from './store.js'
+import { GUARD_CONFIG_KEYS, installGuard, resolveGuardConfig } from './guard.js'
+import { BREVITY_CONFIG_KEYS, installBrevity } from './adhd.js'
+import { indexReportLine, isReportId, listReports, readReport, reportDir, storeRoot, summarizeReport } from './store.js'
 
 /**
  * A usable AbortSignal for a Host call.
@@ -505,10 +505,17 @@ function dispatchTaskTool(ctx, config) {
 }
 
 function readReportTool(ctx) {
+  // The three reads this tool offers. `head` is the default, and it is a real
+  // default: `mode` below falls back to it when the argument is omitted.
+  const readModes = ['head', 'full', 'index']
+
   return {
     name: 'read_report',
     description:
-      'Read one worker report in full, or list recent reports for a workspace. Summaries already arrive as pushed messages; use this only when you need the long document behind one of them.',
+      'Read one worker report, or list recent reports for a workspace. Summaries already arrive as pushed messages. ' +
+      `\`mode\` defaults to "head": metadata, the full summary, section headings, and the first part of the document — ` +
+      `that is usually enough to decide. Ask for mode:"full" only when the head preview is not enough, ` +
+      `or mode:"index" to see one workspace's reports as a one-line-each disk scan.`,
     parameters: {
       type: 'object',
       additionalProperties: false,
@@ -516,6 +523,15 @@ function readReportTool(ctx) {
         report_id: { type: 'string', description: 'Exact report id from a pushed summary.' },
         workspace: { type: 'string', description: 'Workspace to list reports from when no report id is given.' },
         limit: { type: 'integer', description: 'Maximum reports to list (1-50, default 10).' },
+        mode: {
+          type: 'string',
+          enum: ['head', 'full', 'index'],
+          default: 'head',
+          description:
+            'How much to return. "head" (default): metadata + full summary + section headings + a bounded document ' +
+            'preview, plus how to get the rest. Reports under 3000 characters come back whole. "full": the whole ' +
+            'document. "index": one line per report in a workspace, scanned from disk.',
+        },
       },
     },
     output: {
@@ -526,6 +542,18 @@ function readReportTool(ctx) {
           report: { type: 'object', additionalProperties: true, properties: {} },
           reports: { type: 'array', items: { type: 'object', additionalProperties: true, properties: {} } },
           note: { type: 'string' },
+          returned: {
+            type: 'string',
+            enum: ['head', 'full', 'full (small report)', 'index'],
+            description: 'Which read answered this call.',
+          },
+          howToReadFull: { type: 'string', description: 'Present on a head: the exact call that returns the whole document.' },
+          index: {
+            type: 'object',
+            additionalProperties: true,
+            properties: {},
+            description: 'Only on mode:"index": the disk scan that was performed and its one-line entries.',
+          },
         },
       },
       render: (_args, value) => [{ type: 'text', text: JSON.stringify(value, null, 2) }],
@@ -533,12 +561,43 @@ function readReportTool(ctx) {
     presentCall: () => ({ card: 'generic', title: 'Read report', kind: 'read' }),
     async execute(args) {
       const limit = Math.min(Math.max(Number(args.limit ?? 10) || 10, 1), 50)
+      // The default is a real default: an omitted `mode` takes this value, so
+      // `read_report(report_id)` costs a head, not a whole document.
+      const mode = args.mode ?? 'head'
+      if (!readModes.includes(mode)) {
+        throw new Error(`\`mode\` must be one of ${readModes.join(' / ')} (got "${String(args.mode)}")`)
+      }
+
+      if (mode === 'index') {
+        if (args.report_id !== undefined) {
+          throw new Error('`mode:"index"` lists a workspace; it cannot be combined with `report_id`')
+        }
+        const workspace = await resolveWorkspace(ctx.workspaceRegistry, args.workspace)
+        const all = await listReports(storeRoot(), workspace.id)
+        const lines = all.slice(0, limit).map((report) => indexReportLine(report))
+        return {
+          index: {
+            // M2 will add a real index file; until then this is a scan of the
+            // report directory, and it says so rather than implying an index.
+            source: `disk scan of ${reportDir(storeRoot(), workspace.id)} (no index file exists yet)`,
+            workspaceId: workspace.id,
+            workspaceTitle: workspace.title,
+            count: lines.length,
+            total: all.length,
+            truncated: all.length > lines.length,
+            lines,
+          },
+          returned: 'index',
+        }
+      }
 
       if (args.report_id !== undefined) {
         if (!isReportId(args.report_id)) throw new Error('`report_id` is not a valid report id')
         for (const workspace of ctx.workspaceRegistry.list()) {
           const report = await readReport(storeRoot(), workspace.id, args.report_id)
-          if (report !== undefined) return { report }
+          if (report === undefined) continue
+          if (mode === 'full') return { report, returned: 'full' }
+          return summarizeReport(report)
         }
         return { note: `no report with id "${args.report_id}" was found in any workspace` }
       }
@@ -1089,18 +1148,20 @@ export const Config = {
       // falls back on any invalid value), so this schema only has to carry them
       // through instead of dropping them: a row config that silently discarded
       // `readQuota` would look wired and do nothing.
-      const guard = {}
-      for (const key of ['watchdogThreshold', 'readQuota', 'maxInterventions', 'watchdogCounting']) {
-        if (input[key] !== undefined) guard[key] = input[key]
+      //
+      // The key lists are IMPORTED, not re-typed. A hand-copied list here was
+      // how `decisionProseChars` got dropped: the resolver honoured it, this
+      // loop never forwarded it, and no test noticed because every test that
+      // covered it called the resolver directly. Importing the resolver's own
+      // list makes that class of omission impossible for a key the resolver
+      // reads, and `test/adhd.mjs` ok 13 fails if the two ever diverge.
+      const carried = {}
+      for (const key of [...GUARD_CONFIG_KEYS, ...BREVITY_CONFIG_KEYS]) {
+        // `0` and `false` are real values, so the test is `!== undefined`,
+        // never truthiness.
+        if (input[key] !== undefined) carried[key] = input[key]
       }
-      // The brevity knobs (adhd.js) follow the same rule: carried through, then
-      // validated where they are used. `0` and `false` are real values, so the
-      // test is `!== undefined`, never truthiness.
-      const brevity = {}
-      for (const key of ['maxProseChars', 'maxCorrections', 'enabled']) {
-        if (input[key] !== undefined) brevity[key] = input[key]
-      }
-      return { value: { workerPreset, ...guard, ...brevity } }
+      return { value: { workerPreset, ...carried } }
     },
   },
 }
@@ -1128,7 +1189,8 @@ export function apply(ctx, config = {}) {
   installGuard(ctx, resolveGuardConfig(config))
 
   // The output discipline lives in adhd.js: the ADHD ruleset as prompt text, a
-  // next-step correction for over-long prose, and a UI-deliverable exemption.
+  // next-step reminder for over-long prose, a turn-end rewrite for an over-long
+  // final answer, and a UI-deliverable exemption.
   // Separate module, separate listeners: the guard counts *reads*, this counts
   // *characters*, and neither may gate the other.
   installBrevity(ctx, config)

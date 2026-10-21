@@ -1233,7 +1233,9 @@ const checkpointPath = (workerSessionId) =>
   assert.deepEqual(say.methods, ['POST'])
   assert.equal(say.requestBody, 'buffered')
 
-  // The say route queues into the recorded main session and nothing else.
+  // The say route steers into the recorded main session and nothing else:
+  // the step-boundary insert, so a sentence said while the whale works lands
+  // after its current tool call instead of waiting for the whole turn.
   const response = await say.fetch(new Request(`http://dsh${VOICE_SAY_ROUTE}`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
@@ -1242,7 +1244,7 @@ const checkpointPath = (workerSessionId) =>
   assert.equal(response.status, 200)
   assert.equal(prompts.length, 1)
   assert.equal(prompts[0].sessionId, 'session-main-1')
-  assert.equal(prompts[0].mode, 'queue')
+  assert.equal(prompts[0].mode, 'steer')
   assert.equal(prompts[0].content[0].text, '帮我看看今天的派工')
   console.log('ok 20 — the voice routes are mounted by the home row and reach the main session')
 }

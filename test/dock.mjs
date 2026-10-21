@@ -140,6 +140,7 @@ function fakeMicVAD(options) {
       if (!vad.listening) return
       vad.speaking = true
       vad.segment = new Float32Array(Math.round(16000 * seconds)).fill(0.1)
+      options.onSpeechStart()
       options.onSpeechRealStart()
     },
     endSpeech() {
@@ -164,7 +165,7 @@ function deferred() {
  * permission prompt open until the test releases them.
  */
 function listenerHarness(gates = {}) {
-  const record = { streams: [], utterances: [], timers: [], vad: null, created: null }
+  const record = { streams: [], utterances: [], timers: [], speaking: [], vad: null, created: null }
   const taker = dock.createTurnTaker({
     createVad: async (options) => {
       if (gates.model !== undefined) await gates.model.promise
@@ -181,6 +182,7 @@ function listenerHarness(gates = {}) {
     options: { ...dock.VOICE_CONSTANTS.turn, redemptionMs: 2000 },
     maxSpeechMs: 60000,
     onUtterance: (audio) => record.utterances.push(audio),
+    onSpeaking: (active) => record.speaking.push(active),
     setTimeout: (fn, ms) => { record.timers.push({ fn, ms, cancelled: false }); return record.timers.length - 1 },
     clearTimeout: (id) => { if (record.timers[id]) record.timers[id].cancelled = true },
   })
@@ -218,7 +220,7 @@ function listenerHarness(gates = {}) {
 }
 
 {
-  // Half-duplex: while the whale works, the microphone is released (the OS
+  // Holding (microphone off, page hidden): the microphone is released (the OS
   // indicator goes off) and a segment in progress is dropped; listening again
   // asks for the microphone afresh.
   const { taker, record } = listenerHarness()
@@ -231,9 +233,9 @@ function listenerHarness(gates = {}) {
   assert.equal(record.streams.length, 2, 'listening again reopens the microphone')
   assert.equal(record.streams[1].track.readyState, 'live')
 
-  // Muted first, then held (microphone off, page hidden, or the whale
-  // replying): the device must still be released. MicVAD's own pause() does
-  // nothing once detection is already paused, so hold() cannot rely on it.
+  // Muted first, then held (microphone off, page hidden): the device must
+  // still be released. MicVAD's own pause() does nothing once detection is
+  // already paused, so hold() cannot rely on it.
   await taker.mute()
   await taker.hold()
   assert.equal(record.streams[1].track.readyState, 'ended', 'mute then hold releases the device')
@@ -469,32 +471,63 @@ function listenerHarness(gates = {}) {
 // --- 9. finishing, the 60s cap, and closing --------------------------------
 
 {
-  // "Done talking" hands over the segment in progress, then puts the
-  // detector's own setting back.
+  // "Done talking" hands over the segment in progress, puts the detector's
+  // own setting back, and goes on listening on the same open stream: the
+  // next sentence needs no new listen() and no new permission.
   const { taker, record } = listenerHarness()
   await taker.listen(false)
   record.vad.speak(2)
+  assert.deepEqual(record.speaking, [true], 'a segment in progress is reported')
   assert.equal(await taker.finish(), true, 'a segment in progress is handed over')
   assert.equal(record.utterances.length, 1)
+  assert.equal(record.speaking.at(-1), false, 'and reported over')
   assert.equal(record.vad.options.submitUserSpeechOnPause, false, 'pausing stops submitting again afterwards')
-  assert.equal(record.streams[0].track.readyState, 'ended', 'the microphone is released for the reply')
+  assert.equal(record.streams.length, 1, 'the microphone stays open')
+  assert.equal(record.streams[0].track.readyState, 'live')
+  assert.equal(record.vad.listening, true, 'detection goes on')
+  record.vad.speak(1)
+  record.vad.endSpeech()
+  assert.equal(record.utterances.length, 2, 'the next sentence is handed over without listening again')
 
   // With nothing said, finishing hands nothing over and says so.
-  await taker.listen(false)
   assert.equal(await taker.finish(), false)
-  assert.equal(record.utterances.length, 1)
+  assert.equal(record.utterances.length, 2)
+  assert.equal(record.vad.listening, true)
 
-  // Speech that never pauses is cut and sent at 60s.
-  await taker.listen(false)
+  // Speech that never pauses is cut and sent at 60s, and listening goes on.
   record.vad.speak(70)
   const cap = record.timers.at(-1)
   assert.equal(cap.ms, 60000)
-  await cap.fn()
-  assert.equal(record.utterances.length, 2, 'the capped segment is sent')
+  cap.fn()
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  assert.equal(record.utterances.length, 3, 'the capped segment is sent')
+  assert.equal(record.vad.listening, true, 'the cap does not stop the call listening')
+
+  // Muted, finishing has nothing to cut and must not start detection again.
+  await taker.mute()
+  assert.equal(await taker.finish(), false)
+  assert.equal(record.vad.listening, false, 'finishing never unmutes')
+  await taker.unmute()
+
+  // A hold that lands while a segment is being handed over wins.
+  record.vad.speak(1)
+  const finishing = taker.finish()
+  await taker.hold()
+  await finishing
+  assert.equal(record.vad.listening, false, 'a hold during finishing leaves detection off')
+  assert.ok(record.streams.every((stream) => stream.track.readyState === 'ended'), 'and the device released')
+  await taker.listen(false)
 
   // The pause that ends a turn can change mid-call.
   taker.setRedemptionMs(5000)
   assert.equal(record.vad.options.redemptionMs, 5000)
+
+  // Hanging up mid-sentence reports the segment over, so nothing waits on it.
+  const midSentence = listenerHarness()
+  await midSentence.taker.listen(false)
+  midSentence.record.vad.speak(1)
+  await midSentence.taker.close()
+  assert.equal(midSentence.record.speaking.at(-1), false, 'close() mid-segment reports speaking over')
 
   // Closing destroys the detector and releases every track, even from mute.
   await taker.listen(false)
@@ -502,7 +535,7 @@ function listenerHarness(gates = {}) {
   await taker.close()
   assert.equal(record.vad.destroyed, true)
   assert.ok(record.streams.every((stream) => stream.track.readyState === 'ended'), 'no track stays live after close')
-  console.log('ok 9 — done-talking submits, 60s caps a segment, and close releases every track')
+  console.log('ok 9 — done-talking and the 60s cap hand a segment over and keep listening; close releases every track')
 }
 
 // --- 10. the settings panel's TTS wording --------------------------------
@@ -716,14 +749,22 @@ function listenerHarness(gates = {}) {
   assert.deepEqual([slid.docked, slid.y], ['right', 800 - 100 - 60], 'sliding along the edge keeps it stashed')
 
   // Dragged into the page: opens at the panel's size, kept inside the viewport.
-  const opened = dock.dockRelease({ left: 600, top: 700, ...orb, viewport, docked: true, expanded: panel })
+  const opened = dock.dockRelease({ left: 600, top: 600, ...orb, viewport, docked: true, expanded: panel })
   assert.equal(opened.docked, null, 'a stashed button dragged inward opens again')
   assert.ok(opened.y >= 16, 'the reopened panel fits above the bottom margin')
   assert.ok(opened.x >= 16, 'and inside the side margin')
 
-  // Off-screen drops are clamped back in.
-  const high = dock.dockRelease({ left: 300, top: -500, ...panel, viewport, docked: false })
-  assert.equal(high.y, 800 - 16 - 260, 'a drop above the viewport is pulled back under the top margin')
+  // A drop a little past the top or bottom is clamped back in; pushed through
+  // either, the panel is stashed on that edge, keeping its anchored side.
+  const high = dock.dockRelease({ left: 300, top: -60, ...panel, viewport, docked: false })
+  assert.deepEqual([high.docked, high.y], [null, 800 - 16 - 260], 'a drop just above the viewport is pulled back under the top margin')
+  const throughTop = dock.dockRelease({ left: 300, top: -500, ...panel, viewport, docked: false })
+  assert.deepEqual(throughTop, { docked: 'top', anchor: 'left', x: 300, y: 800 - 8 - 60 }, 'pushed through the top, it is stashed there')
+  const throughBottom = dock.dockRelease({ left: 900, top: 800, ...panel, viewport, docked: false })
+  assert.deepEqual(throughBottom, { docked: 'bottom', anchor: 'right', x: 16, y: 8 }, 'pushed through the bottom, it is stashed there')
+  // The stashed button stays on whichever edge is nearest, and moves to another edge when dropped near it.
+  assert.equal(dock.dockRelease({ left: 600, top: 30, ...orb, viewport, docked: true, expanded: panel }).docked, 'top')
+  assert.equal(dock.dockRelease({ left: 600, top: 720, ...orb, viewport, docked: true, expanded: panel }).docked, 'bottom')
 
   // Resizing grows away from the anchored side, within the room left, above the minimums.
   const room = { left: 400, right: 20, top: 300 }
@@ -739,7 +780,7 @@ function listenerHarness(gates = {}) {
   assert.equal(dock.dockGeometryStyle(null, null), undefined)
   assert.deepEqual(dock.dockGeometryStyle({ anchor: 'right', x: 16.4, y: 144 }, { width: 420.6, cardHeight: 260 }),
     { '--dw-dock-x': '16', '--dw-dock-y': '144', '--dw-dock-w': '421', '--dw-card-h': '260' })
-  console.log('ok 12 — a drop stays open, snaps, or stashes on an edge; the stashed button reopens; resizing is clamped')
+  console.log('ok 12 — a drop stays open, snaps, or stashes on any edge; the stashed button reopens; resizing is clamped')
 }
 
 // --- 13. the stashed dock is the microphone button --------------------------
@@ -773,7 +814,72 @@ function listenerHarness(gates = {}) {
   assert.equal(idleButtons.length, 1)
   idleButtons[0].props.onClick()
   assert.deepEqual(calls, ['mic', 'start'], 'without a call, tapping it starts one')
-  console.log('ok 13 — stashed against an edge, the dock is the microphone button alone')
+  // The status line says what runs beside listening: a sentence on its way
+  // first, then the whale working; the controls still outrank both.
+  const on = { device: true, muted: false, processing: true, muteEnabled: true }
+  const key = (input) => dock.dockStatusKey({ error: null, controls: on, ...input })
+  assert.equal(key({ status: 'listening' }), 'statusListening')
+  assert.equal(key({ status: 'listening', sending: 1, whaleBusy: true }), 'statusSending')
+  assert.equal(key({ status: 'listening', whaleBusy: true }), 'statusListeningBusy')
+  assert.equal(key({ status: 'ready', whaleBusy: true }), 'statusThinking')
+  assert.equal(key({ status: 'listening', whaleBusy: true, controls: { ...on, muted: true, processing: false } }), 'statusMuted')
+  console.log('ok 13 — stashed against an edge, the dock is the microphone button alone; the status line names what runs beside listening')
+}
+
+// --- 14. a drag never leaves the viewport ----------------------------------
+
+{
+  const viewport = { width: 1200, height: 800 }
+  const panel = { width: 380, height: 260 }
+  const inside = (frame, box) => {
+    const left = frame.anchor === 'left' ? frame.x : viewport.width - frame.x - box.width
+    const top = viewport.height - frame.y - box.height
+    return left >= 0 && top >= 0 && left + box.width <= viewport.width && top + box.height <= viewport.height
+  }
+
+  // In the open, the panel follows the pointer.
+  const free = dock.dockDragFrame({ left: 300, top: 300, ...panel, viewport, docked: false })
+  assert.deepEqual(free, { stash: null, anchor: 'left', x: 300, y: 800 - 300 - 260 })
+
+  // A little past any edge, it stops at the margin.
+  const up = dock.dockDragFrame({ left: 300, top: -60, ...panel, viewport, docked: false })
+  assert.deepEqual([up.stash, up.y], [null, 800 - 16 - 260], 'the top edge holds it')
+  const down = dock.dockDragFrame({ left: 300, top: 800 - 260 + 60, ...panel, viewport, docked: false })
+  assert.deepEqual([down.stash, down.y], [null, 16], 'the bottom edge holds it')
+  const nudged = dock.dockDragFrame({ left: -60, top: 300, ...panel, viewport, docked: false })
+  assert.deepEqual([nudged.stash, nudged.anchor, nudged.x], [null, 'left', 16], 'a side holds it until it is pushed through')
+  for (const frame of [free, up, down, nudged]) assert.ok(inside(frame, panel), 'every frame of the panel is inside the viewport')
+
+  // Pushed on through a side, it is drawn as the stashed button on that edge,
+  // the same place letting go leaves it.
+  const push = { left: -200, top: 300, ...panel, viewport, docked: false }
+  const through = dock.dockDragFrame(push)
+  assert.deepEqual(through, { stash: 'left', anchor: 'left', x: 8, y: 800 - 300 - 260 })
+  const released = dock.dockRelease(push)
+  assert.deepEqual([released.docked, released.x, released.y], [through.stash, through.x, through.y], 'the frame shows where the release lands')
+  // Pulled back in, it is the panel again, still held by the edge.
+  assert.equal(dock.dockDragFrame({ ...push, left: -80 }).stash, null)
+  const farRight = dock.dockDragFrame({ left: 5000, top: -300, ...panel, viewport, docked: false })
+  assert.deepEqual([farRight.stash, farRight.anchor, farRight.x], ['right', 'right', 8])
+  assert.ok(farRight.y >= 16 && farRight.y + 60 <= 800, 'the button stays on screen however far the pointer goes')
+  // The top and bottom work the same way.
+  const farUp = dock.dockDragFrame({ left: 300, top: -2000, ...panel, viewport, docked: false })
+  assert.deepEqual(farUp, { stash: 'top', anchor: 'left', x: 300, y: 800 - 8 - 60 })
+  const farDown = dock.dockDragFrame({ left: 300, top: 5000, ...panel, viewport, docked: false })
+  assert.deepEqual(farDown, { stash: 'bottom', anchor: 'left', x: 300, y: 8 })
+
+  // The stashed button slides along its edge and stays on screen.
+  const orb = { width: 60, height: 60 }
+  const slide = dock.dockDragFrame({ left: -900, top: -900, ...orb, viewport, docked: true, expanded: panel })
+  assert.deepEqual([slide.stash, slide.anchor, slide.x, slide.y], ['left', 'left', 8, 800 - 16 - 60])
+  const below = dock.dockDragFrame({ left: 600, top: 2000, ...orb, viewport, docked: true, expanded: panel })
+  assert.deepEqual([below.stash, below.y], ['bottom', 8], 'dragged past the bottom it rides the bottom edge')
+  assert.ok(inside(below, orb))
+  // Dragged inward it is still the button (it opens on release), held inside the viewport.
+  const inward = dock.dockDragFrame({ left: 600, top: 400, ...orb, viewport, docked: true, expanded: panel })
+  assert.equal(inward.stash, null)
+  assert.ok(inside(inward, orb))
+  console.log('ok 14 — a drag never leaves the viewport; pushed through any edge, the panel is drawn as the stashed button')
 }
 
 console.log('\nAll discipline-whale dock checks passed.')

@@ -11,8 +11,8 @@
  *
  *   GET  /api/discipline-whale/voice/status      → whether a key is configured
  *   POST /api/discipline-whale/voice/transcribe  → { text, model, audioSeconds? }
- *   POST /api/discipline-whale/voice/say         → queues one transcript into
- *                                                  the recorded main session
+ *   POST /api/discipline-whale/voice/say         → hands one transcript to the
+ *                                                  recorded main session
  *
  * Privacy: the audio leaves this machine. The backend is a cloud service, the
  * key is read from the process environment at request time (never from a file
@@ -486,10 +486,14 @@ export function voiceHandler(options = {}) {
 /**
  * Send one transcript into the main session.
  *
- * This is the SAME call the dispatch path uses (`sessionController.prompt`,
- * queue mode); voice never introduces a second message channel. The caller
- * supplies the session id it read from the home route, so a transcript can
- * only ever land in the main session.
+ * This is the SAME call `send_to_session` makes at its default step-boundary
+ * timing (`sessionController.prompt`, `steer` mode); voice never introduces a
+ * second message channel. While the whale is working, the sentence is an
+ * interjection: the in-flight tool call finishes, then the whale re-plans
+ * with it inside the same turn. While the whale is idle, it wakes a new turn.
+ * Either way the person never waits for a reply before speaking again. The
+ * caller supplies the session id it read from the plugin state, so a
+ * transcript can only ever land in the main session.
  * @param sessionController host session controller.
  * @param sessionId the recorded main session.
  * @param text the recognized utterance.
@@ -501,7 +505,7 @@ export function promptMainSession(sessionController, sessionId, text, requestId)
     {
       requestId,
       sessionId,
-      mode: 'queue',
+      mode: 'steer',
       content: [{ type: 'text', text }],
     },
     new AbortController().signal,
@@ -511,7 +515,7 @@ export function promptMainSession(sessionController, sessionId, text, requestId)
 /**
  * The route that hands one transcript to the main session.
  *
- * It answers with the session id it queued into, so the browser half can tell
+ * It answers with the session id it delivered to, so the browser half can tell
  * "sent" from "not sent" without a second read. A client-supplied `sessionId`
  * is ignored on purpose: the recorded main session is the only destination.
  * @param options sessionController, a state reader, and an optional logger.

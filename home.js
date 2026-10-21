@@ -190,7 +190,7 @@ export function apply(ctx) {
     // `ctx.get` never throws for a missing service, so this is a plain read.
     const credentials = typeof ctx.get === 'function' ? ctx.get('credentials') : undefined
     // Voice rides this same connection: transcription on one route, the
-    // transcript queued into the recorded main session on another, and the
+    // transcript handed to the recorded main session on another, and the
     // settings pair (read/write the key-free description, probe the backend).
     // The say route owns the only `sessionController.prompt` call voice can
     // reach, so a page script cannot address an arbitrary session with it.

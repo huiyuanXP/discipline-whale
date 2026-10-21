@@ -63,6 +63,233 @@ export const MAX_SUMMARY_CHARS = 1200
 /** Bound on a detailed document, in characters. */
 export const MAX_DOCUMENT_CHARS = 200000
 
+/**
+ * How much of a document the default `head` read shows, in characters.
+ *
+ * The head exists so a main session can decide "is the detail worth it?"
+ * without paying for a 12K-character document in every turn's context.
+ */
+export const PREVIEW_CHARS = 2000
+
+/** Reports shorter than this come back whole instead of as a head preview. */
+export const SMALL_REPORT_CHARS = 3000
+
+/** The Host token meter's coarse basis: one token per four characters. */
+export const CHARS_PER_TOKEN = 4
+
+/** Estimate tokens for a character count on the same basis as the Host meter. */
+export function estimateTokens(chars) {
+  const value = Number(chars)
+  if (!Number.isFinite(value) || value <= 0) return 0
+  return Math.ceil(value / CHARS_PER_TOKEN)
+}
+
+/* ------------------------------------------------------------------ *
+ * The `head` read: what a main session pays for when it asks for a report
+ * ------------------------------------------------------------------ */
+
+/** Opening or closing line of a fenced code block. */
+const FENCE_LINE = /^\s*(`{3,}|~{3,})/
+
+/** An ATX heading, captured down to the closing hashes. */
+const ATX_HEADING = /^(#{1,6})\s+(.*?)\s*#*\s*$/
+
+/**
+ * Read one line's fence marker, or undefined when it is not a fence line.
+ *
+ * A backtick fence's info string cannot contain a backtick, so ``` in prose
+ * after the marker does not count; the marker itself is enough for the head.
+ */
+function fenceMarkerOf(line) {
+  const match = FENCE_LINE.exec(line)
+  if (match === null) return undefined
+  const marker = match[1]
+  if (marker[0] === '`' && line.slice(line.indexOf(marker) + marker.length).includes('`')) return undefined
+  return { char: marker[0], length: marker.length }
+}
+
+/** The lines of a document, with the fence state after each one. */
+function scanLines(document) {
+  const lines = String(document ?? '').split('\n')
+  let open
+  // Line index of the fence that is still open at the end, when there is one.
+  let openingLine = -1
+  const state = lines.map((line, index) => {
+    const marker = fenceMarkerOf(line)
+    if (marker !== undefined && open === undefined) {
+      open = marker
+      openingLine = index
+    } else if (
+      marker !== undefined &&
+      open !== undefined &&
+      marker.char === open.char &&
+      marker.length >= open.length &&
+      line.trim() === marker.char.repeat(line.trim().length)
+    ) {
+      open = undefined
+      openingLine = -1
+    }
+    return { line, inFence: open !== undefined }
+  })
+  return { lines, state, open, openingLine }
+}
+
+/**
+ * The ATX h1-h3 headings of a document, outside code fences.
+ *
+ * Deeper headings (h4-h6) are detail, not structure: they cost context without
+ * helping the "do I need the whole thing?" decision the head exists for.
+ */
+export function sectionHeadings(document) {
+  const { state } = scanLines(document)
+  const headings = []
+  for (const entry of state) {
+    if (entry.inFence) continue
+    const match = ATX_HEADING.exec(entry.line)
+    if (match === null) continue
+    const level = match[1].length
+    if (level > 3) continue
+    const title = match[2].trim()
+    if (title === '') continue
+    headings.push({ level, title })
+  }
+  return headings
+}
+
+/**
+ * Cut a document to a bounded preview that is still renderable Markdown.
+ *
+ * The cut has to respect three boundaries:
+ *
+ *   1. Surrogate pairs: cutting between a high and a low surrogate leaves a
+ *      lone half, which JSON round-trips into a replacement character. Back off
+ *      one unit so the pair stays whole.
+ *   2. Open code fences: a preview that ends inside a fence swallows the rest
+ *      of the message into a code block. Back off to the start of the opening
+ *      fence line. When that fence starts at offset 0 there is nothing left to
+ *      show, so keep the cut and append a closing fence of the same marker
+ *      (`fenceClosed: true` marks that).
+ *   3. A trailing newline: the appended fence has to start on its own line.
+ */
+export function previewDocument(document, limit = PREVIEW_CHARS) {
+  const full = String(document ?? '')
+  const bound = Number.isFinite(Number(limit)) && Number(limit) > 0 ? Math.floor(Number(limit)) : PREVIEW_CHARS
+  if (full.length <= bound) {
+    return { text: full, truncated: false, fenceSafe: true, fenceClosed: false, cutAt: full.length }
+  }
+
+  let cutAt = bound
+  const code = full.charCodeAt(cutAt - 1)
+  if (code >= 0xd800 && code <= 0xdbff) cutAt -= 1
+
+  let text = full.slice(0, cutAt)
+  let fenceClosed = false
+
+  // Walk the previewed lines only: fence state before the cut decides the cut.
+  const { lines, open, openingLine } = scanLines(text)
+  if (open !== undefined) {
+    if (openingLine > 0) {
+      // Back off to the start of the opening fence line. The kept text ends with
+      // a newline (a single line keeps none), so the preview still ends cleanly.
+      const kept = lines.slice(0, openingLine).join('\n')
+      cutAt = kept === '' ? 0 : `${kept}\n`.length
+      text = full.slice(0, cutAt)
+    } else {
+      // The fence opens at offset 0, so backing off would leave nothing: keep the
+      // cut and close the fence with the same marker so Markdown still renders.
+      text = `${text}${text.endsWith('\n') ? '' : '\n'}${open.char.repeat(open.length)}`
+      fenceClosed = true
+    }
+  }
+
+  return { text, truncated: true, fenceSafe: true, fenceClosed, cutAt }
+}
+
+/** How much of a summary an index line exposes: one line, never a paragraph. */
+export const INDEX_SUMMARY_CHARS = 120
+
+/** First line of a summary, bounded, for the one-line index. */
+function summaryLine(summary, limit = INDEX_SUMMARY_CHARS) {
+  const first = String(summary ?? '').split('\n')[0].replace(/\s+/g, ' ').trim()
+  if (first.length <= limit) return first
+  const slice = first.slice(0, limit - 1)
+  const code = slice.charCodeAt(slice.length - 1)
+  const safe = code >= 0xd800 && code <= 0xdbff ? slice.slice(0, -1) : slice
+  return `${safe}…`
+}
+
+/**
+ * The `head` payload for one report: everything a main session needs to decide
+ * whether the document is worth reading, and nothing more.
+ *
+ * `document` is a preview, never the whole thing, unless the report is short
+ * enough that a preview would cost more attention than it saves.
+ */
+export function summarizeReport(report, options = {}) {
+  const document = String(report?.document ?? '')
+  const chars = document.length
+  const preview = previewDocument(document, options.previewChars ?? PREVIEW_CHARS)
+  const small = chars < (options.smallChars ?? SMALL_REPORT_CHARS)
+  // `sectionHeadings` is a head-only field: it is added in the head branch below,
+  // never here, so the small-report branch cannot repeat what it already returns.
+  const base = {
+    id: report?.id,
+    status: report?.status,
+    outcome: report?.outcome,
+    reportedAt: report?.reportedAt,
+    workerSessionId: report?.workerSessionId,
+    workspaceId: report?.workspaceId,
+    workspaceTitle: report?.workspaceTitle,
+    summary: report?.summary,
+    chars,
+    estimatedTokens: estimateTokens(chars),
+  }
+
+  if (small) {
+    // A short report comes back whole, and a whole document already shows its
+    // own headings. Repeating them (plus the preview bookkeeping) made this
+    // branch cost 8-15% MORE than `mode:"full"` on six real reports — the exact
+    // opposite of the shortcut's intent, which is "no extra round trip and no
+    // penalty". So this branch carries the document and nothing redundant.
+    // `test/report-head.mjs` ok 5 compares the two rendered payloads.
+    return {
+      report: { ...base, document, documentTruncated: false },
+      returned: 'full (small report)',
+    }
+  }
+
+  const hint =
+    `This is a head: ${chars} characters (about ${estimateTokens(chars)} tokens) are behind it. ` +
+    `To read the whole document call read_report(report_id="${report?.id}", mode="full"). ` +
+    'Ask for it only when this preview and the headings do not answer the question.'
+
+  return {
+    report: {
+      ...base,
+      sectionHeadings: sectionHeadings(document),
+      document: preview.text,
+      documentTruncated: true,
+      fenceClosed: preview.fenceClosed,
+      previewChars: preview.text.length,
+    },
+    howToReadFull: hint,
+    returned: 'head',
+  }
+}
+
+/**
+ * One line per report for `mode:"index"`.
+ *
+ * There is no index file yet: this is a disk scan of the workspace's report
+ * folder, and the caller is told so instead of being led to believe otherwise.
+ */
+export function indexReportLine(report) {
+  const reportedAt = String(report?.reportedAt ?? 'unknown')
+  const status = String(report?.status ?? 'unknown')
+  const outcome = String(report?.outcome ?? 'unknown')
+  return `- ${reportedAt} [${status}/${outcome}] ${summaryLine(report?.summary)} — ${report?.id}`
+}
+
 /** A stable, filesystem-safe key for one workspace. */
 export function workspaceKey(workspaceId) {
   return String(workspaceId).replace(/[^A-Za-z0-9._-]/g, '_')

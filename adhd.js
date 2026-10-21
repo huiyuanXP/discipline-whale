@@ -10,14 +10,21 @@
  *      system prompt on every request, so the soft constraint is always live;
  *   2. a skill — the same file is registered as `whale-brevity` into the main
  *      preset's *scope*, so the catalog entry and the prompt text cannot drift;
- *   3. a correction — when one reply's visible prose exceeds the limit, the
- *      next step receives one attributed reminder.
+ *   3. two corrections, at the two boundaries a turn has:
+ *      - mid-turn: when the turn's visible prose exceeds the limit, the next
+ *        step receives one attributed reminder (`agent/pre-step`);
+ *      - turn end: when the turn's final answer exceeds the limit, the turn is
+ *        held open for one more step and the model rewrites that answer short
+ *        (`agent/turn-stopping`), so the turn closes on the rewrite.
  *
- * What this module cannot do, stated plainly because the upstream mechanism is
- * the same: it cannot rewrite or truncate text the model already streamed. The
- * user has seen that reply by the time any hook runs. The correction is a
- * steer for the *next* step, never a retroactive edit. The prompt section is
- * the load-bearing half; the correction is a nudge for when the model drifts.
+ * The turn-end rewrite is what changes what the user reads. The Web chat folds
+ * a completed turn's process — every row before the final answer — behind the
+ * turn's own control (`foldCompletedTurns` in the compact, standard and
+ * detailed views; detailed is the Web default, standard the Desktop default).
+ * After the rewrite, the short reply is the turn's answer and the long draft is
+ * a process row folded above it. The verbose view shows every row unfolded.
+ * The prompt section stays the load-bearing half: it keeps the first draft
+ * short, so the rewrite is the backstop.
  *
  * Scope is the property that matters most. Every listener is process-wide (a
  * preset tree is mounted once at boot, not per Session), so each handler reads
@@ -43,13 +50,38 @@ import { presetOfAgent } from './guard.js'
 export const DEFAULT_MAX_PROSE_CHARS = 1200
 
 /**
- * Corrections allowed per user turn.
+ * Corrections allowed per user turn, at each boundary.
  *
- * The same anti-loop reasoning as the guard's intervention budget: a turn that
- * is reminded and then writes another wall of text would be reminded again,
- * forever. After this many, the module stands down until the user speaks.
+ * The mid-turn reminder and the turn-end rewrite each get this many. The same
+ * anti-loop reasoning as the guard's intervention budget: a turn that is
+ * corrected and then writes another wall of text would be corrected again,
+ * forever. After this many, that boundary stands down until the user speaks.
+ * The two budgets are separate so a mid-turn reminder leaves the turn-end
+ * rewrite available for the answer the user actually reads.
  */
 export const DEFAULT_MAX_CORRECTIONS = 1
+
+/**
+ * The floor under a derived decision budget.
+ *
+ * Whatever the chat budget is, an option turn gets at least this much room. It
+ * is a floor, not the default: the real default is
+ * `max(this, maxProseChars * DECISION_BUDGET_MULTIPLIER)`, because a decision
+ * budget below the chat budget is the one thing that must not happen — it would
+ * give "what are my options" less room than "how's it going".
+ */
+export const DEFAULT_DECISION_PROSE_CHARS = 400
+
+/**
+ * How much room a decision turn gets relative to the chat budget.
+ *
+ * A multiplier, not a fixed number, so an operator who tightens
+ * `maxProseChars` for chat does not accidentally make option lists impossible.
+ *
+ * It applies to DERIVATION ONLY. An explicit `decisionProseChars` is adopted
+ * verbatim; this multiplier never overrides a number the operator wrote (see
+ * `resolveBrevityConfig`). */
+export const DECISION_BUDGET_MULTIPLIER = 5
 
 /** The prompt section name. Distinct from the persona slot on purpose (see below). */
 export const RULES_SECTION_NAME = 'discipline-whale:brevity'
@@ -85,6 +117,15 @@ export const UI_EXEMPT_TOOLS = Object.freeze(
  * characters it ships.
  */
 export const TEXT_CHANNEL_TOOLS = Object.freeze(new Set(['render_text']))
+
+/**
+ * The `source.summary` of the turn-end rewrite notice.
+ *
+ * Readers of the session log key on it: the assistant text of a turn before
+ * this notice is a draft the rewrite replaced. `client.js` mirrors the string
+ * (it cannot import this module); `test/client.mjs` proves the copies match.
+ */
+export const REWRITE_NOTICE_SUMMARY = 'revision: rewrite the over-long answer'
 
 /** Attribution stamped on every injected notice, so the model can tell them apart. */
 const NOTICE_SOURCE = Object.freeze({
@@ -181,6 +222,23 @@ export function loadRules(path = join(HERE, RULES_PATH)) {
  * configuration
  * ------------------------------------------------------------------ */
 
+/**
+ * The row-config keys this module reads.
+ *
+ * Exported so `main.js` and the tests share one list instead of three
+ * hand-copied ones. See {@link GUARD_CONFIG_KEYS} in `guard.js` for why: a key
+ * the resolver honours but the schema drops is invisible in every direct-call
+ * test and silently inert in production.
+ *
+ * @type {ReadonlyArray<string>}
+ */
+export const BREVITY_CONFIG_KEYS = Object.freeze([
+  'maxProseChars',
+  'decisionProseChars',
+  'maxCorrections',
+  'enabled',
+])
+
 function positiveInteger(value, fallback) {
   return Number.isInteger(value) && value > 0 ? value : fallback
 }
@@ -206,14 +264,123 @@ function nonNegativeInteger(value, fallback) {
 export function resolveBrevityConfig(input = {}, fallback = {}) {
   const source = input !== null && typeof input === 'object' && !Array.isArray(input) ? input : {}
   const preset = fallback.mainPreset ?? source.mainPreset
+  const maxProseChars =
+    source.maxProseChars === 0 ? 0 : positiveInteger(source.maxProseChars, DEFAULT_MAX_PROSE_CHARS)
+  // The decision budget: an explicit value is adopted verbatim, full stop.
+  //
+  // The rule this replaces compared the explicit value against
+  // `maxProseChars` and silently substituted the derived one when it was not
+  // strictly greater. Consequence: the shipped `1200 / 400` resolved to 6000,
+  // fifteen times the number in the docs, and nothing anywhere said so. An
+  // operator who writes a number expects that number; the resolver's job is to
+  // report a surprising value, never to overrule it.
+  //
+  // Only omission (or a value that is not a positive finite integer) derives.
+  // The derived value keeps the "never below the chat budget" safety, because
+  // that is a *default* — "what are my options" must not come out tighter than
+  // "how's it going" when nobody said otherwise. The guarantee is deliberately
+  // scoped to derivation: it must never veto an explicit choice.
+  const explicitDecision = positiveInteger(source.decisionProseChars, undefined)
+  const derivedDecision = Math.max(
+    DEFAULT_DECISION_PROSE_CHARS,
+    maxProseChars * DECISION_BUDGET_MULTIPLIER,
+    // Belt and braces: keep the derivation above the chat budget even if a
+    // future multiplier edit breaks that by construction.
+    maxProseChars,
+  )
+  const decisionProseChars = explicitDecision ?? derivedDecision
+
+  /** Diagnostics an operator can actually read: adopted, derived, or rejected. */
+  const notes = []
+  if (explicitDecision !== undefined) {
+    notes.push(
+      `decisionProseChars: ${explicitDecision} (explicit, in effect)` +
+        (explicitDecision <= maxProseChars
+          ? ` — NOTE: not above maxProseChars ${maxProseChars}, so option turns are no roomier than chat.`
+          : ''),
+    )
+  } else if (source.decisionProseChars !== undefined) {
+    notes.push(
+      `decisionProseChars: ${JSON.stringify(source.decisionProseChars)} is not a positive integer; ` +
+        `derived ${derivedDecision}.`,
+    )
+  } else {
+    notes.push(`decisionProseChars: derived ${derivedDecision} (key omitted).`)
+  }
+
   return {
     mainPreset:
       typeof preset === 'string' && preset !== '' ? preset : 'discipline-whale',
-    maxProseChars:
-      source.maxProseChars === 0 ? 0 : positiveInteger(source.maxProseChars, DEFAULT_MAX_PROSE_CHARS),
+    maxProseChars,
+    decisionProseChars,
+    /** `explicit` when the operator's number is in effect, `derived` otherwise. */
+    decisionSource: explicitDecision === undefined ? 'derived' : 'explicit',
+    decisionDerived: explicitDecision === undefined,
     maxCorrections: nonNegativeInteger(source.maxCorrections, DEFAULT_MAX_CORRECTIONS),
     enabled: source.enabled !== false,
+    notes: Object.freeze(notes),
+    warnings: Object.freeze(
+      explicitDecision === undefined && source.decisionProseChars !== undefined
+        ? [notes[0]]
+        : [],
+    ),
   }
+}
+
+/* ------------------------------------------------------------------ *
+ * turn classification — "compress hard" vs "structure is allowed"
+ * ------------------------------------------------------------------ */
+
+/**
+ * Phrases that mean "put the options / the evidence in front of me".
+ *
+ * Matched case-insensitively against the user's own message for the turn. This
+ * is a heuristic, and it is deliberately generous in the *permissive*
+ * direction: misclassifying a chat turn as a decision turn costs a looser
+ * budget for one turn, while the reverse deletes the answer the user asked for.
+ */
+const DECISION_CUES = Object.freeze([
+  /哪些选项/,
+  /什么选项/,
+  /几个(选择|方案|选项|办法)/,
+  /有哪些(方案|选项|做法|办法|可能)/,
+  /(对比|比较|权衡)/,
+  /利弊/,
+  /优缺点/,
+  /(解释|说明|讲讲|展开|详细)/,
+  /(为什么|怎么会|原理|机制)/,
+  /(pros and cons|trade-?offs?|compare|comparison|options?|alternatives?|explain|walk me through|why)/i,
+])
+
+/**
+ * Whether this turn is asking for options, evidence, or an explanation.
+ *
+ * The user's requirement splits two cases that a single character budget
+ * cannot serve at once:
+ *
+ *   - **plain chat / judgement / boundary / pending decision** — the reading
+ *     burden the user complained about. Compress hard.
+ *   - **"what are my options"** — the options *are* the answer. Structured,
+ *     but numbered with one line each, never prose paragraphs.
+ *
+ * @param {string|undefined} userText - the user's message that opened this turn.
+ * @returns {boolean} true when structure is allowed.
+ */
+export function isDecisionTurn(userText) {
+  if (typeof userText !== 'string' || userText.trim() === '') return false
+  return DECISION_CUES.some((pattern) => pattern.test(userText))
+}
+
+/**
+ * The shape a decision turn must still honour.
+ *
+ * Exported as text, not just implemented, so the prompt and the tests assert
+ * the same sentence: the exception relaxes length, never form.
+ *
+ * @returns {string} the one-line shape contract.
+ */
+export function decisionShapeContract() {
+  return '选项类回答用编号，每项一行（一行权衡 + 推荐），不是散文段落；每项最多 5 个。'
 }
 
 /* ------------------------------------------------------------------ *
@@ -259,14 +426,19 @@ export function isUiTurn(toolCalls) {
  * @param {{toolCalls?: Array, chars?: number, config?: object}} input
  * @returns {{enforce: boolean, reason: string, overBy?: number, limit?: number}}
  */
-export function shouldEnforceBrevity({ toolCalls, chars, config } = {}) {
+export function shouldEnforceBrevity({ toolCalls, chars, config, userText } = {}) {
   const resolved = config ?? resolveBrevityConfig()
   if (resolved.enabled === false) return { enforce: false, reason: 'disabled' }
+  // A delivered artefact outranks every length rule, including the decision
+  // budget: a canvas is read as a thing, not as a message.
   if (isUiTurn(toolCalls)) return { enforce: false, reason: 'ui-deliverable' }
+  const decision = isDecisionTurn(userText)
+  const limit = decision
+    ? (resolved.decisionProseChars ?? DEFAULT_DECISION_PROSE_CHARS)
+    : (resolved.maxProseChars ?? DEFAULT_MAX_PROSE_CHARS)
   const length = Number.isFinite(chars) ? chars : 0
-  const limit = resolved.maxProseChars ?? DEFAULT_MAX_PROSE_CHARS
-  if (length <= limit) return { enforce: false, reason: 'within-limit', limit }
-  return { enforce: true, reason: 'over-limit', overBy: length - limit, limit }
+  if (length <= limit) return { enforce: false, reason: 'within-limit', limit, decision }
+  return { enforce: true, reason: 'over-limit', overBy: length - limit, limit, decision }
 }
 
 /**
@@ -296,23 +468,75 @@ export function countTextInArgs(name, args) {
   return total
 }
 
+/**
+ * The plain text of one user message, for turn classification.
+ *
+ * Only the human's own text blocks count; notices this plugin injects carry a
+ * different `source.kind` and never reach here (the caller filters on that
+ * first). Joining every text block keeps multi-block input intact.
+ *
+ * @param {object} message - one inbox message.
+ * @returns {string} its text, or `''` when it carries none.
+ */
+export function userTextOf(message) {
+  const content = message?.content
+  if (!Array.isArray(content)) return ''
+  return content
+    .filter((block) => block !== null && typeof block === 'object' && block.type === 'text')
+    .map((block) => (typeof block.text === 'string' ? block.text : ''))
+    .join('\n')
+}
+
 /* ------------------------------------------------------------------ *
  * the notice
  * ------------------------------------------------------------------ */
 
-/** Rendered when one turn's prose crossed the limit. Kept verbatim for tests. */
-export function brevityNotice({ limit, overBy }) {
+/** The shape rules both notices carry; `decision` picks the option-turn form. */
+function shapeLines(decision) {
+  const shape = decision
+    ? [
+        '这一轮用户在问选项/证据，所以允许结构化，但只能是编号：',
+        decisionShapeContract(),
+        '不要用散文化段落铺开；每项的权衡压到一行。',
+      ]
+    : [
+        '这一轮是普通对话，按最紧的口径：',
+        '1. 第一句就是下一步动作，不是背景或计划。',
+        '2. 结论 + 下一个动作，正文控制在 3 行以内。',
+        '3. 把细节删到最少，或者放进 UI / 交给 worker——不要留在正文里。',
+      ]
   return [
-    `[Discipline Whale] 这条回复的正文约 ${limit + overBy} 字，超过了简洁上限 ${limit} 字。`,
-    '用户已经读到了那段话，这里不能重写它。下一条回复按下面做：',
-    '1. 第一句就是下一步动作，不是背景或计划。',
-    '2. 多步任务用编号列表，每步一个动作，用最少的步数。',
-    '3. 结尾给一个两分钟内能开始的具体动作；不要「还需要什么随时说」。',
+    ...shape,
     '4. 没有开场白、没有复述、没有客套收尾。',
     '5. 列表每组最多 5 项；分析可以想得多，展示要少。',
     'UI / 画布（render_ui / render_canvas / render_scene / render_mechanism）是交付物，不受长度限制；',
     'render_text 渲染的仍然是文字，字数照算。',
-    '细节写进 UI 或交给 worker，口头说明保持简短。',
+  ]
+}
+
+/** Rendered at a step boundary when the turn's prose crossed the limit. Kept verbatim for tests. */
+export function brevityNotice({ limit, overBy, decision = false }) {
+  return [
+    `[Discipline Whale] 这条回复的正文约 ${limit + overBy} 字，超过了上限 ${limit} 字。`,
+    '那段已经发出。下一条回复按下面做：',
+    ...shapeLines(decision),
+  ].join('\n')
+}
+
+/**
+ * Rendered at turn end when the final answer crossed the limit.
+ *
+ * The reply the model writes next becomes the turn's answer, and the long draft
+ * folds into the turn's process above it. So the rewrite has to stand alone: a
+ * reader who never opens the fold must get the whole point from it.
+ */
+export function rewriteNotice({ limit, overBy, decision = false }) {
+  return [
+    `[Discipline Whale] 本轮的最终回复正文约 ${limit + overBy} 字，超过了上限 ${limit} 字。`,
+    `现在把它重写成本轮的最终回复，正文 ${limit} 字以内。`,
+    '这一条会成为用户看到的答案；刚才那条在本轮结束后折叠进过程区。',
+    '所以它要自成一体：直接给压缩版，不道歉、不提上一条、不写「见上」，不调用工具、不做新的工作。',
+    ...shapeLines(decision),
   ].join('\n')
 }
 
@@ -320,9 +544,15 @@ export function brevityNotice({ limit, overBy }) {
  * the row
  * ------------------------------------------------------------------ */
 
-/** Per-Session measurement. Only main Sessions ever get an entry. */
+/**
+ * Per-Session measurement. Only main Sessions ever get an entry.
+ *
+ * `chars` is the turn's prose since the last mid-turn reminder; `answerChars`
+ * is the prose of the latest model attempt, which is the turn's answer when
+ * that attempt ends the turn. `corrections` and `rewrites` are the two budgets.
+ */
 function emptyState() {
-  return { chars: 0, tools: new Set(), corrections: 0 }
+  return { chars: 0, answerChars: 0, tools: new Set(), corrections: 0, rewrites: 0, userText: '' }
 }
 
 /**
@@ -393,7 +623,8 @@ export function isBrevityInstalled(ctx) {
  * matter how many rows ask for this discipline.
  *
  * @param ctx - the row context (`agent/assistant-stream`, `tools/pre-execute`,
- *   `agent/pre-step`, `agent/inbox/claimed`, `agent/disposed`).
+ *   `agent/pre-step`, `agent/turn-stopping`, `agent/inbox/claimed`,
+ *   `agent/disposed`).
  * @param {object} [config] - row config; see {@link resolveBrevityConfig}.
  * @returns {{config: object, sessions: Map, isMainAgent: Function, rules: string, installed: boolean}}
  *   handle, for tests and diagnostics. `installed` is `false` on a repeat call.
@@ -401,6 +632,20 @@ export function isBrevityInstalled(ctx) {
 export function installBrevity(ctx, config = {}) {
   const resolved = resolveBrevityConfig(config, { mainPreset: config.mainPreset })
   const { body: rulesBody } = loadRules()
+
+  // A configuration warning that only exists in a return value is not
+  // observable: nothing reads the handle. Log it once, at install, where an
+  // operator looking at the row's startup output will see it. This is the
+  // difference between "the value was overridden" and "the value was
+  // overridden and nobody could tell" — which is what made the old rule
+  // expensive.
+  for (const warning of resolved.warnings ?? []) {
+    try {
+      ctx.logger?.warn?.(`discipline-whale: ${warning}`)
+    } catch {
+      // A missing logger must never stop the discipline from installing.
+    }
+  }
 
   const scopeKey = scopeKeyOf(ctx)
   const existing = scopeKey === undefined ? undefined : installedScopes.get(scopeKey)
@@ -446,14 +691,23 @@ export function installBrevity(ctx, config = {}) {
   // 1. Measure. `agent/assistant-stream` is dispatched with the Agent as the
   //    scope key, so a preset-mounted listener receives it (unlike
   //    `session/event`, which is dispatched at the host plane and filtered out).
+  //    A `start` frame opens each model attempt (a new step, or a retry of the
+  //    same one), so it restarts the answer measurement: only the attempt that
+  //    ends the turn is the answer.
   ctx.on('agent/assistant-stream', ({ agent, frame }) => {
     if (agent === undefined || !isMainAgent(agent)) return
     const sessionId = sessionIdOf(agent)
     if (sessionId === undefined) return
+    if (frame?.type === 'start') {
+      stateFor(sessionId).answerChars = 0
+      return
+    }
     if (frame?.type !== 'chunk') return
     const chunk = frame.chunk
     if (chunk?.type !== 'text-delta' || typeof chunk.text !== 'string') return
-    stateFor(sessionId).chars += chunk.text.length
+    const state = stateFor(sessionId)
+    state.chars += chunk.text.length
+    state.answerChars += chunk.text.length
   })
 
   // 2. Record deliveries and count the prose a `render_text` ships. The gate
@@ -472,8 +726,7 @@ export function installBrevity(ctx, config = {}) {
     return next()
   })
 
-  // 3. Correct at the next step boundary — the earliest moment a reminder can
-  //    still change anything, because the streamed reply is already on screen.
+  // 3. Remind at the next step boundary, so the rest of the turn stays short.
   ctx.on('agent/pre-step', async ({ agent, signal }, next) => {
     const decision = await next()
     if (decision.kind === 'reject') return decision
@@ -488,6 +741,7 @@ export function installBrevity(ctx, config = {}) {
       toolCalls: [...state.tools],
       chars: state.chars,
       config: resolved,
+      userText: state.userText,
     })
     if (verdict.enforce !== true) return decision
     signal?.throwIfAborted?.()
@@ -498,7 +752,7 @@ export function installBrevity(ctx, config = {}) {
     state.chars = 0
     state.tools = new Set()
 
-    const text = brevityNotice({ limit: verdict.limit, overBy: verdict.overBy })
+    const text = brevityNotice({ limit: verdict.limit, overBy: verdict.overBy, decision: verdict.decision === true })
     const steered = steerNotice(agent, text, 'revision: over-long prose')
     if (steered) return decision
 
@@ -516,21 +770,61 @@ export function installBrevity(ctx, config = {}) {
     }
   })
 
-  // 4. A real user turn re-arms the budget and restarts the measurement. The
+  // 4. Rewrite at turn end. `agent-loop` dispatches this serially after a step
+  //    that ends the turn, and closes the turn only while `next-step` is still
+  //    empty afterwards. A steer here fills it, so the loop runs one more step:
+  //    the rewrite becomes the turn's answer and the long draft becomes a
+  //    process row, which the chat folds when the turn completes.
+  ctx.on('agent/turn-stopping', ({ agent, signal }) => {
+    if (agent === undefined || !isMainAgent(agent)) return
+    if (signal?.aborted === true) return
+    const sessionId = sessionIdOf(agent)
+    if (sessionId === undefined) return
+    const state = sessions.get(sessionId)
+    if (state === undefined) return
+    if (state.rewrites >= resolved.maxCorrections) return
+
+    const verdict = shouldEnforceBrevity({
+      toolCalls: [...state.tools],
+      chars: state.answerChars,
+      config: resolved,
+      userText: state.userText,
+    })
+    if (verdict.enforce !== true) return
+
+    // Spend the budget before steering, for the same reason as above. The
+    // rewrite starts from a clean measurement so the mid-turn reminder does not
+    // count the draft a second time.
+    state.rewrites += 1
+    state.chars = 0
+    state.answerChars = 0
+
+    const text = rewriteNotice({ limit: verdict.limit, overBy: verdict.overBy, decision: verdict.decision === true })
+    steerNotice(agent, text, REWRITE_NOTICE_SUMMARY)
+  })
+
+  // 5. A real user turn re-arms both budgets and restarts the measurement. The
   //    `source.kind` test excludes the notices this module itself injects.
   ctx.on('agent/inbox/claimed', ({ agent, message }) => {
     if (agent === undefined || !isMainAgent(agent)) return
     if (message?.source?.kind !== 'user') return
     const sessionId = sessionIdOf(agent)
     if (sessionId === undefined) return
-    const state = sessions.get(sessionId)
-    if (state === undefined) return
+    // `stateFor`, not `get`: the user's message may arrive before any assistant
+    // frame, and the turn's classification must still be recorded. Bailing here
+    // would silently leave `userText` empty, so every turn would be measured
+    // against the chat budget — including the option turns that need the wider
+    // one. (Caught by test 12.)
+    const state = stateFor(sessionId)
     state.chars = 0
+    state.answerChars = 0
     state.tools = new Set()
     state.corrections = 0
+    state.rewrites = 0
+    state.userText = userTextOf(message)
   })
 
-  // 5. Forget a Session when it goes away.
+  // 6. Forget a Session when it goes away.
   ctx.on('agent/disposed', ({ agent }) => {
     const sessionId = sessionIdOf(agent)
     if (sessionId !== undefined) sessions.delete(sessionId)

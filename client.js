@@ -81,9 +81,10 @@ window.__ModuleLoader__.load({
       // utterances in a row refused as background sound, closes the microphone.
       awayIdleMs: 120000,
       awayMaxRejections: 3,
-      // How long to wait for the whale's turn to settle before giving up.
-      replyTimeoutMs: 180000,
-      // Turn polling cadence; a real turn-end event is not available here.
+      // A sent utterance counts as "the whale is on it" for this long before
+      // its turn shows up in the session list.
+      sentGraceMs: 10000,
+      // Reply polling cadence; a real turn-end event is not available here.
       pollMs: 700,
     };
 
@@ -103,11 +104,11 @@ window.__ModuleLoader__.load({
         statusReady: "待命 · 可以直接说话",
         statusCalibrating: "正在准备收音…",
         statusListening: "正在听 · 说完停顿一下就发送",
-        statusTranscribing: "识别中…",
+        statusSending: "识别中 · 可以接着说",
+        statusListeningBusy: "鲸鱼在想 · 接着说，会在它这次工具调用结束后插进去",
         statusThinking: "鲸鱼思考中…",
         statusSpeaking: "朗读中…",
         statusError: "出错",
-        statusSent: "已发送，等鲸鱼回复",
         speakOn: "朗读回复：开",
         speakOff: "朗读回复：关（默认）",
         speakHint: "用浏览器语音合成朗读回复",
@@ -127,7 +128,6 @@ window.__ModuleLoader__.load({
         errEmptyTranscript: "没有识别出内容，请再说一次。",
         errNoMainSession: "还没有主会话，请先从侧边栏打开自律鲸鱼。",
         errNoSpeech: "没听到有效语音，未发送。",
-        errReplyTimeout: "等鲸鱼回复超时，可以到会话里查看。",
         errVadLoad: "语音检测组件没能加载，请确认插件安装完整后重试。",
         noticeRejected: "这段听起来是背景声，没有发送。",
         noticeTooQuiet: "声音离麦克风太远，没有发送。",
@@ -234,11 +234,11 @@ window.__ModuleLoader__.load({
         statusReady: "Ready · just talk",
         statusCalibrating: "Getting the microphone ready…",
         statusListening: "Listening · pause when you're done",
-        statusTranscribing: "Transcribing…",
+        statusSending: "Transcribing · keep talking",
+        statusListeningBusy: "The whale is working · keep talking; it cuts in after the current tool call",
         statusThinking: "The whale is thinking…",
         statusSpeaking: "Speaking…",
         statusError: "Error",
-        statusSent: "Sent; waiting for the reply",
         speakOn: "Read replies: on",
         speakOff: "Read replies: off (default)",
         speakHint: "Read the reply with the browser's speech synthesizer",
@@ -258,7 +258,6 @@ window.__ModuleLoader__.load({
         errEmptyTranscript: "Nothing recognizable was said; please retry.",
         errNoMainSession: "There is no main session yet; open the whale from the sidebar first.",
         errNoSpeech: "No usable speech was heard, so nothing was sent.",
-        errReplyTimeout: "The reply took too long; open the conversation to check.",
         errVadLoad: "The speech detector failed to load; check the plugin installation and retry.",
         noticeRejected: "That sounded like background sound, so nothing was sent.",
         noticeTooQuiet: "That was too far from the microphone, so nothing was sent.",
@@ -607,21 +606,25 @@ window.__ModuleLoader__.load({
      *
      *   listen(muted)  open the microphone and detect speech (muted: open it,
      *                  but process nothing)
-     *   hold()         half-duplex while the whale works: stop detecting and
-     *                  release the microphone; a segment in progress is dropped
-     *   mute()         stop detecting, keep the microphone open; a segment in
-     *                  progress is dropped
+     *   hold()         stop detecting and release the microphone (microphone
+     *                  off, page hidden); a segment in progress is dropped
+     *   mute()         stop detecting, keep the microphone open (mute, a reply
+     *                  read aloud); a segment in progress is dropped
      *   unmute()       detect again on the same stream
-     *   finish()       "done talking": end the segment now and hand it over;
-     *                  answers whether there was one
+     *   finish()       "done talking": end the segment now, hand it over and
+     *                  keep listening; answers whether there was one
      *   close()        release everything
      *
-     * Each finished segment reaches `onUtterance(audio)` as 16 kHz Float32
-     * samples. A segment still going after `maxSpeechMs` is finished
-     * automatically. MicVAD is created lazily through `createVad(options)`, so
-     * tests drive this with a fake.
+     * Detection keeps running across segments: each finished one reaches
+     * `onUtterance(audio)` as 16 kHz Float32 samples while the next can already
+     * begin. A segment still going after `maxSpeechMs` is finished
+     * automatically. `onSpeaking(active)` says whether a segment is in progress,
+     * so a reply read aloud can wait for the person to finish. MicVAD is
+     * created lazily through `createVad(options)`, so tests drive this with a
+     * fake.
      * @param deps `createVad`, `getStream`, VAD `options`, `maxSpeechMs`,
-     *   `onUtterance`, and injectable `setTimeout` / `clearTimeout`.
+     *   `onUtterance`, optional `onSpeaking`, and injectable `setTimeout` /
+     *   `clearTimeout`.
      * @returns the listener.
      */
     function createTurnTaker(deps) {
@@ -636,8 +639,11 @@ window.__ModuleLoader__.load({
       let closed = false;
       let keepStream = false;
       let delivered = false;
+      // Detection is running: listening, not muted, not held.
+      let detecting = false;
       let capTimer = null;
       let options = { ...deps.options };
+      const speaking = (active) => { deps.onSpeaking?.(active); };
 
       const clearCap = () => {
         if (capTimer !== null) cancel(capTimer);
@@ -668,22 +674,27 @@ window.__ModuleLoader__.load({
             startOnLoad: false,
             submitUserSpeechOnPause: false,
             getStream: acquire,
-            // Half-duplex releases the device; mute keeps it open.
+            // Holding releases the device; mute keeps it open.
             pauseStream: async () => { if (!keepStream) stopTracks(); },
             resumeStream: async (current) => {
               const live = current?.getTracks().some((track) => track.readyState === "live") === true;
               return live ? current : acquire();
             },
+            onSpeechStart: () => { speaking(true); },
             onSpeechRealStart: () => {
               clearCap();
               capTimer = schedule(() => { void finish(); }, deps.maxSpeechMs);
             },
             onSpeechEnd: (audio) => {
               clearCap();
+              speaking(false);
               delivered = true;
               deps.onUtterance(audio);
             },
-            onVADMisfire: () => { clearCap(); },
+            onVADMisfire: () => {
+              clearCap();
+              speaking(false);
+            },
           })).then((created) => {
             if (closed) {
               Promise.resolve().then(() => created.destroy()).catch(() => { /* never started */ });
@@ -696,26 +707,41 @@ window.__ModuleLoader__.load({
         return creating;
       }
 
-      async function pause(keep, submit) {
+      async function pause(keep) {
         clearCap();
+        detecting = false;
         if (vad !== null) {
           keepStream = keep;
-          if (submit) vad.setOptions({ submitUserSpeechOnPause: true });
           try {
             await vad.pause();
           } finally {
-            if (submit) vad.setOptions({ submitUserSpeechOnPause: false });
             keepStream = false;
           }
         }
+        speaking(false);
         // MicVAD.pause() does nothing once detection is already paused (muted),
         // so releasing the device never depends on its pauseStream call.
         if (!keep) stopTracks();
       }
 
+      // Cut the segment in progress and hand it over, then detect again on the
+      // same open stream: the call goes on listening.
       async function finish() {
         delivered = false;
-        await pause(false, true);
+        clearCap();
+        if (vad === null || !detecting) return false;
+        const current = vad;
+        keepStream = true;
+        current.setOptions({ submitUserSpeechOnPause: true });
+        try {
+          await current.pause();
+        } finally {
+          current.setOptions({ submitUserSpeechOnPause: false });
+          keepStream = false;
+        }
+        speaking(false);
+        // A hold, mute or close while the segment was handed over wins.
+        if (!closed && vad === current && detecting) await current.start();
         return delivered;
       }
 
@@ -727,12 +753,15 @@ window.__ModuleLoader__.load({
             stopTracks();
             throw closedError();
           }
-          if (muted === true) await pause(true, false);
+          detecting = true;
+          if (muted === true) await pause(true);
         },
-        hold() { return pause(false, false); },
-        mute() { return pause(true, false); },
+        hold() { return pause(false); },
+        mute() { return pause(true); },
         async unmute() {
-          if (vad !== null) await vad.start();
+          if (vad === null) return;
+          await vad.start();
+          detecting = true;
         },
         finish,
         /** Change how long a pause ends the turn, now and for a later start. */
@@ -742,7 +771,10 @@ window.__ModuleLoader__.load({
         },
         async close() {
           closed = true;
+          detecting = false;
           clearCap();
+          // Destroying the detector drops a segment in progress without an event.
+          speaking(false);
           const current = vad;
           vad = null;
           if (current !== null) {
@@ -871,21 +903,26 @@ window.__ModuleLoader__.load({
      * Where a released dock settles, as the CSS anchoring the stylesheet uses.
      *
      * Two shapes, one rule each:
-     *   * The open panel, pushed past a side edge by 30% of its width (at most
-     *     120px), is stashed on that side as a single microphone button.
-     *     Released anywhere else it stays open, clamped and edge-snapped by
-     *     `snapDockPosition`.
-     *   * The stashed button, released within `snapDistance` of a side, stays
-     *     stashed there (it can slide along the edge). Released further in, it
-     *     opens again at `expanded` size, centred on where it was dropped.
+     *   * The open panel, pushed past any edge by 30% of its size on that axis
+     *     (at most 120px), is stashed on that edge as a single microphone
+     *     button. Released anywhere else it stays open, clamped and
+     *     edge-snapped by `snapDockPosition`.
+     *   * The stashed button, released within `snapDistance` of an edge, stays
+     *     stashed on the nearest one (it can slide along it). Released further
+     *     in, it opens again at `expanded` size, centred on where it was
+     *     dropped.
      *
      * The result is anchored to the nearer side (`anchor`, distance `x` from
      * it) and to the bottom (`y`), so a panel that grows or shrinks keeps its
-     * control bar where the user left it.
+     * control bar where the user left it. Stashed on a side, the button keeps
+     * the panel's bottom; stashed on the top or bottom, it keeps the panel's
+     * anchored side.
      * @param input `left`/`top` of the dropped box (unclamped), its `width`/
      *   `height`, the `viewport`, whether it is `docked`, the `expanded` size,
-     *   and optional `margin` / `dockMargin` / `snapDistance`.
-     * @returns `{ docked, anchor, x, y }`; `docked` is "left", "right" or null.
+     *   the stashed `button` size, and optional `margin` / `dockMargin` /
+     *   `snapDistance`.
+     * @returns `{ docked, anchor, x, y }`; `docked` is "left", "right", "top",
+     *   "bottom" or null.
      */
     function dockRelease(input) {
       const margin = input.margin ?? 16;
@@ -894,19 +931,39 @@ window.__ModuleLoader__.load({
       const viewport = input.viewport;
       const width = Math.max(0, input.width);
       const height = Math.max(0, input.height);
+      const button = input.button ?? { width: 60, height: 60 };
+      const clamp = (value, low, high) => Math.min(Math.max(value, low), Math.max(low, high));
       let docked = null;
       if (input.docked === true) {
-        const toLeft = input.left;
-        const toRight = viewport.width - (input.left + width);
-        if (Math.min(toLeft, toRight) <= snapDistance) docked = toLeft <= toRight ? "left" : "right";
+        const gaps = {
+          left: input.left,
+          right: viewport.width - (input.left + width),
+          top: input.top,
+          bottom: viewport.height - (input.top + height),
+        };
+        const nearest = Object.keys(gaps).reduce((best, edge) => (gaps[edge] < gaps[best] ? edge : best));
+        if (gaps[nearest] <= snapDistance) docked = nearest;
       } else {
-        const push = Math.min(120, width * 0.3);
-        if (-input.left > push) docked = "left";
-        else if (input.left + width - viewport.width > push) docked = "right";
+        const pushX = Math.min(120, width * 0.3);
+        const pushY = Math.min(120, height * 0.3);
+        if (-input.left > pushX) docked = "left";
+        else if (input.left + width - viewport.width > pushX) docked = "right";
+        else if (-input.top > pushY) docked = "top";
+        else if (input.top + height - viewport.height > pushY) docked = "bottom";
       }
-      if (docked !== null) {
-        const top = Math.min(Math.max(input.top, margin), Math.max(margin, viewport.height - height - margin));
+      if (docked === "left" || docked === "right") {
+        const top = clamp(input.top, margin, viewport.height - height - margin);
         return { docked, anchor: docked, x: dockMargin, y: viewport.height - top - height };
+      }
+      if (docked === "top" || docked === "bottom") {
+        const left = clamp(input.left, margin, viewport.width - width - margin);
+        const anchor = left + width / 2 < viewport.width / 2 ? "left" : "right";
+        return {
+          docked,
+          anchor,
+          x: anchor === "left" ? left : viewport.width - left - width,
+          y: docked === "bottom" ? dockMargin : viewport.height - dockMargin - button.height,
+        };
       }
       // Opening from the stashed button uses the panel's own size, centred
       // under the drop point with its bottom edge where the button was.
@@ -933,6 +990,39 @@ window.__ModuleLoader__.load({
         anchor,
         x: anchor === "left" ? placed.x : viewport.width - placed.x - box.width,
         y: viewport.height - placed.y - box.height,
+      };
+    }
+
+    /**
+     * Where the dock is drawn while it is dragged: always inside the viewport.
+     *
+     * The box follows the pointer within the margins and stops at the edges.
+     * Pushed on past any edge far enough to stash (`dockRelease`'s rule), the
+     * open panel is drawn as the stashed microphone button on that edge,
+     * exactly where letting go leaves it; pulled back in, it is the panel
+     * again. The stashed button stays on the nearest edge while it is within
+     * `snapDistance` of it, and inside the viewport when dragged inward.
+     * @param input the same as `dockRelease`: the box where the pointer would
+     *   put it (unclamped), its size, the `viewport`, `docked` and `expanded`.
+     * @returns `{ stash, anchor, x, y }`: `stash` is the side it would stash
+     *   on, or null; `anchor`/`x`/`y` place the box drawn now.
+     */
+    function dockDragFrame(input) {
+      const margin = input.margin ?? 16;
+      const viewport = input.viewport;
+      const settle = dockRelease(input);
+      if (settle.docked !== null) return { stash: settle.docked, anchor: settle.anchor, x: settle.x, y: settle.y };
+      const width = Math.max(0, input.width);
+      const height = Math.max(0, input.height);
+      const clamp = (value, size, room) => Math.min(Math.max(value, margin), Math.max(margin, room - size - margin));
+      const left = clamp(input.left, width, viewport.width);
+      const top = clamp(input.top, height, viewport.height);
+      const anchor = left + width / 2 < viewport.width / 2 ? "left" : "right";
+      return {
+        stash: null,
+        anchor,
+        x: anchor === "left" ? left : viewport.width - left - width,
+        y: viewport.height - top - height,
       };
     }
 
@@ -1042,40 +1132,73 @@ window.__ModuleLoader__.load({
       };
     }
 
-    // ---- reading the whale's reply ----------------------------------------
+    // ---- following the whale's reply ---------------------------------------
     //
     // The client exposes no per-turn "turn ended" callback to a plugin: the
     // session face carries `running`, and the event window
     // (`binding.eventSource`) carries the durable `turn/start`/`turn/end` and
-    // `assistant/message` events. We read the event window directly, so the
-    // reply text is exact rather than scraped from the DOM. `turn/end` IS a
-    // real durable event; what this dock approximates is only *when to look*:
-    // it polls the session snapshot for `running === false` and then reads the
-    // closed turn from the window. That polling is the approximation.
+    // `assistant/message` events, each with its `seq`. We read the event window
+    // directly, so the reply text is exact rather than scraped from the DOM.
+    // What this dock approximates is only *when to look*: it polls the session
+    // snapshot and the window every `pollMs`.
 
-    /** The highest turn already present when the call starts. */
-    function baselineTurnOf(entries) {
+    function eventOf(entry) {
+      return entry && entry.type === "event" ? entry.event : entry;
+    }
+
+    /** The highest event `seq` in the window: everything up to it has been seen. */
+    function eventMarkOf(entries) {
       let highest = 0;
       for (const entry of entries || []) {
-        const event = entry && entry.type === "event" ? entry.event : entry;
-        if (event && event.type === "turn/start" && typeof event.data?.turn === "number") {
-          highest = Math.max(highest, event.data.turn);
-        }
-        if (event && event.type === "turn/end" && typeof event.data?.turn === "number") {
-          highest = Math.max(highest, event.data.turn);
-        }
+        const event = eventOf(entry);
+        if (event && typeof event.seq === "number") highest = Math.max(highest, event.seq);
       }
       return highest;
     }
 
-    /** Concatenated text of the assistant messages in every turn above `baseline`. */
-    function replyTextOf(entries, baseline) {
+    // The `source.summary` of the notice `adhd.js` steers when a turn's final
+    // answer runs long (REWRITE_NOTICE_SUMMARY there); `test/client.mjs` proves
+    // the copies match.
+    const REWRITE_NOTICE = { kind: "plugin:discipline-whale:brevity", summary: "revision: rewrite the over-long answer" };
+
+    /**
+     * The window without the drafts a turn-end rewrite replaced.
+     *
+     * The model rewrites an over-long answer in the same turn, right after the
+     * rewrite notice, so the turn's assistant text before the notice is the
+     * draft. The reply is what follows it — the same answer the chat shows
+     * after folding the draft into the turn's process.
+     */
+    function withoutRewrittenDrafts(entries) {
+      const list = entries || [];
+      const drafts = new Set();
+      let turnMessages = [];
+      list.forEach((entry, index) => {
+        const event = eventOf(entry);
+        if (!event) return;
+        if (event.type === "turn/start") {
+          turnMessages = [];
+        } else if (event.type === "assistant/message") {
+          turnMessages.push(index);
+        } else if (
+          event.type === "user/message" &&
+          event.data?.source?.kind === REWRITE_NOTICE.kind &&
+          event.data?.source?.summary === REWRITE_NOTICE.summary
+        ) {
+          for (const draft of turnMessages) drafts.add(draft);
+          turnMessages = [];
+        }
+      });
+      return drafts.size === 0 ? list : list.filter((_entry, index) => !drafts.has(index));
+    }
+
+    /** Concatenated text of the assistant messages after `mark`. */
+    function replyTextAfter(entries, mark) {
       const parts = [];
-      for (const entry of entries || []) {
-        const event = entry && entry.type === "event" ? entry.event : entry;
+      for (const entry of withoutRewrittenDrafts(entries)) {
+        const event = eventOf(entry);
         if (!event || event.type !== "assistant/message") continue;
-        const turn = event.data?.turn;
-        if (typeof turn !== "number" || turn <= baseline) continue;
+        if (typeof event.seq !== "number" || event.seq <= mark) continue;
         const content = Array.isArray(event.data?.message?.content) ? event.data.message.content : [];
         for (const block of content) {
           if (block && block.type === "text" && typeof block.text === "string" && block.text.trim() !== "") {
@@ -1086,9 +1209,67 @@ window.__ModuleLoader__.load({
       return parts.join("");
     }
 
-    /** Whether any assistant text exists above `baseline` (the poll's "has it started"). */
-    function hasReplyAbove(entries, baseline) {
-      return replyTextOf(entries, baseline) !== "";
+    /** Whether the latest turn in the window has its `turn/end`. */
+    function lastTurnClosed(entries) {
+      let latest = 0;
+      const ended = new Set();
+      for (const entry of entries || []) {
+        const event = eventOf(entry);
+        const turn = event?.data?.turn;
+        if (typeof turn !== "number") continue;
+        if (event.type === "turn/start") latest = Math.max(latest, turn);
+        if (event.type === "turn/end") ended.add(turn);
+      }
+      return latest === 0 || ended.has(latest);
+    }
+
+    /**
+     * Follow the whale through a call: whether it is working, and each reply
+     * once its turn has closed.
+     *
+     * A reply is the assistant text written since the last one handed over (or
+     * since the call began). An utterance sent into a running turn is answered
+     * inside that turn, one sent to an idle whale wakes a new one; both end up
+     * in the next reply, and two turns in a row give two replies. `sent(now,
+     * entries)` marks an utterance just handed over: until its turn shows up,
+     * for at most `graceMs`, the whale counts as working.
+     * @param options optional `graceMs`.
+     * @returns `{ sent, observe }`; `observe({ running, entries, now })`
+     *   answers `{ busy, reply }`, `reply` being null or the text to show.
+     */
+    function createReplyFollower(options = {}) {
+      const graceMs = options.graceMs ?? VOICE_CONSTANTS.sentGraceMs;
+      // The window's first sight is where the call begins: nothing before it
+      // is a reply to this call.
+      let mark = null;
+      let sentAt = null;
+      const waiting = (now) => sentAt !== null && now - sentAt < graceMs;
+      return {
+        sent(now, entries) {
+          if (mark === null && entries !== null && entries !== undefined) mark = eventMarkOf(entries);
+          sentAt = now;
+        },
+        observe(input) {
+          const entries = input.entries;
+          if (entries === null || entries === undefined) {
+            return { busy: input.running === true || waiting(input.now), reply: null };
+          }
+          if (mark === null) mark = eventMarkOf(entries);
+          if (input.running === true) {
+            sentAt = null;
+            return { busy: true, reply: null };
+          }
+          const text = replyTextAfter(entries, mark);
+          if (text !== "" && lastTurnClosed(entries)) {
+            mark = eventMarkOf(entries);
+            sentAt = null;
+            return { busy: false, reply: text };
+          }
+          if (waiting(input.now)) return { busy: true, reply: null };
+          sentAt = null;
+          return { busy: false, reply: null };
+        },
+      };
     }
 
     /** Reduce markdown to something a speech synthesizer reads naturally. */
@@ -1281,12 +1462,21 @@ window.__ModuleLoader__.load({
       return input.status;
     }
 
-    /** The status copy key for that visual state. */
+    /**
+     * The status copy key for that visual state.
+     *
+     * Listening goes on while utterances are on their way (`sending`) and
+     * while the whale works (`whaleBusy`), so the listening line says which of
+     * the two is happening beside it.
+     */
     function dockStatusKey(input) {
       const state = dockVisualState(input);
       if (state === "error") return "statusError";
       if (state === "deviceoff") return "statusDeviceOff";
       if (state === "muted") return "statusMuted";
+      if (state === "listening" && (input.sending ?? 0) > 0) return "statusSending";
+      if (state === "listening" && input.whaleBusy === true) return "statusListeningBusy";
+      if (state === "ready" && input.whaleBusy === true) return "statusThinking";
       return `status${state.charAt(0).toUpperCase()}${state.slice(1)}`;
     }
 
@@ -1396,7 +1586,7 @@ window.__ModuleLoader__.load({
     }
 
     /**
-     * The dock stashed against a side edge: the microphone button and nothing
+     * The dock stashed against an edge: the microphone button and nothing
      * else.
      *
      * In a call it is the same microphone control as the open bar (same
@@ -1732,13 +1922,18 @@ window.__ModuleLoader__.load({
       try { window.localStorage.setItem(REDEMPTION_STORAGE_KEY, String(ms)); } catch (_error) { /* kept for this page only */ }
     }
 
-    // The call is a small state machine: idle → calibrating → listening →
-    // transcribing → thinking → (speaking) → idle, until the user hangs up.
+    // The call runs three things side by side, until the user hangs up:
+    //   the microphone   ready → calibrating → listening, and it stays
+    //                    listening: a finished sentence is handed over and the
+    //                    next one can start at once;
+    //   the outbox       each sentence is transcribed and sent in the order it
+    //                    was said; sent while the whale works, it is an
+    //                    interjection taken at the whale's next step boundary;
+    //   the reply        followed in the background and shown once the
+    //                    whale's turn closes.
     // The speaking phase exists only while the opt-in read-aloud fallback is
-    // on; with it off (the default) a finished reply goes straight back to
-    // idle and the microphone reopens.
-    // Half-duplex is a rule, not a suggestion: the microphone is only open
-    // while the status is listening, so the whale never hears itself.
+    // on. Reading aloud pauses detection, so the whale never hears itself, and
+    // waits while the person is mid-sentence.
 
     /**
      * Read one reply through the browser's speech synthesizer.
@@ -1850,20 +2045,33 @@ window.__ModuleLoader__.load({
         const [notice, setNotice] = React.useState(null);
         // How long a pause ends the turn; the person's choice, kept per browser.
         const [redemptionMs, setRedemptionMsState] = React.useState(readRedemptionMs);
+        // Utterances still being transcribed or sent, and whether the whale is
+        // working: both run beside listening, so neither is a phase.
+        const [sending, setSending] = React.useState(0);
+        const [whaleBusy, setWhaleBusy] = React.useState(false);
+        // The side an open panel would stash on while it is being pushed
+        // through an edge: it is drawn as the stashed button until let go.
+        const [dragStash, setDragStash] = React.useState(null);
 
         const takerRef = React.useRef(null);
         const awayRef = React.useRef(null);
         if (awayRef.current === null) awayRef.current = createAwayGuard();
         // True while the detector is running for the call: device on, not
-        // muted, not held for the whale's reply. Segments arriving otherwise
-        // are not the call's to send.
+        // muted, not paused for a reply read aloud. Segments arriving
+        // otherwise are not the call's to send.
         const listeningRef = React.useRef(false);
+        // Whether a segment is in progress right now, so a reply read aloud
+        // never starts over the person.
+        const userSpeakingRef = React.useRef(false);
+        // The outbox: each utterance waits for the one before it.
+        const outboxRef = React.useRef(Promise.resolve());
+        const sendingRef = React.useRef(0);
+        const followerRef = React.useRef(null);
         const redemptionRef = React.useRef(redemptionMs);
         const detachedRef = React.useRef(false);
         const guardRef = React.useRef(null);
         const callRef = React.useRef(null);
         const sessionRef = React.useRef(null);
-        const baselineRef = React.useRef(0);
         const disposedRef = React.useRef(false);
         const speakRef = React.useRef(false);
         const watcherRef = React.useRef(null);
@@ -1971,6 +2179,7 @@ window.__ModuleLoader__.load({
               },
               maxSpeechMs: VOICE_CONSTANTS.maxSpeechMs,
               onUtterance: (audio) => { void utteranceDone(audio); },
+              onSpeaking: (active) => { userSpeakingRef.current = active; },
             });
           }
           return takerRef.current;
@@ -2197,6 +2406,14 @@ window.__ModuleLoader__.load({
             startY: event.clientY,
             originX: rect.left,
             originY: rect.top,
+            left: rect.left,
+            top: rect.top,
+            // The shape being dragged, fixed for the whole drag: the stashed
+            // button, or the open panel (which may be drawn as the button while
+            // it is pushed through an edge).
+            stashed: isStashed(),
+            stash: null,
+            expanded: expandedSize(),
             width: rect.width,
             height: rect.height,
             cardHeight: cardRect === null ? 0 : cardRect.height,
@@ -2241,21 +2458,38 @@ window.__ModuleLoader__.load({
             node.setAttribute("data-dw-dragging", "true");
             try { node.ownerDocument?.getSelection?.()?.removeAllRanges(); } catch (_error) { /* nothing selected */ }
           }
-          const viewport = { width: window.innerWidth, height: window.innerHeight };
-          const left = drag.originX + dx;
-          const top = drag.originY + dy;
+          drag.left = drag.originX + dx;
+          drag.top = drag.originY + dy;
+          const frame = dockDragFrame(dragBox(drag));
           // Follow the pointer in the same terms the stylesheet anchors by: the
           // nearer side and the bottom. The drag code never names a CSS box
           // property, so a replacement skin can lay the dock out differently.
-          const anchor = left + drag.width / 2 < viewport.width / 2 ? "left" : "right";
-          node.setAttribute("data-dw-anchor", anchor);
-          node.style.setProperty("--dw-dock-x", String(Math.round(anchor === "left" ? left : viewport.width - left - drag.width)));
-          node.style.setProperty("--dw-dock-y", String(Math.round(viewport.height - top - drag.height)));
-          // Show where letting go would land: stashed on an edge, or open again.
-          const settle = dockRelease({ left, top, width: drag.width, height: drag.height, viewport, docked: isStashed(), expanded: expandedSize() });
-          const change = isStashed() ? (settle.docked === null ? "open" : null) : (settle.docked === null ? null : "dock");
-          if (change === null) node.removeAttribute("data-dw-preview");
-          else node.setAttribute("data-dw-preview", change);
+          node.setAttribute("data-dw-anchor", frame.anchor);
+          node.style.setProperty("--dw-dock-x", String(Math.round(frame.x)));
+          node.style.setProperty("--dw-dock-y", String(Math.round(frame.y)));
+          if (drag.stashed) {
+            // The stashed button grows when letting go would open the panel.
+            if (frame.stash === null) node.setAttribute("data-dw-preview", "open");
+            else node.removeAttribute("data-dw-preview");
+          } else if (frame.stash !== drag.stash) {
+            // Pushed through an edge, the panel is drawn as the button it
+            // becomes when let go; pulled back in, it is the panel again.
+            drag.stash = frame.stash;
+            setDragStash(frame.stash);
+          }
+        }
+
+        /** The dragged box as `dockRelease` and `dockDragFrame` read it. */
+        function dragBox(drag) {
+          return {
+            left: drag.left,
+            top: drag.top,
+            width: drag.width,
+            height: drag.height,
+            viewport: { width: window.innerWidth, height: window.innerHeight },
+            docked: drag.stashed,
+            expanded: drag.expanded,
+          };
         }
 
         function onDragEnd(event) {
@@ -2279,20 +2513,13 @@ window.__ModuleLoader__.load({
           // A press that never moved far enough was a click; let it through.
           if (drag.mode !== "move") return;
           suppressClickRef.current = true;
-          const viewport = { width: window.innerWidth, height: window.innerHeight };
-          const settle = dockRelease({
-            left: drag.originX + (event.clientX - drag.startX),
-            top: drag.originY + (event.clientY - drag.startY),
-            width: drag.width,
-            height: drag.height,
-            viewport,
-            docked: isStashed(),
-            expanded: expandedSize(),
-          });
+          // Settle from the last frame drawn, so the release lands where the
+          // drag showed it would.
+          const settle = dockRelease(dragBox(drag));
           // Remember the panel's size for its current shape (call panel or
           // closed pills), so reopening from the stashed button lands where that
           // shape actually fits.
-          if (!isStashed()) expandedRef.current = { open, width: drag.width, height: drag.height };
+          if (!drag.stashed) expandedRef.current = { open, width: drag.width, height: drag.height };
           if (node !== null && node !== undefined) {
             // Write the settled geometry now as well: React only re-applies
             // props that changed, and the drag already moved the DOM.
@@ -2301,6 +2528,7 @@ window.__ModuleLoader__.load({
             node.style.setProperty("--dw-dock-y", String(Math.round(settle.y)));
           }
           setPlacement(settle);
+          setDragStash(null);
         }
 
         /** The click that ends a drag lands on whatever was under the pointer; drop it. */
@@ -2467,28 +2695,7 @@ window.__ModuleLoader__.load({
           return new Promise((resolve) => window.setTimeout(resolve, ms));
         }
 
-        /** Poll until the whale's turn settles, then read its reply from the window. */
-        async function waitForReply(sessionId, call, baseline) {
-          const deadline = Date.now() + VOICE_CONSTANTS.replyTimeoutMs;
-          let started = false;
-          while (Date.now() < deadline) {
-            if (!callIsLive(call)) return null;
-            const entries = eventEntriesOf(sessionId);
-            if (sessionRow(sessionId)?.running === true) started = true;
-            if (entries !== null && hasReplyAbove(entries, baseline)) started = true;
-            if (started && sessionRow(sessionId)?.running !== true) {
-              const text = entries === null ? "" : replyTextOf(entries, baseline);
-              if (text !== "") return { text, partial: false };
-            }
-            await sleep(VOICE_CONSTANTS.pollMs);
-          }
-          const entries = eventEntriesOf(sessionId);
-          const late = entries === null ? "" : replyTextOf(entries, baseline);
-          return late === "" ? null : { text: late, partial: true };
-        }
-
-
-        /** Listen for the next utterance, unless the call is over or the whale is still working. */
+        /** Listen for the next utterance, unless the call is over or the microphone is off. */
         async function listen() {
           const call = callRef.current;
           if (call === null || !callIsLive(call) || disposedRef.current) return;
@@ -2497,25 +2704,15 @@ window.__ModuleLoader__.load({
             setPhase("error");
             return;
           }
-          // Half-duplex: never listen while the whale is working.
+          // Segments are the call's to send only once detection is confirmed
+          // running below.
           listeningRef.current = false;
-          if (sessionRow(sessionRef.current)?.running === true) {
-            await takerRef.current?.hold();
-            setPhase("thinking");
-            const until = Date.now() + VOICE_CONSTANTS.replyTimeoutMs;
-            while (Date.now() < until && sessionRow(sessionRef.current)?.running === true) {
-              if (!callIsLive(call)) return;
-              await sleep(VOICE_CONSTANTS.pollMs);
-            }
-            if (!callIsLive(call)) return;
-          }
           // The device must be on for a call to listen at all: the microphone
           // button is the device, and reopening it is its job, not listen()'s.
           if (!controlsRef.current.state().device) {
             setPhase("ready");
             return;
           }
-          setUtteranceCount((n) => n + 1);
           setError(null);
           // The first listen loads the detector; later ones resume it.
           setPhase("calibrating");
@@ -2555,28 +2752,25 @@ window.__ModuleLoader__.load({
 
         /**
          * One segment came back from the detector: check it was said into this
-         * microphone, then send it. Half-duplex starts here: the microphone is
-         * released until the whale's turn is over.
+         * microphone, then queue it for sending. Detection goes on, so the next
+         * sentence can start while this one is on its way.
          */
         async function utteranceDone(audio) {
           const call = callRef.current;
           if (!listeningRef.current || call === null || !callIsLive(call) || disposedRef.current) return;
-          listeningRef.current = false;
-          awayRef.current.suspend(Date.now());
-          await takerRef.current?.hold();
+          setUtteranceCount((n) => n + 1);
           if (speechLevelDbfs(audio, 16000) < VOICE_CONSTANTS.minSpeechLevelDbfs) {
-            await refuseUtterance("noticeTooQuiet");
+            await refuseUtterance("noticeTooQuiet", call);
             return;
           }
-          await submit(new Blob([encodeWav(audio, 16000)], { type: "audio/wav" }));
+          enqueue(new Blob([encodeWav(audio, 16000)], { type: "audio/wav" }), call);
         }
 
         /**
-         * A segment that was not said to the whale: count it, say so on the
-         * card, and listen again, or close the microphone once refusals pile up.
+         * A segment that was not said to the whale: count it and say so on the
+         * card, or close the microphone once refusals pile up.
          */
-        async function refuseUtterance(noticeKey) {
-          const call = callRef.current;
+        async function refuseUtterance(noticeKey, call) {
           awayRef.current.rejected();
           if (!callIsLive(call) || disposedRef.current) return;
           if (awayRef.current.reason(Date.now()) === "rejections") {
@@ -2584,15 +2778,28 @@ window.__ModuleLoader__.load({
             return;
           }
           setNotice(noticeKey);
-          setPhase("ready");
-          if (controlsRef.current.state().device) void listen();
         }
 
-        /** One round trip: transcribe, hand over, wait for the reply, show it, maybe read it. */
-        async function submit(blob) {
-          const call = callRef.current;
-          if (!callIsLive(call)) return;
-          setPhase("transcribing");
+        /** Queue one utterance behind the ones still on their way, so they arrive in the order said. */
+        function enqueue(blob, call) {
+          sendingRef.current += 1;
+          setSending(sendingRef.current);
+          outboxRef.current = outboxRef.current
+            .then(() => submit(blob, call))
+            .catch(() => { /* submit reports its own failures on the card */ })
+            .finally(() => {
+              sendingRef.current -= 1;
+              if (!disposedRef.current) setSending(sendingRef.current);
+            });
+        }
+
+        /**
+         * Transcribe one utterance and hand it to the whale. It never waits
+         * for the reply: the route delivers it as an interjection when the
+         * whale is working, and `followReplies` shows what comes back.
+         */
+        async function submit(blob, call) {
+          if (!callIsLive(call) || disposedRef.current) return;
           const language = uiLanguage();
           let response;
           try {
@@ -2604,7 +2811,6 @@ window.__ModuleLoader__.load({
           } catch (_error) {
             if (!callIsLive(call) || disposedRef.current) return;
             setError("errUnreachable");
-            setPhase("error");
             return;
           }
           if (!response.ok) {
@@ -2613,29 +2819,25 @@ window.__ModuleLoader__.load({
             // Background sound and empty recognitions are not failures: the
             // segment simply was not for the whale.
             if (code === "voice/rejected-transcript" || code === "voice/empty-transcript") {
-              await refuseUtterance("noticeRejected");
+              await refuseUtterance("noticeRejected", call);
               return;
             }
             setError(errorKeyOf(code));
-            setPhase("error");
             return;
           }
           const payload = await response.json();
           const text = typeof payload.text === "string" ? payload.text : "";
-          // The late-result rule: hang up, or a newer utterance, drops this one.
+          // The late-result rule: a hang-up or a switched session drops it.
           if (text === "" || !callIsLive(call) || disposedRef.current) return;
           const sessionId = sessionRef.current;
           if (sessionId === null || !guardRef.current.accepts(call, sessionId)) return;
           awayRef.current.accepted(Date.now());
+          setError(null);
           setNotice(null);
           setHeard(text);
-          setPhase("thinking");
+          setReply("");
           showInMainView(sessionId);
-          // The baseline is read HERE, not at call start: the whale must be
-          // idle before we send, so "the turn above the current highest turn"
-          // is unambiguously this utterance's reply.
           const before = eventEntriesOf(sessionId);
-          baselineRef.current = before === null ? 0 : baselineTurnOf(before);
           let sent;
           try {
             sent = await fetch(VOICE_SAY_ROUTE, {
@@ -2646,39 +2848,65 @@ window.__ModuleLoader__.load({
           } catch (_error) {
             if (!callIsLive(call) || disposedRef.current) return;
             setError("errUnreachable");
-            setPhase("error");
             return;
           }
           if (!sent.ok) {
             const code = await failureCodeOf(sent);
             if (!callIsLive(call) || disposedRef.current) return;
             setError(errorKeyOf(code));
-            setPhase("error");
-            return;
-          }
-          const answer = await waitForReply(sessionId, call, baselineRef.current);
-          if (answer === null) {
-            if (!callIsLive(call) || disposedRef.current) return;
-            setError("errReplyTimeout");
-            setPhase("error");
             return;
           }
           if (!callIsLive(call) || disposedRef.current) return;
-          setReply(answer.text);
-          // Read-aloud is OFF by default. When it is off there is no speech
-          // event to wait for, so the call returns to ready immediately — this
-          // is the branch that used to stall on an `onend` that never fires.
-          if (!speakRef.current) {
-            setPhase("ready");
-            if (controlsRef.current.state().device) void listen();
-            return;
+          followerRef.current?.sent(Date.now(), before);
+          setWhaleBusy(true);
+        }
+
+        /**
+         * Follow the whale for the whole call: whether it is working, and each
+         * reply once its turn has closed. It runs beside listening and never
+         * holds the microphone, except to read a reply aloud.
+         */
+        async function followReplies(call, sessionId) {
+          const follower = createReplyFollower();
+          followerRef.current = follower;
+          while (callIsLive(call) && !disposedRef.current) {
+            const now = Date.now();
+            const seen = follower.observe({
+              running: sessionRow(sessionId)?.running === true,
+              entries: eventEntriesOf(sessionId),
+              now,
+            });
+            setWhaleBusy(seen.busy);
+            // Waiting for the whale is not being away: only listening while
+            // the whale is idle counts toward the away rule.
+            if (seen.busy) awayRef.current.suspend(now);
+            else if (listeningRef.current) awayRef.current.resume(now);
+            if (seen.reply !== null) {
+              setReply(seen.reply);
+              if (speakRef.current) await readAloud(seen.reply, call);
+            }
+            await sleep(VOICE_CONSTANTS.pollMs);
           }
-          // Read-aloud is ON: stay in "speaking" so the microphone stays shut
-          // (half-duplex), but never depend on `onend` alone — `speakReply`
-          // also settles on error, on an engine refusal, and on a bounded
-          // timer, so the call cannot wedge here.
+          if (followerRef.current === follower) followerRef.current = null;
+        }
+
+        /**
+         * Read one reply aloud. It waits while the person is mid-sentence, and
+         * detection pauses on the open microphone while it plays, so the
+         * speaker is never heard as the next utterance. `speakReply` settles on
+         * its own (end, error, refusal or a bounded timer), so this never
+         * wedges the call.
+         */
+        async function readAloud(text, call) {
+          while (userSpeakingRef.current && callIsLive(call) && !disposedRef.current) {
+            await sleep(VOICE_CONSTANTS.pollMs);
+          }
+          if (!callIsLive(call) || disposedRef.current || !speakRef.current) return;
+          listeningRef.current = false;
+          awayRef.current.suspend(Date.now());
+          await takerRef.current?.mute();
           setPhase("speaking");
-          const speech = speakReply(answer.text, {
+          const speech = speakReply(text, {
             enabled: speakRef.current,
             synth: typeof speechSynthesis === "undefined" ? undefined : speechSynthesis,
             Utterance: typeof SpeechSynthesisUtterance === "undefined" ? undefined : SpeechSynthesisUtterance,
@@ -2689,17 +2917,14 @@ window.__ModuleLoader__.load({
           if (controlsRef.current.state().device) void listen();
         }
 
-        /** "Done talking": end the segment now; with nothing said, say so and keep listening. */
+        /** "Done talking": end the segment now; with nothing said, say so. Listening goes on either way. */
         async function stopTalking() {
           awayRef.current.present(Date.now());
           const taker = takerRef.current;
           if (taker === null || !listeningRef.current) return;
           const delivered = await taker.finish();
           if (delivered || !callIsLive(callRef.current) || disposedRef.current) return;
-          listeningRef.current = false;
           setNotice("errNoSpeech");
-          setPhase("ready");
-          if (controlsRef.current.state().device) void listen();
         }
 
         /** Start (or restart) the call. */
@@ -2730,6 +2955,7 @@ window.__ModuleLoader__.load({
           callRef.current = call;
           awayRef.current.reset();
           setOpen(true);
+          void followReplies(call, sessionId);
           // Starting a call opens the device through the microphone control, so
           // "call in progress" and "microphone on" can never disagree. A refused
           // permission is handled inside listen() and leaves the control off.
@@ -2759,6 +2985,7 @@ window.__ModuleLoader__.load({
           if (!disposedRef.current) {
             setOpen(false);
             setNotice(null);
+            setWhaleBusy(false);
             setPhase("ready");
           }
         }
@@ -2771,7 +2998,7 @@ window.__ModuleLoader__.load({
           if (!next && typeof speechSynthesis !== "undefined") speechSynthesis.cancel();
         }
 
-        const busy = status === "transcribing" || status === "thinking" || status === "speaking";
+        const busy = sending > 0 || whaleBusy;
 
         // The workspace colors the settings panel edits; the same store paints
         // the chips and the sidebar dots.
@@ -2782,15 +3009,18 @@ window.__ModuleLoader__.load({
         // The dock may be rendered into a detached document (Document PiP or a
         // popup). React renders the same tree; only the host container changes.
         const container = renderDocument();
-        const stashed = isStashed();
-        const View = stashed
+        // Stashed on an edge, or being pushed through one right now.
+        const stashSide = dragStash ?? (isStashed() ? placement.docked : null);
+        const View = stashSide !== null
           ? dockedView({
             t,
             open,
-            side: placement.docked,
+            side: stashSide,
             status,
             error,
             notice,
+            sending,
+            whaleBusy,
             controls,
             actions: {
               startCall: () => { void startCall(); },
@@ -2857,6 +3087,8 @@ window.__ModuleLoader__.load({
               heard,
               reply,
               busy,
+              sending,
+              whaleBusy,
               controls,
               detached,
               utteranceCount,
@@ -2877,7 +3109,7 @@ window.__ModuleLoader__.load({
           className: "dw-dock-host",
           ref: dockElRef,
           "data-dw-anchor": placement === null ? undefined : placement.anchor,
-          "data-dw-docked": stashed ? placement.docked : undefined,
+          "data-dw-docked": stashSide ?? undefined,
           "data-dw-sized": size === null ? undefined : "true",
           style: dockGeometryStyle(placement, size),
           onPointerDown: onDragStart,
@@ -2973,10 +3205,9 @@ window.__ModuleLoader__.load({
         ".dw-dock-host[data-dw-dragging='true'],.dw-dock-host[data-dw-dragging='true'] *{cursor:grabbing!important}",
         ".dw-transcript,.dw-settings-body{touch-action:pan-y}",
         ".dw-input{user-select:text;-webkit-user-select:text}",
-        // While dragging: a panel about to be stashed fades and shrinks; a
-        // stashed button about to open grows.
-        ".dw-dock-host>*{transition:opacity .15s,transform .15s}",
-        ".dw-dock-host[data-dw-preview='dock']>*{opacity:.55;transform:scale(.94)}",
+        // While dragging, a stashed button about to open grows. (A panel
+        // pushed through an edge is drawn as the button itself.)
+        ".dw-dock-host>*{transition:transform .15s}",
         ".dw-dock-host[data-dw-preview='open']>*{transform:scale(1.12)}",
 
         // ---- shared bits ----
@@ -3023,7 +3254,6 @@ window.__ModuleLoader__.load({
         ".dw-dot{width:8px;height:8px;border-radius:50%;background:var(--dw-fg-3);display:inline-block;flex:none}",
         ".dw-status-ready .dw-dot{background:var(--dw-ok)}",
         ".dw-status-listening .dw-dot,.dw-status-calibrating .dw-dot{background:var(--dw-danger);animation:dw-pulse 1.2s ease-in-out infinite}",
-        ".dw-status-transcribing .dw-dot,.dw-status-thinking .dw-dot{background:var(--dw-warn)}",
         ".dw-status-speaking .dw-dot{background:var(--dw-accent)}",
         ".dw-status-muted .dw-dot{background:var(--dw-warn)}",
         ".dw-status-deviceoff .dw-dot{background:var(--dw-fg-3)}",
@@ -3078,8 +3308,6 @@ window.__ModuleLoader__.load({
         ".dw-status-listening .dw-orb-core{animation:dw-breathe 1.4s ease-in-out infinite}",
         ".dw-status-listening .dw-orb-core:before{opacity:1;animation:dw-spin 2.4s linear infinite}",
         ".dw-status-listening .dw-orb:after{animation:dw-ripple 1.6s ease-out infinite}",
-        ".dw-status-transcribing .dw-orb-core,.dw-status-thinking .dw-orb-core{transform:scale(.88)}",
-        ".dw-status-transcribing .dw-orb-core:before,.dw-status-thinking .dw-orb-core:before{opacity:1;animation:dw-spin .9s linear infinite}",
         ".dw-status-speaking .dw-orb-core{filter:hue-rotate(40deg) saturate(1.2);animation:dw-talk .45s ease-in-out infinite alternate}",
         ".dw-status-muted .dw-orb-core{filter:saturate(.2) brightness(.96)}",
         ".dw-status-deviceoff .dw-orb-core{filter:grayscale(1) brightness(.72)}",
@@ -3763,15 +3991,20 @@ window.__ModuleLoader__.load({
     module.exports.detachCapability = detachCapability;
     module.exports.snapDockPosition = snapDockPosition;
     module.exports.dockRelease = dockRelease;
+    module.exports.dockDragFrame = dockDragFrame;
     module.exports.dockResize = dockResize;
     module.exports.dockGeometryStyle = dockGeometryStyle;
     module.exports.dockedView = dockedView;
     module.exports.settingsDraftPatch = settingsDraftPatch;
     module.exports.dockView = dockView;
+    module.exports.dockStatusKey = dockStatusKey;
     module.exports.dockStyles = dockStyles;
     module.exports.settingsView = settingsView;
-    module.exports.baselineTurnOf = baselineTurnOf;
-    module.exports.replyTextOf = replyTextOf;
+    module.exports.eventMarkOf = eventMarkOf;
+    module.exports.replyTextAfter = replyTextAfter;
+    module.exports.withoutRewrittenDrafts = withoutRewrittenDrafts;
+    module.exports.REWRITE_NOTICE = REWRITE_NOTICE;
+    module.exports.createReplyFollower = createReplyFollower;
     module.exports.speakable = speakable;
     module.exports.speakReply = speakReply;
     module.exports.speechLanguage = speechLanguage;

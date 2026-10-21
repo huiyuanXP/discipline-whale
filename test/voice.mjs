@@ -397,7 +397,10 @@ function join(...parts) {
   assert.equal(payload.sessionId, 'session-main')
   assert.equal(calls.length, 1)
   assert.equal(calls[0].sessionId, 'session-main')
-  assert.equal(calls[0].mode, 'queue')
+  // `steer`: an interjection at the whale's next step boundary while it works,
+  // a new turn while it is idle. Never `queue`, which would hold the sentence
+  // until the whole turn ends.
+  assert.equal(calls[0].mode, 'steer')
   assert.equal(calls[0].content[0].text, '你好，鲸鱼')
   assert.match(String(calls[0].requestId), /^[0-9a-f-]{36}$/)
 
@@ -422,7 +425,7 @@ function join(...parts) {
   // A malformed body is a 400.
   const broken = await say('{not json')
   assert.equal(broken.status, 400)
-  console.log('ok 10 — one transcript is queued into the recorded main session only')
+  console.log('ok 10 — one transcript is steered into the recorded main session only')
 }
 
 // --- 3. the call guard ----------------------------------------------------
