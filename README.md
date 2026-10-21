@@ -178,7 +178,7 @@ worker 每次即将结束回合时，插件会检查本轮是否调用过 `repor
 
 阈值全部是 `guard.js` 顶部的具名常量（`WATCHDOG_SILENT_THRESHOLD` / `READ_QUOTA_PER_EPOCH` / `MAX_FORCED_INTERVENTIONS_PER_TURN`），也可以在 `cordis.patch.yml` 的 `discipline-whale-main` 行里按部署覆盖。
 
-**验证了什么、没验证什么**：逻辑与真实作用域投递都有测试（`node test/guard.mjs`，含用真实 `cordis` + `dsh-scope` 包断言 preset 监听器确实能收到 `agent/assistant-stream`、而 `session/event` 确实收不到）。**没有**做真机重启验证，因此「硬停把正在派工的回合打断」这类时序行为仍属未验证，见 `VERIFICATION.md`。
+**验证了什么、没验证什么**：逻辑与真实作用域投递都有测试（`node test/guard.mjs`，含用真实 `cordis` + `dsh-scope` 包断言 preset 监听器确实能收到 `agent/assistant-stream`、而 `session/event` 确实收不到）。**没有**做真机重启验证，因此「硬停把正在派工的回合打断」这类时序行为仍属未验证。
 
 ## 输出纪律：给 ADHD 读者的简洁回复（`adhd.js`）
 
@@ -224,7 +224,7 @@ worker 每次即将结束回合时，插件会检查本轮是否调用过 `repor
 
 **作用域（最关键的一条）**：主会话有，worker **没有**。worker 的价值在于回报详细，给它加简洁约束会直接毁掉回报质量。所以每个 handler 先读 `agent.session.header.agentPreset`，不等于 `discipline-whale` 就 `next()` 放行，**连计数器都不建**。preset identity 读不出来时也放行——不确定时宁可主会话漏约束，不许误伤 worker。
 
-**验证了什么、没验证什么**：`node test/adhd.mjs`（13 项）覆盖纯函数、真实 skill registry 的 scope 隔离、worker 放行、纠正预算、UI 豁免、`render_text` 不豁免、config 回落；`test/contract.mjs` ok 27 断言这行**只声明在主 preset**。**没做**真机重启验证，所以「模型是否真的变简洁」「纠正注入的实际触发时机」「豁免会不会被滥用」都属未验证，见 `VERIFICATION.md`。
+**验证了什么、没验证什么**：`node test/adhd.mjs`（13 项）覆盖纯函数、真实 skill registry 的 scope 隔离、worker 放行、纠正预算、UI 豁免、`render_text` 不豁免、config 回落；`test/contract.mjs` ok 27 断言这行**只声明在主 preset**。**没做**真机重启验证，所以「模型是否真的变简洁」「纠正注入的实际触发时机」「豁免会不会被滥用」都属未验证。
 
 ## 语音对话（像打电话一样）
 
@@ -467,11 +467,11 @@ worker 每次即将结束回合时，插件会检查本轮是否调用过 `repor
 - **通话条的默认位置为会话页让路**：会话页输入框贴底，通话条默认浮在它上方（距底 144px）；新会话空白页的输入框在屏幕中部，窗口较矮时（例如 800×600、手机竖屏）**打开的**通话条会盖住它的右半部分和发送按钮。把通话条拖开即可，拖动后的位置在本次页面生命周期内保持（拆成独立窗口再收回后回到默认位置）。一个固定位置无法同时避开这两种输入框；通话条锚在底部是为了卡片变高时控制条不跳动。
 - **离开防护挡不住「近处有人对着麦克风说话」**：音量门和过滤只能分出「远处的声音」和「Whisper 编出来的字」；如果旁边有人凑近麦克风正常说话，它会被当成你说的话发送。环境吵或旁边有人时，用静音按钮或直接关话筒最可靠。
 - **近场音量门 -45 dBFS 是经验值**：不同麦克风的电平差异较大，声音很轻或离麦克风较远时可能被拦；如果常出现「声音离麦克风太远」，需要调低这个值。
-- 麦克风权限、真人说话时的起停手感、PiP 真窗口、拖动手感都只能在真浏览器里确认，见 `VERIFICATION.md` 的未验证清单。
+- 麦克风权限、真人说话时的起停手感、PiP 真窗口、拖动手感都只能在真浏览器里确认。
 
 ## 记忆系统：无限对话流（`memory-row.js`）
 
-主会话是一条不会结束的对话。它自己决定什么时候清工具输出、什么时候压缩，同时始终知道「用户是谁、我们正在做什么、做过什么」。完整设计见 [`docs/memory-design.md`](./docs/memory-design.md)。
+主会话是一条不会结束的对话。它自己决定什么时候清工具输出、什么时候压缩，同时始终知道「用户是谁、我们正在做什么、做过什么」。
 
 **分层**（OpenClaw 层级，Devin 条目格式 `- 内容 [source: …; added: YYYY-MM-DD]`）：
 
@@ -601,10 +601,6 @@ npm run test:memory
 
 `node test/adhd.mjs` 单独覆盖输出纪律（13 组）：`isUiTurn` 的豁免表（`render_ui`/`render_canvas`/`render_scene`/`render_mechanism` 豁免，`render_text` 和纯文字不豁免）、`shouldEnforceBrevity` 的「刚好等于上限算合规 / 超出报告 overBy / UI 轮豁免 / `enabled:false` 关闭」、`resolveBrevityConfig` 的具名默认值与**非法值回落**（负数、小数、字符串、`NaN`、`Infinity` 都不抛错）、规则文件是 prompt 段与 skill 的**同一来源**、`countTextInArgs` 让 `render_text` 里的文字照算、**组装出的主会话 prompt 含规则而 worker prompt 不含**、**用真实 `dsh-skill` registry 证明 skill 只落进主 preset 的 scope**（主会话看得到、worker 和 host 平面都看不到）、**worker 会话触发事件时被直接放行且不建计数器**、超长正文在下一个步边界最多注入一次且带归属标记、`render_text` 不买豁免、knobs 生效、`tools/pre-execute` **永远放行**（不与 guard 抢刹车）、以及 `main.apply` 真的挂上了两套独立监听器并把 knobs 透传过 `Config`。
 
-## 真实端到端验证
-
-见 [`VERIFICATION.md`](./VERIFICATION.md)：真实会话、真实 worker、真实回报推送，含原始证据。
-
 ## 已知限制
 
 - **看板只有工具，没有 GUI 面板**。`list_dispatches` 是给主会话调的工具（也可靠 `present` 渲染）；侧边栏入口打开的是主会话，不是派工看板。要看状态还得问主会话，或在会话列表里找 worker。
@@ -616,7 +612,7 @@ npm run test:memory
 - **`create_session` 靠 profile 层关掉，不是靠 preset**。`create_session` 由 profile 级 bundle `dsh-session-kit` 注册进 Host 工具层，能创建用户可见会话并下发首条 prompt，效果等于派工。preset 内部的 `plugins` 列表由 agent-preset-registry 挂进它自己的 PresetTree，跟 Host 树是两个组合，所以**在 worker preset 里写 `- id: dsh-session-kit` + `disabled: true` 关不掉它**（而且这种没有 `name` 的行会让整个 preset 装载失败）。本包的 `cordis.patch.yml` 因此改用**一条 profile 层按 id 定向的 patch** 关掉该行；它排在本 bundle 之前插入的 `dsh-session-kit` 之后生效。代价是**全局生效**：主会话也没有这个工具了（主会话本来该用 `dispatch_task`，不受影响）。未装 `dsh-session-kit` 的 profile 上这条 patch 只会告警「entry not found」并跳过，可以安全单独安装。模板里没有「只对 worker 关闭」的可行写法 —— 若要那种效果，需要在 preset 内挂一个对 agent 调 `ctx.tools.restrict({ deny: ['create_session'] })` 的插件行，本包未提供。
 - **主会话只读 + UI**。主会话 preset 里 `tool-fs` 是 `read: true, readImage: true, write: false, edit: false`，并且 `tool-bash` / `tool-pwsh` / `tool-jobs` 三行都被禁用 —— 没有 shell，就没有 bash 重定向、`tee`、`sed -i` 这类绕道写文件的路子。`tool-jobs` 一并关掉，是因为主会话既没有 shell、也没有挂 `tool-terminal` / `tool-workflow`，自己造不出后台任务，`job_*` 只剩空列表（任务注册表本身仍在 Host 层，不受影响）。因此主会话**不能写总结文档**，也不能把文档落盘：它的产出只有对话正文和 UI 渲染。如果确实需要主会话落盘一份总结，得单独给 `write` 开例外（本包没有加）。
 - **这些改动都要重启才生效，且没有在运行中的进程里验证过**。preset 行不受 HMR 管理；改动 `cordis.patch.yml` 后需重启 `dsh web`，**新建的**会话才会拿到新的工具面（已存在的会话仍用旧组合）。
-  能验证到什么程度：用 `dsh --profile web --dump-config` 核对过**组合后的配置树**确实包含 `dsh-session-kit: disabled: true`、`write: false` / `edit: false`、`tool-bash` / `tool-pwsh` / `tool-jobs` 全部 `disabled: true`（输出见 [`VERIFICATION.md`](./VERIFICATION.md)）。这只是「配置写对了」，**不等于**「重启后实测生效」——实际工具面要重启一次、新建两个 preset 的会话各看一眼才能确认。这一步本包没有做，别把它当已验证。
+  能验证到什么程度：用 `dsh --profile web --dump-config` 核对过**组合后的配置树**确实包含 `dsh-session-kit: disabled: true`、`write: false` / `edit: false`、`tool-bash` / `tool-pwsh` / `tool-jobs` 全部 `disabled: true`。这只是「配置写对了」，**不等于**「重启后实测生效」——实际工具面要重启一次、新建两个 preset 的会话各看一眼才能确认。这一步本包没有做，别把它当已验证。
 - **输出纪律（`adhd.js`）不能强制简洁，只能约束下一步**。DSH 没有「在文本发出去之前改写/截断它」的接口：等 hook 跑到时，那段话用户已经看过了。所以本模块能给的是 ①常驻 prompt section（软约束，真正承重的那一半）②超长时在**下一个步边界**注入一次纠正。它缩短的是下一步，不是这一步。别把它宣传成「强制简洁」。另外两条边界：**豁免判定是轮级的**（一轮里渲染过 UI，整轮正文都不计量，代价是可能漏掉一段啰唆说明；换来的是不误伤正常交付物）；**`render_text` 不豁免**，用它是绕不过去的。
 - **输出纪律同样要重启，且已存在的主会话仍用旧组合**。`discipline-whale-brevity` 是 preset 行，preset 在**会话创建时**装配；改完 `cordis.patch.yml` 需重启 `dsh web` 并**新建**主会话，已开着的会话不会中途换上这套规则。本轮**没有**重启用户正在跑的进程。
 - **persona 改动同样要重启，且已存在的主会话仍用旧 prompt**。persona 是 preset 行的一部分，preset 在**会话创建时**装配进 system prompt：改完 `cordis.patch.yml` 后必须重启 `dsh web`，并且**新建**一个主会话（或换用新会话）才会拿到新纪律；已经开着的那个主会话不会中途换人格。验证只做到「组合后的配置树里有这段文本」和「按 Host 的组装方式渲染出的 system prompt 包含这段文本」（`node prompt-probe.mjs discipline-whale`、契约测试 ok 23），**没有**在真机上断言模型的派工行为是否改变——那需要 A/B 观察，本包不做这个声明。

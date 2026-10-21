@@ -587,7 +587,7 @@ export function resolveTiming(at) {
 /**
  * Deliver one instruction into a Session at the requested timing.
  *
- * The Host facts this rests on (verified in VERIFICATION.md section 11):
+ * The Host facts this rests on (verified against the Host source):
  *
  *   * `sessionController.prompt({ mode })` accepts exactly `queue` and `steer`
  *     (`@deepseek-ai/dsh-api-session-controller` lib/typert.host.js:1795). There

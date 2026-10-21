@@ -54,7 +54,6 @@
     "locale/*.json",
     "icon.svg",
     "README.md",
-    "VERIFICATION.md",
     "LICENSE",
     "prompt-probe.mjs",
     "test/*.mjs",

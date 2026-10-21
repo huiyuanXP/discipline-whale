@@ -47,7 +47,7 @@
 # needs. Delete this row to restore the tool everywhere.
 #
 # VERIFIED HOW FAR: `dsh --profile web --dump-config` shows this row composed as
-# `disabled: true` (see VERIFICATION.md §1b), which proves the patch applies to
+# `disabled: true`, which proves the patch applies to
 # the composition. It does NOT prove the running process dropped the tool:
 # preset rows are not HMR-managed, so the runtime effect is only visible after
 # restarting `dsh web` and opening a new Session. That restart check has NOT

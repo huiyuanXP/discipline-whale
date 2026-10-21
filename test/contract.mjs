@@ -1249,8 +1249,8 @@ const checkpointPath = (workerSessionId) =>
 
 // --- 21. continuation: the two delivery timings on the same Session --------
 //
-// The distinction that matters (verified against the Host, see
-// VERIFICATION.md §11): `queue` waits for the whole turn, `steer` lands at the
+// The distinction that matters (verified against the Host source, see test
+// 25): `queue` waits for the whole turn, `steer` lands at the
 // nearest STEP boundary — inside the same turn. The second one is "Interrupt"
 // in the user's sense. `abort` is a separate, last-resort third behaviour.
 

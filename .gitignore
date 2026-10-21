@@ -11,3 +11,11 @@ problems.html
 config.yaml
 *.session.json
 .dsh/
+
+# Process documents (handoffs, audits, verification logs, design notes) stay local.
+# Markdown the plugin reads at runtime (skills/**/SKILL.md) and README.md stay tracked.
+HANDOFF-*.md
+*-AUDIT.md
+VERIFICATION.md
+docs/**/*.md
+.dsh-tmp/

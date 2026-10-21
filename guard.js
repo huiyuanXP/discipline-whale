@@ -598,7 +598,7 @@ export function installGuard(ctx, config = {}, deps = {}) {
   // A preset-mounted row cannot observe `session/event`: that event is
   // dispatched on the HOST plane with no scope key, so a scoped listener is
   // filtered out and would silently never fire (proved against the real
-  // cordis + dsh-scope packages, see VERIFICATION.md). The agent-subject
+  // cordis + dsh-scope packages in test/guard.mjs). The agent-subject
   // events below are dispatched with the Agent itself as the scope key, and an
   // Agent's scope is parented to its preset generation
   // (`AgentPresetsService.join`), so a listener registered by this row does
