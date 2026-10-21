@@ -152,6 +152,8 @@
 
 用户消息气泡整体染色需要替换宿主的 `user` 节点渲染器，放到第二期，第一期用 turnTail 标签。
 
+客户端读取的路由：`GET /api/discipline-whale/memory/workspaces`（颜色与介绍）、`POST` 同路径 `{ id, color }`（改色）、`GET /api/discipline-whale/memory/tags?sessionId=<主会话>`（每个用户 turn 的工作区与对应 worker 会话）、`GET /api/discipline-whale/memory/dispatched`（worker 会话 → 工作区）。
+
 ### 3.7 后续：小 Agent 选工作区（第二期）
 
 第一期把两样素材备好：工作区卡片（≤200 字符/个）与 Tag 历史。第二期在 `agent/inbox/claimed` 时用一次小模型调用，只读卡片 + 用户消息，输出候选工作区，作为提示注入大模型。
@@ -387,18 +389,23 @@ runDream({ homeDir, complete, store, now })          // 门禁失败退化为只
 
 自包含实现，`apply` 里通过 `ctx.reflect.provide('toolResultPruner', …)` 注册，替换 compaction 组里宿主的 pruner 行（同组内同名服务只能有一个）。最近 3 个用户 turn（按 `data.turn` 分组，进行中的 turn 算一个）内的工具结果沿用头尾截断，更早的整条换成一行占位；占位不比原文短的小结果保持原样；被清理结果里的图片块一并去掉，原文仍在 session log。
 
-### 10.6 实施顺序
+### 10.6 接线
 
-| 阶段 | 内容 |
+| 位置 | 内容 |
 |---|---|
-| 第一阶段（本分支） | `entry.js` + 10.2–10.5 四个新模块与各自单测，全部是新文件 |
-| 第二阶段（同步到最新代码后） | 接线：`main.js` 注册 section / context / 工具；`worker.js` 接 `workspace_note`；`guard.js` 拦截主会话 `memory_*` 并放行 `remember`；`client.js` 标签、色点、颜色设置；`home.js` 新路由；`cordis.patch.yml` 换 pruner；README / VERIFICATION |
+| `memory-row.js`（`discipline-whale/memory` 行，主 preset） | 注册 section / context / 四个工具；`agent/inbox/claimed` 记当前用户 turn 并计 nudge；`agent/pre-step` 刷新缓存并在阈值前 32K 启动 flush；`agent/status → idle` 检查 dream；启动时迁移 dsh-auto-memory |
+| `memory-routes.js`（挂在 home 行） | `GET/POST /api/discipline-whale/memory/workspaces`、`GET …/tags?sessionId=`、`GET …/dispatched` |
+| `main.js` | `dispatch_task` / `send_to_session` / `resume_dispatch` 调 `noteDispatch` 打 Tag；新会话 brief 插入 `dispatchBootstrap` |
+| `worker.js` | `report_to_main` 的可选 `workspace_note` 写工作区卡片，超长时只记 warning |
+| `guard.js` | 主会话里 `memory_*` 被引导到 `remember`；四个记忆工具计入生产性工具 |
+| `cordis.patch.yml` | 主 preset 挂 memory 行；两个 preset 的 compaction 组用 `discipline-whale/pruner` |
+| `client.js` | turnTail 工作区标签、侧栏色点、设置面板改色 |
 
 ---
 
 ## 11. 已定决策（2026-10-21）
 
-1. **代码基线**：第一阶段在本分支做独立新模块；`feat/voice-ui-redesign` 的改动提交后，本分支同步过去再接线。
+1. **代码基线**：模块与接线都建在 `feat/voice-ui-redesign`（d288572）之上。
 2. **对话范围**：第一期只算鲸鱼派出的会话；第二期加开关，让用户选择是否把其它会话也算进来。
 3. **40% 口径**：按条数，历史条数 = max(5, ⌈进行中条数 × 40%⌉)。
 4. **dsh-auto-memory**：鲸鱼主会话由鲸鱼 memory 接管，已有 3 条（均为 feedback）迁入 USER Preferences。

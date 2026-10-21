@@ -96,6 +96,11 @@ export const PRODUCTIVITY_TOOLS = Object.freeze(
     'read_report',
     'send_to_session',
     'report_to_main',
+    // this plugin's memory surface (memory-row.js)
+    'remember',
+    'update_instructions',
+    'set_workspace_intro',
+    'dream_now',
     // talking to the user
     'present',
     'ask_user_question',
@@ -123,6 +128,23 @@ export const PRODUCTIVITY_TOOLS = Object.freeze(
     'ppt_create',
   ]),
 )
+
+/**
+ * dsh-auto-memory's tools. In the main session the whale's own memory replaces
+ * them: one store, one injection, so the main session never reads two versions
+ * of the same fact.
+ */
+export const AUTO_MEMORY_TOOLS = Object.freeze(
+  new Set(['memory_write', 'memory_read', 'memory_list', 'memory_delete', 'memory_prune', 'memory_delete_all']),
+)
+
+/** The refusal an auto-memory tool gets inside the main session. */
+export function autoMemoryReason(name) {
+  return (
+    `${name} belongs to dsh-auto-memory; the main session keeps its memory in home/memory/. ` +
+    'Write with `remember` (user / memory / soul), read the files under home/memory/ with `read`.'
+  )
+}
 
 /** Tools whose single argument names a file path. */
 export const FILE_PATH_TOOLS = Object.freeze(new Set(['read', 'read_image']))
@@ -514,6 +536,9 @@ export function installGuard(ctx, config = {}, deps = {}) {
     const name = String(exec.name ?? '')
     const state = stateFor(sessionId)
     const isRead = READ_TOOLS.has(name)
+
+    // 0. one memory store in the main session
+    if (AUTO_MEMORY_TOOLS.has(name)) return deny(autoMemoryReason(name))
 
     // 1. the quota is the always-on budget, checked before anything may grow it
     if (isRead && state.reads >= resolved.readQuota) return deny(quotaExhaustedReason(resolved.readQuota))

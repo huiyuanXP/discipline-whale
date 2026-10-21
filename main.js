@@ -20,6 +20,7 @@ import {
   readDispatchCheckpoint,
   writeDispatchCheckpoint,
 } from './checkpoint.js'
+import { dispatchBootstrap, noteDispatch } from './memory-row.js'
 import { dispatchForWorker, listDispatches, recordDispatch } from './registry.js'
 import { installGuard, resolveGuardConfig } from './guard.js'
 import { installBrevity } from './adhd.js'
@@ -350,6 +351,7 @@ function dispatchTaskTool(ctx, config) {
       if (live !== undefined) {
         const delivered = await deliverInstruction(ctx, exec, live.workerSessionId, task, timing)
         live.status = live.status ?? 'running'
+        await noteDispatch({ sessionId: exec.agent?.session?.id, workspaceId: live.workspaceId, dispatchId: live.dispatchId })
         // Keep the checkpoint's routing facts fresh even though the Session did
         // not change: the brief that now matters is this one.
         try {
@@ -426,6 +428,8 @@ function dispatchTaskTool(ctx, config) {
         ...(topic === undefined ? {} : { topic }),
         ...(writes.length === 0 ? {} : { writes }),
       })
+      // Tag the user message that caused this dispatch with its workspace.
+      await noteDispatch({ sessionId: mainSessionId, workspaceId: workspace.id, dispatchId })
 
       // Persist the routing facts now, to the same file the worker half reads.
       //
@@ -450,10 +454,14 @@ function dispatchTaskTool(ctx, config) {
       }
 
       // The brief carries the report contract so enforcement has something to
-      // point at even when the worker preset's persona is terse.
+      // point at even when the worker preset's persona is terse. The workspace
+      // background (intro, what the user said about it, recent deliveries) comes
+      // first, so a fresh worker starts from the thread instead of from zero.
+      const background = await dispatchBootstrap(workspace)
       const brief = [
         'You are a Discipline Whale worker. Complete the task below in this workspace.',
         '',
+        ...(background === '' ? [] : [background, '']),
         '## Task',
         task,
         '',
@@ -677,7 +685,12 @@ function sendToSessionTool(ctx) {
       }
       const sessionId = String(args.session_id)
       const timing = resolveTiming(args.at)
-      return deliverInstruction(ctx, exec, sessionId, message, timing)
+      const delivered = await deliverInstruction(ctx, exec, sessionId, message, timing)
+      const dispatch = dispatchForWorker(sessionId)
+      if (dispatch !== undefined) {
+        await noteDispatch({ sessionId: exec.agent?.session?.id, workspaceId: dispatch.workspaceId, dispatchId: dispatch.dispatchId })
+      }
+      return delivered
     },
   }
 }
@@ -1002,6 +1015,7 @@ function resumeDispatchTool(ctx) {
       })
       // Route the report to the session resuming it, in case the main session changed.
       await writeDispatchCheckpoint(storeRoot(), checkpoint.workerSessionId, dispatch)
+      await noteDispatch({ sessionId: mainSessionId, workspaceId: checkpoint.workspaceId, dispatchId: checkpoint.dispatchId })
       const note = typeof args.note === 'string' ? args.note.trim() : ''
       const brief = note === '' ? RESUME_BRIEF : `${RESUME_BRIEF}\n\nNote from the main session: ${note}`
       await ctx.sessionController.prompt(

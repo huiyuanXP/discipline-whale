@@ -29,6 +29,7 @@ import {
   recordDispatch,
   retriesFor,
 } from './registry.js'
+import { setWorkspaceIntro } from './activity.js'
 import {
   MAX_DOCUMENT_CHARS,
   boundSummary,
@@ -244,6 +245,11 @@ function reportToMainTool(ctx, config) {
           enum: ['done', 'partial', 'blocked'],
           description: 'Outcome classification. Defaults to done.',
         },
+        workspace_note: {
+          type: 'string',
+          description:
+            'Optional, at most 200 characters: what the user is using this workspace for, where it stands now, and the next step. It updates the workspace card the main session reads; it is about purpose and progress, not a README.',
+        },
       },
     },
     output: {
@@ -351,6 +357,15 @@ function reportToMainTool(ctx, config) {
         ...(dispatch.recoveredFrom === undefined ? {} : { recoveredFrom: dispatch.recoveredFrom }),
       }
       await writeReport(storeRoot(), report)
+
+      // The workspace card is bookkeeping: an over-long note is a warning, never a failed report.
+      if (typeof args.workspace_note === 'string' && args.workspace_note.trim() !== '' && dispatch.workspaceId !== undefined) {
+        try {
+          await setWorkspaceIntro(storeRoot(), String(dispatch.workspaceId), args.workspace_note)
+        } catch (error) {
+          warnings.push(`workspace_note not saved: ${String(error?.message ?? error)}`)
+        }
+      }
 
       // Mark the dispatch before pushing: enforcement reads this flag, and a
       // failed push must not cause the worker to be steered again.

@@ -34,6 +34,7 @@ import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 
 import { listDispatchCheckpoints } from './checkpoint.js'
+import { registerMemoryRoutes } from './memory-routes.js'
 import { dataDir, storeRoot, whaleHomeDir } from './store.js'
 import { registerVoiceRoutes } from './voice.js'
 import { registerVoiceSettingsRoutes } from './voice-settings.js'
@@ -207,6 +208,18 @@ export function apply(ctx) {
     // installed packages on this same connection, never from a CDN.
     registerVoiceAssetRoutes(c.connection, { logger: ctx.logger }).catch((error) => {
       ctx.logger?.warn?.(`discipline-whale: could not register the voice detector routes: ${error?.message ?? error}`)
+    })
+    // Workspace colors and per-turn tags for the client's chips and sidebar dots.
+    registerMemoryRoutes(c.connection, {
+      workspaces: () => {
+        try {
+          return ctx.get?.('workspaceRegistry')?.list?.() ?? []
+        } catch {
+          return []
+        }
+      },
+    }).catch((error) => {
+      ctx.logger?.warn?.(`discipline-whale: could not register the memory routes: ${error?.message ?? error}`)
     })
     return c.connection.fetch.register({
       path: HOME_ROUTE,

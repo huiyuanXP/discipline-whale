@@ -155,6 +155,18 @@
               maxProseChars: 1200
               maxCorrections: 1
               enabled: true
+          # Memory (memory-row.js): Soul / User / Memory and the workspace cards
+          # as a prompt section, the running and recent conversations as a
+          # runtime context, the remember / update_instructions /
+          # set_workspace_intro / dream_now tools, the pre-compaction flush, the
+          # ten-turn nudge and the idle dream. Main preset only.
+          - id: discipline-whale-memory
+            name: 'discipline-whale/memory'
+            config:
+              flushMarginTokens: 32768
+              nudgeInterval: 10
+              dreamMinHours: 24
+              dreamMinEntries: 5
           - id: tool-fs
             name: '@deepseek-ai/dsh-tool-fs'
             config:
@@ -214,9 +226,14 @@
                 name: '@deepseek-ai/dsh-compaction-basic'
               - id: command-compact
                 name: '@deepseek-ai/dsh-command-compact'
+              # Claude Code order: clear older tool outputs first, summarize only
+              # if still needed. The last three user turns keep their outputs
+              # (over-long ones head/tail trimmed); older ones become a one-line
+              # placeholder, the original stays in the session log (pruner.js).
               - id: tool-result-pruner
-                name: '@deepseek-ai/dsh-compaction-tool-result-pruner'
+                name: 'discipline-whale/pruner'
                 config:
+                  keepRecentTurns: 3
                   thresholdChars: 8192
 
     - id: preset-discipline-whale-worker
@@ -300,7 +317,12 @@
                 name: '@deepseek-ai/dsh-compaction-basic'
               - id: command-compact
                 name: '@deepseek-ai/dsh-command-compact'
+              # Claude Code order: clear older tool outputs first, summarize only
+              # if still needed. The last three user turns keep their outputs
+              # (over-long ones head/tail trimmed); older ones become a one-line
+              # placeholder, the original stays in the session log (pruner.js).
               - id: tool-result-pruner
-                name: '@deepseek-ai/dsh-compaction-tool-result-pruner'
+                name: 'discipline-whale/pruner'
                 config:
+                  keepRecentTurns: 3
                   thresholdChars: 8192

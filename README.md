@@ -469,6 +469,39 @@ worker 每次即将结束回合时，插件会检查本轮是否调用过 `repor
 - **近场音量门 -45 dBFS 是经验值**：不同麦克风的电平差异较大，声音很轻或离麦克风较远时可能被拦；如果常出现「声音离麦克风太远」，需要调低这个值。
 - 麦克风权限、真人说话时的起停手感、PiP 真窗口、拖动手感都只能在真浏览器里确认，见 `VERIFICATION.md` 的未验证清单。
 
+## 记忆系统：无限对话流（`memory-row.js`）
+
+主会话是一条不会结束的对话。它自己决定什么时候清工具输出、什么时候压缩，同时始终知道「用户是谁、我们正在做什么、做过什么」。完整设计见 [`docs/memory-design.md`](./docs/memory-design.md)。
+
+**分层**（OpenClaw 层级，Devin 条目格式 `- 内容 [source: …; added: YYYY-MM-DD]`）：
+
+| 层 | 文件（`home/memory/`） | 谁写 | 怎么进上下文 |
+|---|---|---|---|
+| Instructions | `home/AGENTS.md` | 只经 `update_instructions`，且要附用户本轮原话 | 每步全量 |
+| Soul | `SOUL.md` | `remember(target:"soul")` | 每步全量 |
+| User | `USER.md`（Preferences + Now） | `remember`；Now 由后台 flush 轮换 | 每步全量 |
+| Memory | `MEMORY.md` | `remember` + dream 提升 | 每步全量 |
+| Activity | 由派工记录生成 | 程序 | 每次派工状态变化后刷新 |
+| Daily | `daily/YYYY-MM-DD.md` | 后台 flush / nudge，只追加 | 按需 `read` |
+| Review | `DREAMS.md` | dream 的整理记录 | 给人看 |
+
+**Activity（我们正在做什么）**：
+- 工作区卡片：每个工作区一段 ≤200 字的介绍，写用户拿它在做什么、下一步想做什么。可通过 `set_workspace_intro` 修改，worker 回报时也能带上 `workspace_note`。
+- 对话条目：鲸鱼派出的对话里，进行中的全部注入；最近结束的注入 max(5, ⌈进行中条数 × 40%⌉) 条。
+- 消息 Tag：主会话某一轮里派了活，这一轮的用户消息就打上目标工作区的 Tag，派到几个工作区就打几个。
+- 派工 bootstrap：向一个工作区派新会话时，brief 开头附上该工作区的介绍、用户说过的相关话、最近的交付。
+
+**自动机制**：
+- 清工具输出：压缩压力成立时先清工具输出（`pruner.js`）。最近 3 个用户 turn 保留，更早的换成一行占位，原文仍在 session log。
+- 压缩：沿用 `dsh-compaction-basic`。
+- flush：距压缩阈值 32K token 时跑一次后台隐藏调用，把值得留下的观察写进 daily，并更新 Now 和工作区介绍。
+- nudge：每 10 个真实用户 turn 也跑一次，逻辑同 flush。
+- dream：主会话空闲、且距上次 ≥24h、新 daily ≥5 条时运行。它只输出操作列表，由代码执行，并受 6 条门禁约束（删除 ≤25%、条目必须有来源、hash 校验、预算、结构可解析，失败时只追加）。`dream_now` 可以手动触发。
+
+**和宿主 `dsh-auto-memory` 的关系**：主会话的记忆由鲸鱼接管。首次启动时，鲸鱼 home 下已有的 auto-memory 条目会被迁进 USER / MEMORY，原目录改名为 `*.migrated-YYYYMMDD` 保留。主会话里调用 `memory_*` 工具会被 guard 引导去用 `remember`。其它会话照常使用 auto-memory。
+
+**客户端**：主会话每轮的回复尾部显示彩色工作区标签，点击打开对应的工作会话。派出去的会话在侧栏有工作区色点。工作区颜色在鲸鱼设置面板里修改。数据来自 `/api/discipline-whale/memory/{workspaces,tags,dispatched}`。
+
 ## 安装
 
 ```bash
@@ -494,11 +527,14 @@ $DSH_HOME/discipline-whale/reports/<workspaceId>/<reportId>.json    ← 报告
 $DSH_HOME/discipline-whale/dispatches/<workerSessionId>.json        ← 派工检查点
 $DSH_HOME/discipline-whale/dispatches/<workerSessionId>.abandoned   ← 用户放弃的派工
 $DSH_HOME/discipline-whale/voice.json                               ← 语音设置（0600；仅在没有 Host 凭据面时存 key）
+$DSH_HOME/discipline-whale/home/memory/                             ← 记忆文件：SOUL / USER / MEMORY / DREAMS.md、daily/
+$DSH_HOME/discipline-whale/home/AGENTS.md                           ← 主会话运行规则（只经 update_instructions 写）
+$DSH_HOME/discipline-whale/memory-state/                            ← 工作区卡片与颜色、消息 Tag、flush/dream 游标与锁
 $DSH_HOME/.credentials.yaml                                         ← Host 凭据面（0600；优先，由 dsh-credentials-local 写）
 ```
 
 `voice.json` 与 `.credentials.yaml` 都是 **0600**。仓库里**没有**、也**不许有** key：`.gitignore` 已经忽略 `.credentials*`，而 `voice.json` 只存在于数据目录。
-以后新增的状态（自动记忆、唤醒计划等）各占一个子目录。
+新增的状态各占一个子目录，例如记忆状态放在 `memory-state/`。
 
 每个报告一个 JSON 文件，原子写入（temp + rename）。损坏的文件会被列表跳过，不会拖垮整个 listing。
 
@@ -516,7 +552,17 @@ node test/dock.mjs
 node test/settings.mjs
 node test/guard.mjs
 node test/adhd.mjs
+npm run test:memory
 ```
+
+`npm run test:memory` 覆盖记忆系统：
+- 条目与分层（`memory.mjs`）
+- 工作区卡片、对话条目、Tag、bootstrap（`activity.mjs`）
+- flush / nudge（`memory-flush.mjs`）
+- dream 与门禁（`dream.mjs`）
+- 清空型 pruner（`pruner.mjs`）
+- 真实 store 串起 flush → dream → 注入的集成测试（`memory-integration.mjs`）
+- 接线测试（`memory-wiring.mjs`）：memory 行注册、迁移、Tag、flush 触发、路由、派工 bootstrap、`workspace_note`、guard 拦截
 
 28 项契约测试（编号 1–27，另加 15b），用假 Host 分别挂载两半；另有 `node test/voice.mjs` 13 项语音端点、幻觉过滤、起停参数、离开防护与检测文件路由测试、`node test/client.mjs` 9 项浏览器半边测试、`node test/dock.mjs` 13 项通话条控件/收音/窗口/拖动/贴边/缩放/文案/接缝测试、`node test/settings.mjs` 10 项设置与密钥测试、`node test/guard.mjs` 10 项主会话刹车测试、`node test/adhd.mjs` 13 项输出纪律测试：
 
