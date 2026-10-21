@@ -42,9 +42,10 @@ DSH 里已经有 `subagent`（同一会话内的子代理）和 `dsh-webhook`（
 
 ### `dispatch_task`（主会话）
 ```json
-{ "workspace": "soc-api-test", "task": "完整任务描述", "title": "可选标题" }
+{ "workspace": "soc-api-test", "task": "完整任务描述", "title": "可选标题", "topic": "可选话题", "at": "step|queue|abort", "writes": ["可选路径前缀"] }
 ```
 创建一个 worker 会话、下任务、返回 `dispatchId` + `workerSessionId`。worker 立刻开始执行。
+带了 `topic` 且同工作区有同话题的活会话时，改为把新任务插给那个会话（默认在步边界生效）并返回 `reused: true`；`writes` 与另一个活会话重叠时拒绝派工。详见下文「派工路由」。
 
 任务描述里会自动附加「必须调用 `report_to_main`」的约定，即使 worker preset 的 persona 写得很简。
 
@@ -57,7 +58,50 @@ DSH 里已经有 `subagent`（同一会话内的子代理）和 `dsh-webhook`（
 - `document` 落到磁盘，主会话只在需要细节时用 `read_report` 打开，不会撑爆上下文。
 
 ### `send_to_session`（主会话）
-给运行中的 worker 追发新决策。`mode: 'queue'`，会立即唤醒目标。
+给运行中的 worker 追发新决策。默认 `at: "step"`：在当前回合的**下一个步边界**插话；`at: "queue"` 等整个回合跑完；`at: "abort"` 才硬中止。三种时机的准确差别见下节。
+
+### 派工优先与「一个话题一个会话」
+
+主会话的纪律写在 preset 的 **persona prefix**（`cordis.patch.yml` 的 `preset-discipline-whale` 行里那段中文），不靠用户每次提醒。它是 system prompt 的一个 section，每次请求重新组装；不采用「每轮强塞一条消息」的注入方式（理由见「已知限制」）。
+
+规则要点（全文即 `cordis.patch.yml` 里那段，`node prompt-probe.mjs discipline-whale` 可打印组装后的实际文本）：
+
+- **默认动作是派工**：第一句先给判断，同一回合内 `dispatch_task`。
+- **读预算**：`list_workspaces` 之外最多 2 次读，只用于判断归属和划任务边界；禁止为写 brief 去通读实现、翻配置找密钥、跑实验、读子系统详细文档。自检判据是那句「如果继续读下去就能直接回答用户『能不能做 / 怎么做』的技术细节，就立刻停手派工」。
+- **同一件事的延续 → 往正在跑的会话插话（步边界生效）**，不新建；只有主题不同或前一个已交付完成才新建。几项改动落在同一文件或同一职责时合成一个 brief 派一次。
+- **例外**：纯讨论、架构权衡、选工作区、转述回报，以及用户问的是问题不是活 —— 不派工。
+- **诚实边界**：派工不等于完成。
+
+### 三种投递时机：step（= Interrupt）/ queue / abort
+
+用户要的「Interrupt」是**第二档**：等当前这一次 tool call 收尾，在下一个 step 边界插进去，同一个 turn 内重新规划。**不是硬中止。** 三档并列如下：
+
+| # | 时机 | 插件参数 | Host 路径 | 生效点 | 会打断正在跑的工具调用吗 |
+|---|---|---|---|---|---|
+| 1 | 排队 | `at: "queue"` | `prompt(mode:"queue")` → `followup` → inbox `next-turn`（`dsh-agent-loop:806`） | 当前**整个 turn 跑完** | 不会 |
+| **2** | **步边界插话（= 用户说的 Interrupt，默认）** | `at: "step"`（可省略） | `prompt(mode:"steer")` → `steer` → inbox `next-step`（`dsh-agent-loop:809`） | 当前 **tool call 结束、下一步开始之前**，同一 turn 内 | **不会——这是设计意图，不是缺陷** |
+| 3 | 硬中止 | `at: "abort"` | 先 `sessionController.cancel({sessionId})`，再 `steer` | 立刻打断正在执行的工具调用 | 会，且可能留下半截状态 |
+
+**纯 `steer` 那条路径（第 2 档）全程不调用 `cancel`**：当前那一次工具调用正常收尾，worker 带着完整的上下文（已读的文件、已建立的判断）重新规划。不打断正在跑的工具调用是**有意为之**，因为硬中止会留下半截状态（brief 写一半、文件改一半），那正是这一档要避免的代价。契约测试 ok 26 专门断言这一点：只要 step 路径上出现任何 `cancel` 调用就会失败。
+
+**代价，必须说清**：如果当前那一步是个长跑工具调用，插话得等它结束。所以这个机制的准确含义是**「最近一个步边界」，不是「立刻」**——不许对用户暗示成瞬时打断。README 与 persona 都写死了这句口径。
+
+`queue`（第 1 档）的用途：**不想打断它当前的活、只补一条不影响方向的说明**。它等整个 turn 结束才接入。
+
+`abort`（第 3 档）只在「它已经在写错的文件、等不起」时用，属于最后手段，用之前先说明代价：`cancel` 中止当前回合的 AbortSignal 但保留 inbox（`dsh-api-session-controller/lib/types/commands.js:466-475` → `dsh-agent-loop:815-821`）。冷会话（没有活着的 turn）时 `cancel` 抛 `session/not-found`，插件吞掉并照常投递，返回 `aborted: false` —— 不谎报中止过。
+
+依据（都在 Host 源码里，可自行核对）：`followup` → `next-turn`、`steer` → `next-step`（`dsh-agent-loop/lib/index.js:806-811`）；`claim()` 在**每个**步边界都清空 `next-step`，而 `next-turn` 只在 target 是 `"next-turn"` 时才清（`lib/index.js:103-105`）；turn 循环以 `target = "next-turn"` 开场、首步之后切到 `"next-step"`（`lib/index.js:951`、`1008`）。所以一次 `steer` 必然会落到当前 turn 的下一个步边界。契约测试 ok 25 直接对这几行源码做断言，Host 升级改变语义会在这里失败。
+
+### 派工路由：`topic` / `at` / `writes`
+
+```json
+{ "workspace": "soc-api-test", "task": "…", "topic": "voice-input", "at": "step", "writes": ["src/voice"] }
+```
+
+- `topic`：同工作区 + 同 topic（忽略大小写与多余空格）+ 尚未 reported/abandoned → **把这个新任务插给那个已有会话**，返回 `status: "reused"`、`reused: true`、`deliveredAs`，不新建会话。没有 topic 就没有可判定的「同一件事」，每次都是新会话。
+- `at`：复用已有会话时的投递时机，`step`（默认，步边界）、`queue`（等回合结束）、`abort`（硬中止）。
+- `writes`：本任务会改的路径前缀。同一工作区里两个仍活着的会话若前缀重叠（`a/b` 与 `a` 算重叠），**派工直接拒绝**并指出该找谁续。声明了不相交的前缀才允许并行。
+- 已 reported 的会话不会被复用：交付完的事再提新需求属于新活。
 
 ### `list_dispatches`（主会话）
 看板：本次进程里记录的所有派工，带 worker session、状态（`running` / `reported` / `abandoned`）、已派出多久。
@@ -93,6 +137,303 @@ worker 每次即将结束回合时，插件会检查本轮是否调用过 `repor
 
 **局限（必须说清）**：它拦的是「想收工却没报告」。拦不住 worker 什么都不做就结束，也拦不住它编一份假报告。主会话的转述只能当索引，最终验证仍应落到那个工作区的实际结果上。
 
+## 主会话的三道刹车（`guard.js`）
+
+主会话的文件系统是只读的，也没有 shell，所以「忍不住写代码」不是这里的问题。真正的问题是**读得太多、没有配额、不回话就一路读下去**。插件在主会话行上挂了三道机制（实现全在 `guard.js`，`main.js` 只多一行 `installGuard`）：
+
+**1. 工具调用看门狗 —— 硬停 + 强制回话**
+
+连续 **10** 次静默工具调用（没有任何用户可见文本）→ **终止当前回合并注入一条 prompt**，逼它立刻回话、然后 `dispatch_task` 把活派下去。注入的 prompt 同时**把读配额重置满**，否则它刚被 10 条配额卡住，被迫回话时连派工都做不了。
+
+- **计数口径**：默认 `all` —— 除「只产出、不增加对代码库了解」的 28 个履职工具外都算。豁免四组：派工/看板/回报（`dispatch_task` 等）、对用户说话（`present`/`ask_user_question`/`todo_write`）、**渲染产出**（`render_text`/`render_ui`/`render_canvas`/`render_scene`/`render_mechanism`/`update_ui`/`patch_ui`/`validate_ui`/`inspect_ui`/`ui_catalog`/`preview_video`/`render_video`/`process_video`/`synthesize_voice`）、**文档产出**（`excel_create`/`excel_update`/`word_create`/`word_update`/`ppt_create`）。也可用 `watchdogCounting: read-only` 切到「只数 `read`/`read_image`/`grep`/`glob`/`web_fetch`/`web_search`」。取舍见下。
+  - 渲染产出必须在豁免清单里：一次多图形块的回答会在正文之间连续渲染若干 UI 文档，那不是埋头调研。漏掉它们，渲染到第 10 个就会把正常交付拦腰截断。（`excel_read`/`word_read`/`ppt_read`/`inspect_video` **不**豁免——把产物读回来确实拉进了上下文。）
+- **防死循环**：单轮最多强制介入 `maxInterventions`（默认 **2**）次，之后**停止干预**并推一条「主会话异常，已停止干预」给用户；用户发新消息即重新武装。配额仍然生效，所以不会失控刷钱。
+- **用户可见文本**的判定用真实信号：assistant 流里出现非空白的 `text-delta` / 文本块结束。`reasoning-delta`（思考）**不算**回话。
+
+**2. 读配额 —— 每回合 10 条，回话刷新**
+
+每个「回话周期」最多 **10** 次读类调用（`read`/`read_image`/`grep`/`glob`/`web_fetch`/`web_search`）。**一旦产生用户可见文本就刷新**（不是每条新用户消息才刷新，否则一轮里多段回复的额度回不来）。超额不是静默失败，而是返回一条自解释的拒绝，原文：
+
+> `[Discipline Whale] Read quota exhausted — 0 of 10 read calls left in this reply. Stop reading now: answer the user with what you already have, then route the rest of the work with `dispatch_task` (or `send_to_session` for a running worker). The quota refreshes as soon as you produce user-visible text.`
+
+状态按会话隔离，且**只对主会话 preset 生效**——worker 要正常读几十个文件，绝不受影响。
+
+**3. 读路径白名单 —— 读过界要说话**
+
+| 区域 | 可读性 |
+|---|---|
+| 主会话自己的 home（`$DSH_HOME/discipline-whale/home`） | **完全可读**，不设路径限制（但仍受 10 条配额） |
+| 其他工作区 | 只允许：根级 `README*.md`、任意层 `AGENTS.md` / `CLAUDE.md`、`docs/**/*.md`、根级 `*.md`、根级 `package.json` |
+| 其余 | 拒绝 + 一句明确的话，告诉你「为什么被拦 + 该怎么替代」 |
+
+白名单外的拒绝原文：
+
+> `[Discipline Whale] Read blocked — "<path>" is outside the main session's read scope. Readable: anything under your own home (<home>); public documents inside a registered workspace: README*.md, AGENTS.md, CLAUDE.md, docs/**/*.md, top-level *.md, and package.json. Source files, configs, and data are not readable from the main session. To inspect this file, dispatch a worker into that workspace with `dispatch_task` and let it read it.`
+
+- **路径穿越按解析后的真实路径判定**：`../`、符号链接指向白名单外，都会先 `realpath` 再判断（叶子文件不存在时向上找到最深的已存在祖先再拼回尾部），不是看字符串前缀。
+- `grep` / `glob` 是**整树遍历**，无法事后逐文件过滤，所以它们**只允许在主会话 home 内**。否则一次 `grep` 就把白名单想拦的源码全读进来了。
+- **不误伤既有能力**：`list_workspaces` / `dispatch_task` / `read_report` 都不是文件读，不受白名单或配额影响；`read_image` 算**一次读**（它确实把文件内容拉进上下文）并同样受路径白名单约束。
+
+**为什么默认 `watchdogCounting: all`**：读配额已经把读类调用卡在同一个数字（10）上，若看门狗也只数读类，两者会在同一刻触发、只有先判的那个可见，等于少了一层保护。`all` 让两者都活着：混合型爆发（读 + todo/skill 等）由看门狗硬停，纯读爆发在被停过一次、介入预算用完后由配额兜住。想要字面的「10 个 tool call」口径，把 `watchdogCounting` 设为 `all` 即可——它本来就是默认值；想只数读类就设 `read-only`。
+
+阈值全部是 `guard.js` 顶部的具名常量（`WATCHDOG_SILENT_THRESHOLD` / `READ_QUOTA_PER_EPOCH` / `MAX_FORCED_INTERVENTIONS_PER_TURN`），也可以在 `cordis.patch.yml` 的 `discipline-whale-main` 行里按部署覆盖。
+
+**验证了什么、没验证什么**：逻辑与真实作用域投递都有测试（`node test/guard.mjs`，含用真实 `cordis` + `dsh-scope` 包断言 preset 监听器确实能收到 `agent/assistant-stream`、而 `session/event` 确实收不到）。**没有**做真机重启验证，因此「硬停把正在派工的回合打断」这类时序行为仍属未验证，见 `VERIFICATION.md`。
+
+## 输出纪律：给 ADHD 读者的简洁回复（`adhd.js`）
+
+主会话是唯一直接跟你说话的会话。这道机制约束**它怎么说**：正文短、第一句就是下一步、不铺垫不复述。实现全在 `adhd.js`，`main.js` 只多一行 `installBrevity`，规则原文在 `skills/whale-brevity/SKILL.md`。
+
+改造自 [ayghri/i-have-adhd](https://github.com/ayghri/i-have-adhd)（**MIT**，Copyright (c) 2026 Ayoub Ghriss）。上游是「Skill + Hook」两半：Skill 存规则，`SessionStart` hook 在用户 opt-in 后把整份规则注入会话。本插件保留这两半，但**规则正文按本插件口径重写并新增了「UI 交付物豁免」一节**（上游没有画布类工具，所以没有这一节），不是逐字照抄。
+
+**两半分别落在哪**
+
+| 上游 | 这里 | 作用 |
+|---|---|---|
+| `SKILL.md` | 注册成 skill `whale-brevity`，**只进主 preset 的 scope** | 模型可以按名字加载完整规则 |
+| `SessionStart` hook 注入 | 同一条 prompt section（`discipline-whale:brevity`） | 规则常驻 system prompt，每轮都在，不依赖模型主动加载 |
+
+`SessionStart` 在 DSH 里没有对应事件，而且 preset 里的监听器收不到 `session/event`（host 平面派发会被 scope 过滤掉，见 `guard.js` 的注释）。所以「常驻」改用 prompt section 实现——这比注入一条消息更稳：它每次请求重新组装，不会被压缩掉，也不需要额外的消息。
+
+**第三个机制：超长纠正**
+
+一轮回复的**可见正文**超过 `maxProseChars`（默认 **1200** 字符）时，下一个步边界注入一条纠正提示，单用户轮最多 `maxCorrections`（默认 **1**）次。
+
+> **诚实边界**：这条机制**不能重写或截断已经流出去的文字**。等你看到那段话时，任何 hook 都晚了。它做的是「让下一步变短」，不是「把这一步变短」。真正承重的是常驻 prompt section；纠正是模型跑偏时的兜底。别把它理解成「强制简洁」。
+
+**UI 交付物豁免（本插件新增）**
+
+- **对话正文**：受全部长度规则约束。
+- **UI / 画布**：**豁免**。`render_ui` / `render_canvas` / `render_scene` / `render_mechanism` 产出的是交付物，不是闲聊；里面可以完整、密集、多段。
+- **`render_text` 不豁免**：它渲染的是文字，仍然是文字通道。否则「调个 `render_text` 包一层」就成了绕过简洁要求的一行后门。它在 `render_text` 里带的字数**照算**。
+- 一轮里既有渲染又有长正文 → **整轮豁免**。理由：把「围绕交付物的说明」和「交付物本身」切开不可判定，而误伤一份正常交付物的代价高于漏掉一段啰嗦说明。豁免只关掉长度纠正，形状规则（先给动作、编号、无客套）仍由常驻 prompt 约束，下一步也照常重新计量——豁免不会粘到下一轮。
+
+判据集中在一个纯函数里（`isUiTurn(toolCalls)` / `shouldEnforceBrevity({toolCalls, chars, config})`），单测覆盖，不散落在 handler 里。
+
+**开关与阈值**（`cordis.patch.yml` 的 `discipline-whale-brevity` 行，或沿用 `discipline-whale-main` 行）：
+
+| 键 | 默认 | 含义 |
+|---|---|---|
+| `maxProseChars` | `1200` | 每轮可见正文字符上限；`0` = 不写正文 |
+| `maxCorrections` | `1` | 每用户轮最多纠正几次；`0` = 从不注入 |
+| `enabled` | `true` | `false` 关掉整套纪律（prompt 段和纠正一起） |
+
+非法值**回落**到默认而不是抛错——照 `resolveGuardConfig` 的规矩：一个坏数字不许把主行带下去。
+
+**和 guard 的三道刹车互不干扰**：`guard.js` 数的是**读类调用次数**，这里数的是**输出字符数**，两套计数器、两套监听器，`tools/pre-execute` 这条水线上本模块**永远放行**（不 deny、不 cancel）。测试里断言了两者注册的是**两个独立的** `agent/assistant-stream` 监听器。
+
+**作用域（最关键的一条）**：主会话有，worker **没有**。worker 的价值在于回报详细，给它加简洁约束会直接毁掉回报质量。所以每个 handler 先读 `agent.session.header.agentPreset`，不等于 `discipline-whale` 就 `next()` 放行，**连计数器都不建**。preset identity 读不出来时也放行——不确定时宁可主会话漏约束，不许误伤 worker。
+
+**验证了什么、没验证什么**：`node test/adhd.mjs`（13 项）覆盖纯函数、真实 skill registry 的 scope 隔离、worker 放行、纠正预算、UI 豁免、`render_text` 不豁免、config 回落；`test/contract.mjs` ok 27 断言这行**只声明在主 preset**。**没做**真机重启验证，所以「模型是否真的变简洁」「纠正注入的实际触发时机」「豁免会不会被滥用」都属未验证，见 `VERIFICATION.md`。
+
+## 语音对话（像打电话一样）
+
+侧边栏「自律鲸鱼」页之外，界面上还有一个浮动的「开始通话」按钮（挂在 `shell.overlay`，所以切到会话页也不会消失）。点它之后：
+
+1. **收环境噪音**（500ms），用测得的底噪算出这次通话的静音阈值，不写死魔法数；
+2. **开始听**，状态条显示「正在听 · 停口 10 秒自动发送」；
+3. **停口满 10 秒**（`SILENCE_MS`，`client.js` 与 `voice-silence.js` 各有一份同名常量，测试逐帧比对两份实现）自动结束这句，上传识别；
+4. 识别文本通过 **`POST /api/discipline-whale/voice/say`** 排队进当前主会话（服务端用 `sessionController.prompt`，和派工走同一条路，不另造消息通道）；
+5. 鲸鱼回复后，**回复正文以文字显示在浮层里，然后回到待命、重新开麦**；
+6. **挂断**随时可点；挂断、切会话、页面隐藏或插件卸载都会停录音、释放麦克风，并作废迟到的识别结果。
+
+> **朗读 = 浏览器语音合成（fallback，非真实 TTS），默认关闭。** 通话条右侧的喇叭按钮与设置页「通话 → 朗读回复」开关是同一个状态；打开后用 `speechSynthesis` 念出回复。它没有独立凭据、音色与配额管理，声音取决于设备，和「接入一个真实 TTS 通道」（云端 key 或本地模型）不是一回事。
+>
+> 真实 TTS（云端 key 或本地模型）**尚未接入**。关闭朗读时，回复到手后**直接回待命并重新开麦**，不会等待任何语音事件。
+
+### 话筒 ≠ 静音：两个独立控制
+
+用户要求这两件事分开，实现里就是两套状态，各自可见、互不代替：
+
+| 控件 | 管什么 | 开 | 关 |
+| --- | --- | --- | --- |
+| **话筒**（`data-dw-control="mic"`） | **麦克风设备/权限** | `getUserMedia` 拿到流，系统指示灯亮 | 停掉所有 track、关闭 AudioContext，**设备真正释放**，指示灯灭 |
+| **静音**（`data-dw-control="mute"`） | **是否处理数据** | （静音态）**音频帧直接丢弃**：不进 VAD、不上传、不发送 | 从下一帧起立刻恢复处理 |
+
+状态机的四条规则（`client.js` 的 `createCallControls`，`test/dock.mjs` ok 1 逐条钉住）：
+
+- 话筒关着时**不能静音**：静音按钮 `disabled`，`title` 写明「话筒关闭时不需要静音」，而不是灰着不解释；
+- 静音**不碰设备**：track 仍然 live，只是帧不进处理路径（`createFrameGate` 是唯一的闸口，`listen()` 里所有帧都走它）；
+- 话筒关闭时会**清掉已按下的静音**，不会留一个悬空状态；
+- 两个按钮各有自己的 `aria-pressed`；「话筒开 + 静音开」与「话筒开 + 静音关」在 DOM 上是两种明确不同的状态。
+
+**静音解除后 VAD 是干净的**（`test/dock.mjs` ok 3、ok 9）：静音期间 `detector.pause()` 把静音计时清零，解除时 `resume()` 重新起算；静音时长既不进 `silenceMs`、也不进 `speechMs`/`elapsedMs`。所以**不会出现「一解除静音就立刻断句」**，同时真正的 10 秒安静仍然照常结束这句。
+
+### 设置界面（API Key / Base URL / 模型 / 语言）
+
+通话条左侧（或未通话时「开始通话」旁）的齿轮打开设置面板。面板是一级总览 + 两个二级页：
+
+| 页面 | 内容 |
+| --- | --- |
+| 总览 | **通话**：「朗读回复」开关（附 fallback 说明）；**语音识别**：key 来源状态点 + 「测试连接」、当前服务摘要（模型 · 主机 · 语言）；**朗读引擎**：「真实 TTS · 未接入」入口 |
+| 服务与密钥（二级） | `baseUrl`、`apiKey`、`model`（转写模型）、`language` 四个字段，「清除已保存的 key」开关，保存 / 测试连接 |
+| 真实 TTS（二级） | 四个禁用占位字段与说明（见下） |
+
+**TTS 那一块怎么写，是有分寸的**：面板里保留四个**禁用占位**——`Base URL`、`模型`、`音色`、`API Key`，每格都标「未接入，留作将来」，页尾明确写着「真实 TTS 需要它自己的那把 key，与「服务与密钥」里的转写 key 不是同一个」。措辞同时避免两个错误说法：
+
+- 不写成「**已接入 TTS**」——它不是；
+- 也不写成「本插件没有 TTS」——**当前有浏览器内置语音合成作为 fallback**（通话条上的「朗读回复」，默认关闭），这是真实存在的朗读能力，只是没有凭据、音色、配额管理，声音取决于设备。
+
+即：**fallback 有，真实 TTS（MiniMax 等）没有**；占位留着是为了将来接入时不用改结构，而不是让人以为现在填了就能用。`/voice/status` 与 `/voice/settings` 的 `tts` 字段同样如实描述：`integrated:false`、`fallback:"browser-speech-synthesis"`、`fallbackDefaultOn:false`、`needsOwnKey:true`、`configurable:false`。
+
+**key 放在哪、为什么**（先查了 Host 有没有现成的面）：
+
+1. **优先用 Host 自己的凭据面 `ctx.credentials`**（`@deepseek-ai/dsh-credentials-local`）。它写 `$DSH_HOME/.credentials.yaml`、**权限 0600**、外部改动热重载、`describe(ref)` 只回 `{ configured, source }`（`source` 是 `file`/`env`）。这是产品已有的密钥设施，**没有理由再造一个**。
+2. 该面**不一定挂载**（minimal/headless 组合里没有），所以 `voice-settings.js` 补一条回落：插件自己的数据文件 **`$DSH_HOME/discipline-whale/voice.json`，权限 0600**，原子写（temp + rename，temp 就以 0600 创建，不存在「先可读后 chmod」的窗口）。这个文件同时存非密字段（baseUrl / model / language），因为它们没有 Host 面可用。
+3. 用了 `ctx.credentials` 时**不会**在插件文件里再留一份 key 副本；该面抛错时自动回落到插件文件，语音不会因此不可用。
+
+**回落顺序（已定并实现）：设置界面 → 环境变量 → 未配置。**
+
+为什么设置优先于环境变量：与 Host 自己凭据面的既定语义一致（`dsh-credentials-local` 明确让「用户在产物里存的值」压过继承环境，注释原文是保证 `a credential the user explicitly saved in the product must take effect consistently`）。同时 `SOCLAAS_API_KEY` / `SOCLAAS_BASE_URL` 仍是可用的零配置路径，老部署不受影响；`/voice/status` 会**报告 key 来自哪一层**（`keySource`：`settings` / `env` / `none`），UI 直接显示「设置界面（已保存）」或「环境变量 SOCLAAS_API_KEY」。
+
+**测试连接**按钮打一次 `GET {baseUrl}/models`（轻量、不计费、不需要音频），把结果分成 `ok` / `invalid-key`(401/403) / `endpoint-not-found`(404) / `backend-unreachable` / `backend-timeout`(15s)，每条给可读原因。选 `/models` 而不是空音频探测的理由：空音频会被计费，而且可能因为容器格式失败——那会把「key 是好的」误报成「key 坏了」。
+
+**key 的可见性**：不进日志、不进任何 HTTP 响应体、不进仓库。表单的 key 输入是 `type="password"` 且**永不回填**（服务端本来就不返回值）；「留空 = 不修改」，要清除必须打开「清除已保存的 key」开关（只在 key 来自设置界面时出现；再关掉就恢复「不修改」）——这样一次误提交不会抹掉已存的 key。`test/settings.mjs` 对每个响应与每条日志都断言 key 不出现。
+
+### 四个端点
+
+| 方法 | 路径 | 作用 |
+| --- | --- | --- |
+| GET | `/api/discipline-whale/voice/status` | 是否配置了 key（不返回 key 本身）、**key 来源 `keySource`**、baseUrl、模型、语言、大小/时长上限、朗读能力描述（`tts.integrated:false` + `fallback:"browser-speech-synthesis"` + `needsOwnKey:true`） |
+| POST | `/api/discipline-whale/voice/transcribe` | 上传一段录音（`audio/wav` 或 `audio/webm` 等，见 `ACCEPTED_AUDIO_TYPES`），返回 `{ text, model, audioSeconds }` |
+| POST | `/api/discipline-whale/voice/say` | `{ text }` → 排进**记录在案的主会话**；请求体里的 `sessionId` 会被忽略 |
+| GET / POST | `/api/discipline-whale/voice/settings` | 读/写 key-free 的配置描述；写 `{ baseUrl?, apiKey?, model?, language? }` |
+| POST | `/api/discipline-whale/voice/test` | 用（可选的）草稿值打一次 `/models`，回可读的成功/失败原因 |
+
+`say` 只认 `state.json` 里的主会话 id，所以页面脚本没法借它往任意会话里塞消息。设置接口**只返回描述**：`hasApiKey` / `keySource` / `apiKeyEnv`，没有任何字段能承载 key。
+
+### 通话条独立于会话页 / 独立窗口
+
+**两层，边界不同，这里说清楚：**
+
+| 层次 | 做不做得到 | 本插件怎么做 |
+| --- | --- | --- |
+| **浏览器内、脱离会话页存在** | ✅ 可以 | 通话条挂在 `shell.overlay`，切面板/切会话都不消失；再点「独立窗口」把它搬进一个独立小窗 |
+| **浏览器最小化后依然可见** | ❌ 普通网页做不到 | **不承诺**。最小化时页面通常仍在跑（音频、定时器继续），通话**不断**，但窗口不可见，也不可能画到浏览器之外 |
+| **真正的桌面宠物（浏览器外常驻）** | 需要原生壳 | **本次不做**，评估见下 |
+
+独立窗口的实现优先用 **Document Picture-in-Picture**（`documentPictureInPicture.requestWindow()`，Chrome/Edge 116+）：一个 **always-on-top** 的 OS 窗口，由本页持有，页面关闭即消失。不可用时回落到 **`window.open()` 弹窗**（保留引用，`pagehide` 时收回状态）；两者都不可用时**留在页面内**，并在 UI 里说明「当前浏览器不支持独立窗口」——不假装成功。`requestWindow` 需要**用户手势**，没有手势会被拒，此时也回落到弹窗（`test/dock.mjs` ok 4、ok 8 覆盖三条路径）。
+
+> **要让通话条在浏览器最小化 / 关闭浏览器后依然常驻，只有原生壳能做到**：Electron/Tauri 的 `alwaysOnTop` 原生窗口，或 macOS 菜单栏 App（`NSStatusItem`）。那是另一个工程（打包、签名、自动更新、与 `dsh web` 的 IPC），本插件是 DSH 的 Web 插件，没有这条通道。本插件提供的是「浏览器内的置顶小窗」，不是桌面常驻。
+
+### 拖动与吸附边缘
+
+通话条顶部有一条拖拽把手（`data-dw-control` 之外的独立 strip；未通话时是「开始通话」左侧的竖向把手），用**原生 Pointer Events + `setPointerCapture`** 实现，不引任何依赖：拖动时跟手，松手按 72px 内的最近边吸附，并 clamp 进视口（宽于视口的窗口钉在边距上，不会得到负坐标）。吸附逻辑是纯函数 `snapDockPosition`，`test/dock.mjs` ok 5 直接验算。
+
+**为什么不引库**：`client.js` 是 `window.__ModuleLoader__` 里的 plain JS，**没有构建步骤**，插件也**不允许外链 CDN**。`react-rnd` 会带入 `react-draggable` → `clsx` + `prop-types`，`@dnd-kit/core` 会带入 `@dnd-kit/utilities` + `accessibility`；任何一个都得手工 vendoring 进仓库，而它们的收益（拖动+缩放）在这里只用得到「拖动 + 吸附」这一小块。原生实现约 30 行，含触摸/笔，且不动打包结构。
+
+### 换外观：给接手视觉的人
+
+视觉层与逻辑层是**分开的**，换外观只需要动样式和 DOM 构建函数，不需要碰状态机、权限、音频处理或 PiP 生命周期。以下是接手的全部信息。
+
+#### 1. 渲染入口与挂载点
+
+| 项 | 位置 |
+| --- | --- |
+| 通话条视图 | `client.js` 的 `dockView(input)` —— 纯函数，`input` 是状态快照，返回 React 元素树 |
+| 设置面板视图 | `client.js` 的 `settingsView(input)` —— 同上 |
+| 组件本体（状态/副作用） | `makeVoiceDock(ctx, t)` 返回的 `VoiceDock` |
+| 样式唯一入口 | `client.js` 的 `dockStyles()`，返回**一整段 CSS 字符串**（已导出，可被测试与替换层直接读取） |
+| 挂载 slot | `shell.overlay`，注册 id `discipline-whale-voice`，`order: VOICE_DOCK_ORDER`（`test/client.mjs` ok 5 守住） |
+| 图标 | `MicGlyph`（话筒/静音）、`SpeakerGlyph`（朗读）、`HangupGlyph`（挂断）、`DetachGlyph`（独立窗口）、`GearGlyph`（设置）、`LockGlyph`（隐私小字）、`ChevronGlyph` / `CloseGlyph`（设置页导航）、`VoiceGlyph`（未开始通话时的光球按钮）；全部经 `strokeIcon()` 输出内联 SVG |
+
+**约束**：`dockView` / `settingsView` 只读 `input`，不读 ref、不发请求、不做决定。所有决定都在组件里，因此替换这两个函数不会改变任何行为。
+
+#### 2. 状态名与含义
+
+`status` 只有这几个值。`dockVisualState()` 把它和两个控件合成**一个视觉状态**，挂在 `.dw-dock` 根节点上（`.dw-status-<state>`），状态点、光球动效、文案都只读这一个 class：
+
+| 状态 | 含义 | 麦克风 |
+| --- | --- | --- |
+| `ready` | 待命，可以说下一句 | 视话筒开关 |
+| `calibrating` | 开头 500ms 采环境底噪 | 开 |
+| `listening` | 正在听；停口 10s 自动结束 | 开 |
+| `transcribing` | 录音已上传，等转写返回 | 关（半双工） |
+| `thinking` | 转写文本已排进主会话，等鲸鱼回复 | 关 |
+| `speaking` | **仅当朗读开关打开时存在**：浏览器语音合成正在念 | 关（半双工） |
+| `error` | 上一步失败，文案见 `error` 键 | 关 |
+
+**注意**：朗读默认关闭，此时**不存在 `speaking` 阶段**，`thinking` 之后直接回 `ready`。另外有两个**优先于 status** 的派生状态，由 `dockStatusKey` 决定文案：
+
+- `deviceoff` / `statusDeviceOff` —— 话筒关着（覆盖上面任何状态，因为此刻没有音频在处理）；
+- `muted` / `statusMuted` —— 话筒开着但静音（设备在跑，帧被丢弃）。
+
+`error`（带具体原因时）优先于这两者。
+
+#### 3. 控件语义（不要从样式反推）
+
+通话条是两个平面：上面的卡片（状态行、识别结果气泡、鲸鱼回复、隐私与朗读小字），下面的控制条 `(设置) ( 静音 | 光球=话筒 | 朗读 ) (挂断)`。
+
+| 控件 | `data-dw-control` / class | 语义 | 视觉 |
+| --- | --- | --- | --- |
+| 话筒 | `mic` / `.dw-ctl.dw-ctl-mic.dw-orb`，开时加 `.is-on` | **麦克风权限与设备**：开 = `getUserMedia` 拿流；关 = 停所有 track、关 AudioContext，系统指示灯灭 | 胶囊正中的光球；动效即通话状态（待命慢呼吸、正在听快呼吸 + 外扩波纹、处理中旋转光晕、朗读紫色律动、静音褪色、话筒关灰色 + 斜杠话筒、出错红色） |
+| 静音 | `mute` / `.dw-ctl.dw-ctl-mute`，静音时加 `.is-on` | **不处理数据**：设备仍在，但每帧直接丢弃，不进 VAD、不上传、不发送。话筒关着时 `disabled`，`title` 说明原因 | 光球左侧的话筒图标；静音时斜杠话筒 + 琥珀底 |
+| 朗读回复 | `.dw-toggle`，`aria-pressed` | 浏览器语音合成 **fallback**，**默认关**；不是真实 TTS | 光球右侧的喇叭图标；开时强调色底 |
+| 挂断 | `.dw-round.dw-hangup` | 释放设备、作废迟到的转写、收回独立窗口、结束通话 | 控制条右端的红色圆钮 |
+| 设置 | `.dw-round`（`GearGlyph`） | 打开 `settingsView` | 控制条左端的圆钮 |
+| 说完了 | `.dw-chip`（仅 `listening`/`calibrating` 出现） | 手动结束这句（仍受 1s / 500ms 最小值约束） | 状态行右侧的反色小胶囊 |
+| 处理中 | `.dw-busy`（`transcribing`/`thinking`/`speaking`） | 派生指示 | 状态行里三个跳动小点 |
+| 独立窗口 | `.dw-icon-button`（`DetachGlyph`） | 把通话条搬进 Document PiP / 弹窗；在小窗里同一个按钮是「收回窗口」 | 卡片右上角图标 |
+| 拖动 | `.dw-drag-handle`（**只有这一条是可拖区域**） | 拖拽把手，避免抢走控件的点击 | 卡片上方细条；悬停时变清晰 |
+
+图标按钮的可读名称放在 `aria-label` 和视觉隐藏的 `.dw-sr` 文本里，屏幕阅读器与测试都能读到当前状态。
+
+两个按钮的 `aria-pressed` 是**各自独立**的：`[话筒开, 静音关] = [true,false]`、`[话筒开, 静音开] = [true,true]`。把它们合成一个开关就是错的。
+
+#### 4. 现有实现假设过的尺寸与断点
+
+| 假设 | 值 | 出处 |
+| --- | --- | --- |
+| 通话条宽度 | `380px`（`max-width: calc(100vw - 32px)`）；宿主列本身 `pointer-events:none`，只有子元素接收点击 | `.dw-dock-host` |
+| 卡片高度 | 最高 `min(52vh, 440px)`，识别结果/回复区内部滚动 | `.dw-card` / `.dw-transcript` |
+| 默认位置 | 右下角，距右 20px、距底 `--dw-dock-bottom`（144px）：在会话页（含自律鲸鱼主会话）浮在底部输入框之上，发送按钮可点；新会话空白页的输入框居中，矮窗口下打开的通话条会压住它的右半部分（见「已知限制」）；拖动后改由 `--dw-dock-x/y` 定位 | `.dw-dock-host` |
+| 窄窗断点 | **≤768px**：左右边距收到 8px，宽度占满，卡片最高 42vh | `@media (max-width:768px)` |
+| 设置面板 | 与通话条同宽，最高 `min(600px, calc(100vh - var(--dw-dock-bottom) - 40px))`，内部滚动 | `.dw-settings` |
+| 配色 | 全部读宿主主题 token（`--dsw-alias-label-*`、`bg-layer-2`、`border-l2`、`interactive-bg-*`、`state-*`），经 `.dw-dock-host` 上的 `--dw-*` 一层转接，自动跟随明暗主题 | `dockStyles()` |
+| 拖动边距 / 吸附距离 | `margin: 16`、`snapDistance: 72`（逻辑参数，非样式） | `snapDockPosition` 调用处 |
+| 拖动位置表达 | 逻辑只写 `--dw-dock-x` / `--dw-dock-y` 两个**数字**，并置 `data-dw-dragged="true"`；由 CSS 决定锚哪条边、什么单位 | `onDragMove` + `.dw-dock-host[data-dw-dragged='true']` |
+| 独立窗口初始尺寸 | `400 × 340`（PiP）/ `400 × 360`（弹窗） | `detachDock()` |
+| 独立窗口内的外观 | 由 `body.dw-detached` 这一条 class 决定（隐藏把手、去固定定位、卡片撑满）；小窗没有宿主样式表，`dockStyles()` 在这里自带一份明/暗 token，`copyStylesInto` 照抄宿主 `<body>` 的 `data-ds-dark-theme` | `dockStyles()` |
+
+#### 5. 换外观只需改这几处
+
+**改 `dockStyles()` 一个函数（配色/圆角/阴影/间距/动效/布局）+ 需要改结构时改 `dockView()` / `settingsView()` 两个函数**——其余（状态机 `createCallControls`、帧闸口 `createFrameGate`、窗口能力 `detachCapability`、吸附 `snapDockPosition`、录音、转写、设置路由）都不用碰。
+
+两条硬约束，`test/dock.mjs` ok 11 会守住：
+
+1. **所有视觉规则只能在 `dockStyles()` 里**，逻辑分支不得写 `element.style.*` 的视觉属性；
+2. **几何通过 CSS 自定义属性传到样式层**（`--dw-dock-x/y` + `data-dw-dragged`），逻辑不直接写 `left/top/right/bottom`——所以换一套布局不会改坏拖动。
+
+`data-dw-control`、`data-dw-tts`、`data-dw-test`、`data-dw-source`、`data-dw-page`、`data-dw-dragged` 这些 data 属性是**行为接口**，换外观时保留它们，测试和控件语义都依赖它们；`.dw-*` class 属于外观层，可随皮肤调整（`dockStyles()` 里 ok 11 点名的几个除外）。
+
+### 静音判定参数（都在 `voice-silence.js`，`client.js` 镜像一份）
+
+| 常量 | 值 | 含义 |
+| --- | --- | --- |
+| `SILENCE_MS` | 10000 | 连续静音多久结束这句 |
+| `CALIBRATION_MS` | 500 | 开头采底噪的窗口 |
+| `NOISE_MARGIN` | 0.02 | 阈值 = 底噪 × 2 + 余量 |
+| `MIN_THRESHOLD` | 0.012 | 绝对下限，静音房间不会把阈值算成 0 |
+| `MIN_SPEECH_MS` | 500 | 有效语音不足这么多 → 不上传、不发送 |
+| `MIN_RECORDING_MS` | 1000 | 短于这个时长的手动结束直接丢弃 |
+| `MAX_RECORDING_MS` | 60000 | 上限兜底（服务端还有 120s / 25MB 的硬上限） |
+
+### 隐私（必须看得见）
+
+**音频会上传到 NUS SoCLaaS 云端转写服务**（OpenAI 兼容 `/v1/audio/transcriptions`，模型默认 `whisper-large-v3`，可在设置里改）。本地不落盘：录音只在浏览器内存里存在到上传结束，服务端转发后即丢弃，日志里不出现 key，也不出现完整音频。这条同时写在 UI 的浮层里和这里。
+
+未配置 key 时，`/voice/status` 返回 `configured: false`、`keySource: "none"`，通话按钮点下去会明确显示「服务端没有配置 SOCLAAS_API_KEY，语音识别不可用」，设置面板显示「还没有可用的 key」。**不会静默变灰**。
+
+### 已知限制
+
+- **回复的「一轮结束」是轮询近似**：客户端没有给插件提供回合结束回调，浮层读取 `ctx.sessions.binding(id).eventSource` 里的 `turn/end` / `assistant/message` 持久事件拿到**正文**（这是准的），但「什么时候去读」靠轮询会话 `running` 变 idle。极端情况下（工具回合结束但没有文本）会继续等下一轮，最长等到 `replyTimeoutMs`。
+- **朗读只有浏览器语音合成 fallback，真实 TTS 未接入**：默认关闭，打开后走 `speechSynthesis`，声音与可用性取决于设备（系统没装中文声音时可能念英文或直接失败）。它没有服务端凭据、配额、音色选择与并发控制，因此**不要**把它当作「已接入 TTS」。
+- **半双工不被朗读拖住**：朗读关闭（默认）时，回复到手后直接 `setPhase("ready")` 并重新开麦，**不 await 任何语音事件**；朗读开启时最多等到一个「有界」的结束信号（`onend` / `onerror` / 引擎拒绝 / 定时兜底，四者任一都会 settle）。两条路径都有 `test/client.mjs` ok 3a 看守。
+- **浏览器最小化后小窗不可见**：这是 Web 平台边界，不是实现缺陷；见上面「两层」表格。
+- **设置界面的 key 不显示、不回填**：这是有意的（服务端从不返回它）。要确认「存进去的是哪把」，只能靠「测试连接」的结果。
+- **通话条的默认位置为会话页让路**：会话页输入框贴底，通话条默认浮在它上方（距底 144px）；新会话空白页的输入框在屏幕中部，窗口较矮时（例如 800×600、手机竖屏）**打开的**通话条会盖住它的右半部分和发送按钮。把通话条拖开即可，拖动后的位置在本次页面生命周期内保持（拆成独立窗口再收回后回到默认位置）。一个固定位置无法同时避开这两种输入框；通话条锚在底部是为了卡片变高时控制条不跳动。
+- 麦克风权限、真实 10 秒静音、PiP 真窗口、拖动手感都只能在真浏览器里确认，见 `VERIFICATION.md` 的未验证清单（本轮新增的 12 条在 §14f）。
+
 ## 安装
 
 ```bash
@@ -117,7 +458,11 @@ $DSH_HOME/discipline-whale/home/                                    ← 主会�
 $DSH_HOME/discipline-whale/reports/<workspaceId>/<reportId>.json    ← 报告
 $DSH_HOME/discipline-whale/dispatches/<workerSessionId>.json        ← 派工检查点
 $DSH_HOME/discipline-whale/dispatches/<workerSessionId>.abandoned   ← 用户放弃的派工
+$DSH_HOME/discipline-whale/voice.json                               ← 语音设置（0600；仅在没有 Host 凭据面时存 key）
+$DSH_HOME/.credentials.yaml                                         ← Host 凭据面（0600；优先，由 dsh-credentials-local 写）
 ```
+
+`voice.json` 与 `.credentials.yaml` 都是 **0600**。仓库里**没有**、也**不许有** key：`.gitignore` 已经忽略 `.credentials*`，而 `voice.json` 只存在于数据目录。
 以后新增的状态（自动记忆、唤醒计划等）各占一个子目录。
 
 每个报告一个 JSON 文件，原子写入（temp + rename）。损坏的文件会被列表跳过，不会拖垮整个 listing。
@@ -130,9 +475,15 @@ $DSH_HOME/discipline-whale/dispatches/<workerSessionId>.abandoned   ← 用户�
 
 ```bash
 node test/contract.mjs
+node test/voice.mjs
+node test/client.mjs
+node test/dock.mjs
+node test/settings.mjs
+node test/guard.mjs
+node test/adhd.mjs
 ```
 
-19 项契约测试，用假 Host 分别挂载两半：
+28 项契约测试（编号 1–27，另加 15b），用假 Host 分别挂载两半；另有 `node test/voice.mjs` 16 项语音/端点测试、`node test/client.mjs` 9 项浏览器半边测试、`node test/dock.mjs` 11 项通话条控件/窗口/拖动/文案/接缝测试、`node test/settings.mjs` 10 项设置与密钥测试、`node test/guard.mjs` 10 项主会话刹车测试、`node test/adhd.mjs` 13 项输出纪律测试：
 
 1. 存储往返、长度截断、路径穿越防护
 2. 主会话行注册 7 个工具，schema 在受支持子集内（遍历注册表，未列入清单的工具会直接失败）
@@ -142,7 +493,7 @@ node test/contract.mjs
 6. `report_to_main` 存文档并投递到主会话
 7. 无 dispatch 的会话不能报告；空 summary、非法 status 被拒
 8. 静默 worker 被推回两次，第三次升级到主会话；已报告的 worker 不再被打扰
-9. `send_to_session` 投递新决策
+9. `send_to_session` 投递新决策（默认步边界 = `mode:"steer"`），空 message、非法 `at` 被拒
 10. 重启后 worker 从磁盘检查点恢复派工并完成回报
 11. 连检查点都没有时，报告落盘并标记 `orphaned`，绝不猜目标会话
 12. 出错/中断的回合照样写检查点，恢复后只催一次
@@ -154,8 +505,20 @@ node test/contract.mjs
 17. 已投递的派工不会被后续生命周期事件「复活」成第二个检查点
 18. home 目录被创建；连点两次也只新建、唤醒、记录一个主会话（`state.json`）
 19. 启动检查把中断的派工推给主会话；`resume_dispatch` 唤醒 worker 并改投回报，`abandon_dispatch` 清掉检查点并留下放弃标记，worker 看到标记后不再被催报
+20. 语音路由挂载在 home 行上，`say` 只投给记录在案的主会话（请求体里的 `sessionId` 被忽略）
+21. `send_to_session` 的三种时机：`queue` 等回合、`at:"step"`（默认）落步边界且**不**中止、`at:"abort"` 才中止；冷会话中止失败也不谎报
+22. 同一话题续接同一会话（`reused`）、已 reported 不复用、`writes` 重叠被拒、不相交才允许并行
+23. **persona 纪律真的进了 system prompt**：按 Host 的方式（`dsh-system-prompt` + `dsh-scope` 里的 `dsh-persona` 行）组装出主会话 prompt，断言读预算自检句、插话段、诚实边界段都在，并断言**没有**把插话说成瞬时（`不是「立刻」`、`上下文不丢`、`最后手段`）；同一段文本**不进** worker preset
+24. **三道刹车真的挂上了**：走真实的 `main.apply(ctx, config)` 路径，断言 `tools/pre-execute` 门禁与两条回话信号都已注册、`Config` 里的阈值原样传到 guard（配 3 就按 3 拒绝，不是默认 10）、未知字段被丢掉；同一个门禁下 worker 会话连读 20 个源码文件不受影响
+25. **时机语义钉在 Host 源码上**：`steer` 落 `next-step`、`claim` 每个步边界都清空它、turn 循环首步后切 target —— 直接对 Host 源码断言；并断言 `prompt.mode` 只有 `queue`/`steer`、本插件默认 `step`。Host 升级改了语义，这条会红
+26. **纯 `steer` 路径全程不 cancel**：默认与显式 `at:"step"` 都走 `mode:"steer"` 且 `cancel` 调用数为 0；`queue` 也不 cancel；只有 `at:"abort"` 调一次 cancel；`dispatch_task` 复用默认同样不 cancel。step 路径上只要出现 `cancel`，这条就红
+27. **输出纪律只声明在主 preset**：直接对真实 `cordis.patch.yml` 断言 `discipline-whale/adhd` 行存在于 `preset-discipline-whale`、且**不在** `preset-discipline-whale-worker`；并断言全文件里只有**一个** preset 拥有这行（防止日后复制粘贴到 worker）
 
 假 `prompt` **故意模仿真实实现**，会解引用 `signal` —— 这条强化曾抓出三个真实缺陷（信号未传、`exec` 参数缺失、dispatch 未标记已报）。
+
+`node test/guard.mjs` 单独覆盖三道刹车（10 组）：白名单与看门狗口径的纯函数判定、第 11 次读被配额拒绝且拒绝文案含额度与「去派工」、回话刷新配额（且思考不算回话）、连续 10 次静默调用触发硬停+注入+配额重置、介入预算用尽后不再无限干预并只告知一次、home 全开/公用文档放行/源码与 `../` 被拒、符号链接按真实目标判定、**连续 12 次渲染不触发硬停**（防「正常交付被误判成埋头调研」）、以及**用真实 `cordis` + `dsh-scope` 包**搭出与 Host 相同的作用域图，证明 preset 里的监听器确实收得到 `agent/assistant-stream`、并证明 `session/event` 收不到（这就是实现不监听它的原因）。
+
+`node test/adhd.mjs` 单独覆盖输出纪律（13 组）：`isUiTurn` 的豁免表（`render_ui`/`render_canvas`/`render_scene`/`render_mechanism` 豁免，`render_text` 和纯文字不豁免）、`shouldEnforceBrevity` 的「刚好等于上限算合规 / 超出报告 overBy / UI 轮豁免 / `enabled:false` 关闭」、`resolveBrevityConfig` 的具名默认值与**非法值回落**（负数、小数、字符串、`NaN`、`Infinity` 都不抛错）、规则文件是 prompt 段与 skill 的**同一来源**、`countTextInArgs` 让 `render_text` 里的文字照算、**组装出的主会话 prompt 含规则而 worker prompt 不含**、**用真实 `dsh-skill` registry 证明 skill 只落进主 preset 的 scope**（主会话看得到、worker 和 host 平面都看不到）、**worker 会话触发事件时被直接放行且不建计数器**、超长正文在下一个步边界最多注入一次且带归属标记、`render_text` 不买豁免、knobs 生效、`tools/pre-execute` **永远放行**（不与 guard 抢刹车）、以及 `main.apply` 真的挂上了两套独立监听器并把 knobs 透传过 `Config`。
 
 ## 真实端到端验证
 
@@ -173,6 +536,11 @@ node test/contract.mjs
 - **主会话只读 + UI**。主会话 preset 里 `tool-fs` 是 `read: true, readImage: true, write: false, edit: false`，并且 `tool-bash` / `tool-pwsh` / `tool-jobs` 三行都被禁用 —— 没有 shell，就没有 bash 重定向、`tee`、`sed -i` 这类绕道写文件的路子。`tool-jobs` 一并关掉，是因为主会话既没有 shell、也没有挂 `tool-terminal` / `tool-workflow`，自己造不出后台任务，`job_*` 只剩空列表（任务注册表本身仍在 Host 层，不受影响）。因此主会话**不能写总结文档**，也不能把文档落盘：它的产出只有对话正文和 UI 渲染。如果确实需要主会话落盘一份总结，得单独给 `write` 开例外（本包没有加）。
 - **这些改动都要重启才生效，且没有在运行中的进程里验证过**。preset 行不受 HMR 管理；改动 `cordis.patch.yml` 后需重启 `dsh web`，**新建的**会话才会拿到新的工具面（已存在的会话仍用旧组合）。
   能验证到什么程度：用 `dsh --profile web --dump-config` 核对过**组合后的配置树**确实包含 `dsh-session-kit: disabled: true`、`write: false` / `edit: false`、`tool-bash` / `tool-pwsh` / `tool-jobs` 全部 `disabled: true`（输出见 [`VERIFICATION.md`](./VERIFICATION.md)）。这只是「配置写对了」，**不等于**「重启后实测生效」——实际工具面要重启一次、新建两个 preset 的会话各看一眼才能确认。这一步本包没有做，别把它当已验证。
+- **输出纪律（`adhd.js`）不能强制简洁，只能约束下一步**。DSH 没有「在文本发出去之前改写/截断它」的接口：等 hook 跑到时，那段话用户已经看过了。所以本模块能给的是 ①常驻 prompt section（软约束，真正承重的那一半）②超长时在**下一个步边界**注入一次纠正。它缩短的是下一步，不是这一步。别把它宣传成「强制简洁」。另外两条边界：**豁免判定是轮级的**（一轮里渲染过 UI，整轮正文都不计量，代价是可能漏掉一段啰唆说明；换来的是不误伤正常交付物）；**`render_text` 不豁免**，用它是绕不过去的。
+- **输出纪律同样要重启，且已存在的主会话仍用旧组合**。`discipline-whale-brevity` 是 preset 行，preset 在**会话创建时**装配；改完 `cordis.patch.yml` 需重启 `dsh web` 并**新建**主会话，已开着的会话不会中途换上这套规则。本轮**没有**重启用户正在跑的进程。
+- **persona 改动同样要重启，且已存在的主会话仍用旧 prompt**。persona 是 preset 行的一部分，preset 在**会话创建时**装配进 system prompt：改完 `cordis.patch.yml` 后必须重启 `dsh web`，并且**新建**一个主会话（或换用新会话）才会拿到新纪律；已经开着的那个主会话不会中途换人格。验证只做到「组合后的配置树里有这段文本」和「按 Host 的组装方式渲染出的 system prompt 包含这段文本」（`node prompt-probe.mjs discipline-whale`、契约测试 ok 23），**没有**在真机上断言模型的派工行为是否改变——那需要 A/B 观察，本包不做这个声明。
+- **为什么输出纪律没做成第二个 `dsh-persona` 行**。更「干净」的想法是单独注册一个 persona 行、可独立开关。实测不行：同一个 preset 里两行 `dsh-persona` 都要注册 `deployment:persona-prefix` 这个 section，第二行会以 `prompt section "deployment:persona-prefix" is already registered in this scope` 直接让整个 preset 装载失败。所以改用**独立命名的 prompt section**（`discipline-whale:brevity`），紧跟在 persona 之后——同样可独立识别、可独立移除，也不会和 persona 抢槽位。
+- **不用「每轮注入一条提醒」的替代方案**。Host 有 `agent/pre-step` 钩子可以在每个 step 往上下文里插消息（`dsh-time-context` 就是这么做的），但那样每轮都会往**对话历史**里写一条 `user/message`：用户可见、会被压缩、会干扰正常讨论，还得按会话 id 过滤才知道是不是主会话。persona 是每个请求重新组装的 system section，天然只对主会话生效、不进对话正文、不占用户消息位。所以选了 persona。
 
 ## 命名冲突核查
 
@@ -180,4 +548,11 @@ node test/contract.mjs
 
 ## License
 
-MIT
+MIT（本包）。
+
+本包的输出纪律（`adhd.js` + `skills/whale-brevity/SKILL.md`）改造自 [ayghri/i-have-adhd](https://github.com/ayghri/i-have-adhd)，该上游项目同样是 **MIT** 许可：
+
+> MIT License
+> Copyright (c) 2026 Ayoub Ghriss
+
+上游的规则正文按本包口径**重写**（新增「UI 交付物豁免」一节，调整了规则编号与措辞，删掉了上游 `SessionStart` hook 的 opt-in 文件开关），保留了它的核心诊断与规则骨架，并保留 `SKILL.md` frontmatter 里的 `upstream` / `upstream-license` / `upstream-copyright` 三项署名。按 MIT 要求，原文版权声明与许可声明继续保留在此处；本包整体仍以 MIT 发布。

@@ -21,6 +21,8 @@ import {
   writeDispatchCheckpoint,
 } from './checkpoint.js'
 import { dispatchForWorker, listDispatches, recordDispatch } from './registry.js'
+import { installGuard, resolveGuardConfig } from './guard.js'
+import { installBrevity } from './adhd.js'
 import { isReportId, listReports, readReport, storeRoot } from './store.js'
 
 /**
@@ -68,6 +70,86 @@ export function resolveWorkspace(registry, selector) {
   throw new Error(
     `no registered workspace matches "${selector}"; registered workspaces:\n- ${all.map(describeWorkspace).join('\n- ')}`,
   )
+}
+
+/* ------------------------------------------------------------------ *
+ * continuation routing
+ * ------------------------------------------------------------------ */
+
+/**
+ * Canonical form of a work-thread name, or `undefined` when there is none.
+ *
+ * Case and inner whitespace are folded because "Voice-Input", "voice-input "
+ * and "voice  input" are the same thread to a human, and a routing rule that
+ * disagrees with a human's reading would either duplicate Sessions or merge
+ * unrelated ones. Nothing else is normalised: the topic stays an opaque label,
+ * so the rule needs no per-project knowledge.
+ */
+function normalizeTopic(value) {
+  if (typeof value !== 'string') return undefined
+  const collapsed = value.trim().replace(/\s+/g, ' ').toLowerCase()
+  return collapsed === '' ? undefined : collapsed
+}
+
+/** Canonical workspace-relative write prefixes; blank entries are dropped. */
+function normalizeWrites(value) {
+  if (!Array.isArray(value)) return []
+  return [...new Set(value
+    .filter((entry) => typeof entry === 'string')
+    .map((entry) => entry.trim().replace(/\/+$/, ''))
+    .filter((entry) => entry !== ''))]
+}
+
+/** Whether two workspace-relative path prefixes cover a common file. */
+function prefixesOverlap(a, b) {
+  // Prefix equality is covered by the prefixes() test both ways; comparing the
+  // strings first keeps the common identical case obvious.
+  if (a === b) return true
+  return a.startsWith(`${b}/`) || b.startsWith(`${a}/`)
+}
+
+/** Whether one dispatch is still able to take more work. */
+function isLive(record) {
+  return record.status !== 'reported' && record.status !== 'abandoned'
+}
+
+/**
+ * The Session that should continue instead of a new one being created.
+ *
+ * Decidable, not a judgement call: same workspace, same normalised topic, and
+ * still live (never reported, never abandoned). A reported Session is finished
+ * work — the user asking for more is a new piece of work, so it starts fresh.
+ * Without a topic there is nothing to compare, so nothing is reused.
+ */
+function findReusableDispatch(workspace, topic) {
+  if (topic === undefined) return undefined
+  const workspaceId = String(workspace.id)
+  return listDispatches().find(
+    (record) =>
+      record.workspaceId === workspaceId && record.topic === topic && isLive(record),
+  )
+}
+
+/**
+ * The live dispatch whose declared write scope overlaps `writes`, if any.
+ *
+ * This is the guard that keeps two Sessions from editing one tree. Scoped to a
+ * workspace on purpose: two workspaces are two checkouts, and a path prefix in
+ * one says nothing about the other. A dispatch that declared no scope cannot be
+ * proven disjoint, so it is treated as disjoint — the rule only fires on
+ * declared overlaps, and claiming more than that would refuse work for a reason
+ * the caller never supplied.
+ */
+function findWriteClash(workspace, writes) {
+  if (writes.length === 0) return undefined
+  const workspaceId = String(workspace.id)
+  for (const record of listDispatches()) {
+    if (record.workspaceId !== workspaceId || !isLive(record)) continue
+    const declared = Array.isArray(record.writes) ? record.writes : []
+    if (!declared.some((prefix) => writes.some((mine) => prefixesOverlap(prefix, mine)))) continue
+    return record
+  }
+  return undefined
 }
 
 /* ------------------------------------------------------------------ *
@@ -196,13 +278,30 @@ function dispatchTaskTool(ctx, config) {
           type: 'string',
           description: 'Optional worker Session title shown in the Session List (max 120 chars).',
         },
+        topic: {
+          type: 'string',
+          description:
+            'Stable name for the thread of work, e.g. "voice-input". Two dispatches in one workspace with the same topic (compared case-insensitively, whitespace collapsed) are the same job: the second continues the first Session instead of creating one. Omit it and every dispatch is a new Session.',
+        },
+        at: {
+          type: 'string',
+          enum: DELIVERY_TIMINGS,
+          description:
+            'When to deliver when this continues a live dispatch. "step" (default): at the next step boundary of the current turn — the in-flight tool call finishes, then the worker re-plans with this work and keeps its context. "queue": after the turn ends. "abort": cancel the running turn first (last resort). Ignored when a new Session is created.',
+        },
+        writes: {
+          type: 'array',
+          items: { type: 'string' },
+          description:
+            'Workspace-relative path prefixes this task will modify (e.g. ["src/voice"]). Declare it so a second concurrent dispatch in the same workspace is refused when its prefixes overlap: two Sessions editing one tree is what this check exists to prevent.',
+        },
       },
     },
     output: {
       schema: {
         type: 'object',
         additionalProperties: false,
-        required: ['dispatchId', 'workerSessionId', 'workspaceId', 'workspaceTitle', 'status'],
+        required: ['dispatchId', 'workerSessionId', 'workspaceId', 'workspaceTitle', 'status', 'reused'],
         properties: {
           dispatchId: { type: 'string' },
           workerSessionId: { type: 'string' },
@@ -210,8 +309,12 @@ function dispatchTaskTool(ctx, config) {
           workspaceTitle: { type: 'string' },
           status: {
             type: 'string',
-            enum: ['dispatched', 'dispatch-prompt-failed'],
+            enum: ['dispatched', 'dispatch-prompt-failed', 'reused'],
           },
+          /** True when this continued an existing Session instead of creating one. */
+          reused: { type: 'boolean' },
+          /** Timing actually honoured when this continued an existing Session. */
+          deliveredAs: { type: 'string', enum: DELIVERY_TIMINGS },
           title: { type: 'string' },
           warnings: { type: 'array', items: { type: 'string' } },
         },
@@ -230,9 +333,54 @@ function dispatchTaskTool(ctx, config) {
       if (title !== undefined && title.length > 120) {
         throw new Error('`title` is longer than 120 characters')
       }
+      const timing = resolveTiming(args.at)
+      const topic = normalizeTopic(args.topic)
+      if (args.topic !== undefined && topic === undefined) {
+        throw new Error('`topic` must be a non-empty string when given')
+      }
+      const writes = normalizeWrites(args.writes)
 
       const workspace = await resolveWorkspace(ctx.workspaceRegistry, args.workspace)
       const warnings = []
+
+      // Route before creating: a live Session on the same thread of work is
+      // continued, never duplicated. Two Sessions on one topic in one
+      // workspace is exactly the conflict this rule prevents.
+      const live = findReusableDispatch(workspace, topic)
+      if (live !== undefined) {
+        const delivered = await deliverInstruction(ctx, exec, live.workerSessionId, task, timing)
+        live.status = live.status ?? 'running'
+        // Keep the checkpoint's routing facts fresh even though the Session did
+        // not change: the brief that now matters is this one.
+        try {
+          await writeDispatchCheckpoint(storeRoot(), live.workerSessionId, live)
+        } catch (error) {
+          warnings.push(`the dispatch record could not be refreshed on disk: ${String(error?.message ?? error)}`)
+        }
+        return {
+          dispatchId: live.dispatchId,
+          workerSessionId: live.workerSessionId,
+          workspaceId: live.workspaceId,
+          workspaceTitle: live.workspaceTitle,
+          status: 'reused',
+          reused: true,
+          deliveredAs: delivered.delivered,
+          warnings,
+        }
+      }
+
+      // A new Session may still collide with a different thread writing the
+      // same tree. Refuse that loudly instead of letting the two fight.
+      const clash = findWriteClash(workspace, writes)
+      if (clash !== undefined) {
+        throw new Error(
+          `write scope overlap in workspace "${workspace.title}": this dispatch declares ` +
+            `${JSON.stringify(writes)} and worker ${clash.workerSessionId} (dispatch ${clash.dispatchId}, ` +
+            `topic "${clash.topic ?? '(none)'}") already declared ${JSON.stringify(clash.writes)}. ` +
+            'Two Session in one workspace must not edit the same files. Continue that Session with ' +
+            'send_to_session, give this one a disjoint `writes` scope, or wait for its report.',
+        )
+      }
 
       const created = await ctx.sessionController.create({
         workspaceId: workspace.id,
@@ -272,6 +420,11 @@ function dispatchTaskTool(ctx, config) {
         workspaceTitle: workspace.title,
         task,
         startedAt: new Date().toISOString(),
+        // Routing facts for the continuation rule. `topic` is what makes "the
+        // same job" decidable rather than a judgement call; `writes` is what
+        // keeps two live Sessions out of one tree.
+        ...(topic === undefined ? {} : { topic }),
+        ...(writes.length === 0 ? {} : { writes }),
       })
 
       // Persist the routing facts now, to the same file the worker half reads.
@@ -335,6 +488,7 @@ function dispatchTaskTool(ctx, config) {
         workspaceId: String(workspace.id),
         workspaceTitle: workspace.title,
         status,
+        reused: false,
         ...(appliedTitle === undefined ? {} : { title: appliedTitle }),
         ...(warnings.length === 0 ? {} : { warnings }),
       }
@@ -398,11 +552,87 @@ function readReportTool(ctx) {
   }
 }
 
+/**
+ * The three delivery timings, named so a caller cannot confuse them.
+ *
+ *   queue  — admitted after the current TURN ends (`followup` -> inbox
+ *            `next-turn`). The worker finishes everything it planned first.
+ *   step   — admitted at the next STEP boundary, inside the SAME turn (`steer`
+ *            -> inbox `next-step`). The in-flight tool call finishes normally,
+ *            then the worker re-plans with the instruction and keeps its whole
+ *            context. This is "Interrupt" in the user's sense.
+ *   abort  — the running turn's AbortSignal is cancelled before the instruction
+ *            is steered in. Last resort: it stops a tool call mid-flight and can
+ *            leave half-written work.
+ */
+export const DELIVERY_TIMINGS = ['queue', 'step', 'abort']
+
+/** Resolve the delivery timing; an omitted `at` means the step boundary. */
+export function resolveTiming(at) {
+  if (at === undefined) return 'step'
+  if (!DELIVERY_TIMINGS.includes(at)) {
+    throw new Error(`\`at\` must be one of ${DELIVERY_TIMINGS.join(' / ')}`)
+  }
+  return at
+}
+
+/**
+ * Deliver one instruction into a Session at the requested timing.
+ *
+ * The Host facts this rests on (verified in VERIFICATION.md section 11):
+ *
+ *   * `sessionController.prompt({ mode })` accepts exactly `queue` and `steer`
+ *     (`@deepseek-ai/dsh-api-session-controller` lib/typert.host.js:1795). There
+ *     is no `interrupt` mode; the timing is composed here.
+ *   * `followup` -> inbox `next-turn`, `steer` -> inbox `next-step`
+ *     (`dsh-agent-loop` lib/index.js:806-811).
+ *   * The turn loop opens with `target = "next-turn"` and switches to
+ *     `"next-step"` after its first step (`lib/index.js:951`, `1008`); `claim`
+ *     drains `next-step` at EVERY step boundary but drains `next-turn` only for
+ *     the `"next-turn"` target (`lib/index.js:103-105`). A `steer` is therefore
+ *     visible at the next step of the current turn: the step-boundary insert,
+ *     with no abort needed.
+ *   * To abort first: `sessionController.cancel` aborts the live turn while
+ *     keeping the inbox (`dsh-api-session-controller` lib/types/commands.js:466-475
+ *     -> `dsh-agent-loop` lib/index.js:815-821). A cold Session raises
+ *     `session/not-found`, which is not a failure: there is no turn to abort.
+ *
+ * @returns the timing honoured and whether a running turn was aborted.
+ */
+async function deliverInstruction(ctx, exec, sessionId, message, timing) {
+  let aborted = false
+  if (timing === 'abort') {
+    try {
+      await ctx.sessionController.cancel({ sessionId })
+      aborted = true
+    } catch (error) {
+      ctx.logger?.warn?.(
+        `discipline-whale: could not abort ${sessionId} (${String(error?.message ?? error)}); ` +
+          'the instruction is still delivered at the step boundary',
+      )
+    }
+  }
+  // `signal` is a required parameter of session/prompt: the controller calls
+  // signal.throwIfAborted() before admitting anything.
+  await ctx.sessionController.prompt(
+    {
+      requestId: randomUUID(),
+      sessionId,
+      // `queue` waits for the turn to end; `step` and `abort` both target the
+      // step inbox, which is what makes the instruction land inside the turn.
+      mode: timing === 'queue' ? 'queue' : 'steer',
+      content: [{ type: 'text', text: message }],
+    },
+    signalOf(exec),
+  )
+  return { sessionId, accepted: true, delivered: timing, aborted }
+}
+
 function sendToSessionTool(ctx) {
   return {
     name: 'send_to_session',
     description:
-      'Send a new instruction to an existing Session and wake it. Use it to hand a running worker a changed decision, or to reopen finished work with a follow-up. The message is durable and queued like a user turn.',
+      'Send a new instruction to an existing Session and wake it. Default `at: "step"` inserts the message at the next step boundary of the SAME turn: the in-flight tool call finishes, then the worker re-plans with your instruction while keeping everything it has read. Use `at: "queue"` to wait for the whole turn to end, and `at: "abort"` only when the worker is actively writing the wrong thing and must be stopped mid-call.',
     parameters: {
       type: 'object',
       additionalProperties: false,
@@ -413,16 +643,26 @@ function sendToSessionTool(ctx) {
           description: 'Target Session id, usually a worker session id from dispatch_task.',
         },
         message: { type: 'string', description: 'The instruction to deliver.' },
+        at: {
+          type: 'string',
+          enum: DELIVERY_TIMINGS,
+          description:
+            'When the instruction takes effect. "step" (default): at the next step boundary inside the current turn — not instant, it waits for the in-flight tool call to finish. "queue": after the current turn ends. "abort": cancel the running turn first (last resort; can leave half-written work).',
+        },
       },
     },
     output: {
       schema: {
         type: 'object',
         additionalProperties: false,
-        required: ['sessionId', 'accepted'],
+        required: ['sessionId', 'accepted', 'delivered', 'aborted'],
         properties: {
           sessionId: { type: 'string' },
           accepted: { type: 'boolean' },
+          /** Which timing was honoured: the inbox target this instruction went to. */
+          delivered: { type: 'string', enum: DELIVERY_TIMINGS },
+          /** True only when a running turn was actually aborted first. */
+          aborted: { type: 'boolean' },
         },
       },
       render: (_args, value) => [{ type: 'text', text: JSON.stringify(value, null, 2) }],
@@ -436,18 +676,8 @@ function sendToSessionTool(ctx) {
         throw new Error('`session_id` is required')
       }
       const sessionId = String(args.session_id)
-      // `signal` is a required parameter of session/prompt: the controller calls
-      // signal.throwIfAborted() before admitting anything.
-      await ctx.sessionController.prompt(
-        {
-          requestId: randomUUID(),
-          sessionId,
-          mode: 'queue',
-          content: [{ type: 'text', text: message }],
-        },
-        signalOf(exec),
-      )
-      return { sessionId, accepted: true }
+      const timing = resolveTiming(args.at)
+      return deliverInstruction(ctx, exec, sessionId, message, timing)
     },
   }
 }
@@ -841,7 +1071,22 @@ export const Config = {
       if (typeof workerPreset !== 'string' || workerPreset === '') {
         return { issues: [{ message: 'workerPreset must be a non-empty string', path: ['workerPreset'] }] }
       }
-      return { value: { workerPreset } }
+      // The guard knobs are validated where they are used (`resolveGuardConfig`
+      // falls back on any invalid value), so this schema only has to carry them
+      // through instead of dropping them: a row config that silently discarded
+      // `readQuota` would look wired and do nothing.
+      const guard = {}
+      for (const key of ['watchdogThreshold', 'readQuota', 'maxInterventions', 'watchdogCounting']) {
+        if (input[key] !== undefined) guard[key] = input[key]
+      }
+      // The brevity knobs (adhd.js) follow the same rule: carried through, then
+      // validated where they are used. `0` and `false` are real values, so the
+      // test is `!== undefined`, never truthiness.
+      const brevity = {}
+      for (const key of ['maxProseChars', 'maxCorrections', 'enabled']) {
+        if (input[key] !== undefined) brevity[key] = input[key]
+      }
+      return { value: { workerPreset, ...guard, ...brevity } }
     },
   },
 }
@@ -861,4 +1106,16 @@ export function apply(ctx, config = {}) {
   ctx.effect(() => ctx.tools.register(listDispatchesTool(ctx)))
   ctx.effect(() => ctx.tools.register(resumeDispatchTool(ctx)))
   ctx.effect(() => ctx.tools.register(abandonDispatchTool()))
+
+  // The three main-session brakes live in guard.js: the silent-tool-call
+  // watchdog, the per-reply read quota, and the read-path whitelist. Their whole
+  // surface is read by `resolveGuardConfig`; installing them is one call so this
+  // row stays a tool registry and nothing else.
+  installGuard(ctx, resolveGuardConfig(config))
+
+  // The output discipline lives in adhd.js: the ADHD ruleset as prompt text, a
+  // next-step correction for over-long prose, and a UI-deliverable exemption.
+  // Separate module, separate listeners: the guard counts *reads*, this counts
+  // *characters*, and neither may gate the other.
+  installBrevity(ctx, config)
 }

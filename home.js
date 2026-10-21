@@ -35,6 +35,8 @@ import { join } from 'node:path'
 
 import { listDispatchCheckpoints } from './checkpoint.js'
 import { dataDir, storeRoot, whaleHomeDir } from './store.js'
+import { registerVoiceRoutes } from './voice.js'
+import { registerVoiceSettingsRoutes } from './voice-settings.js'
 
 /** Route the Web sidebar entry reads and writes. */
 export const HOME_ROUTE = '/api/discipline-whale/home'
@@ -175,10 +177,30 @@ export function apply(ctx) {
   ensureHome().catch((error) => {
     ctx.logger?.warn?.(`discipline-whale: could not create the whale home: ${error?.message ?? error}`)
   })
-  // Only the Web server carries the route; headless and SDK profiles skip it.
+  // Only the Web server carries the routes; headless and SDK profiles skip them.
   ctx.inject(['sessionController', 'connection', 'webServer'], (c) => {
     startupCheck(c.sessionController).catch((error) => {
       ctx.logger?.warn?.(`discipline-whale: startup check failed: ${error?.message ?? error}`)
+    })
+    // The Host's credential seam, when this composition mounts one. It is
+    // optional on purpose: a minimal profile has no credential store, and voice
+    // must still work off the 0600 plugin file and the environment there.
+    // `ctx.get` never throws for a missing service, so this is a plain read.
+    const credentials = typeof ctx.get === 'function' ? ctx.get('credentials') : undefined
+    // Voice rides this same connection: transcription on one route, the
+    // transcript queued into the recorded main session on another, and the
+    // settings pair (read/write the key-free description, probe the backend).
+    // The say route owns the only `sessionController.prompt` call voice can
+    // reach, so a page script cannot address an arbitrary session with it.
+    registerVoiceRoutes(c.connection, {
+      logger: ctx.logger,
+      credentials,
+      say: { sessionController: c.sessionController, readState: () => readState() },
+    }).catch((error) => {
+      ctx.logger?.warn?.(`discipline-whale: could not register the voice routes: ${error?.message ?? error}`)
+    })
+    registerVoiceSettingsRoutes(c.connection, { logger: ctx.logger, credentials }).catch((error) => {
+      ctx.logger?.warn?.(`discipline-whale: could not register the voice settings routes: ${error?.message ?? error}`)
     })
     return c.connection.fetch.register({
       path: HOME_ROUTE,

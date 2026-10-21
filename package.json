@@ -1,6 +1,6 @@
 {
   "name": "discipline-whale",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Discipline Whale for DeepSeek Harness: one main conversation routes work into workspaces, workers report back as pushed messages, and a turn-end check makes the report contract real.",
   "license": "MIT",
   "author": "huiyuanXP",
@@ -13,27 +13,40 @@
     "./home": "./home.js",
     "./store": "./store.js",
     "./registry": "./registry.js",
+    "./guard": "./guard.js",
+    "./adhd": "./adhd.js",
     "./locale/*.json": "./locale/*.json",
     "./icon": "./icon.svg",
     "./package.json": "./package.json",
     "./checkpoint": "./checkpoint.js",
-    "./client": "./client.js"
+    "./client": "./client.js",
+    "./voice": "./voice.js",
+    "./voice-silence": "./voice-silence.js",
+    "./prompt-probe": "./prompt-probe.mjs",
+    "./voice-settings": "./voice-settings.js"
   },
   "files": [
     "main.js",
     "worker.js",
     "home.js",
     "client.js",
+    "voice.js",
+    "voice-settings.js",
+    "voice-silence.js",
     "store.js",
     "checkpoint.js",
     "registry.js",
+    "guard.js",
+    "adhd.js",
     "cordis.patch.yml",
     "locale/*.json",
     "icon.svg",
     "README.md",
     "VERIFICATION.md",
     "LICENSE",
-    "test/*.mjs"
+    "prompt-probe.mjs",
+    "test/*.mjs",
+    "skills/**/*.md"
   ],
   "keywords": [
     "dsh",
@@ -57,7 +70,14 @@
   },
   "scripts": {
     "test": "node test/contract.mjs",
-    "test:smoke": "node test/smoke-restart.mjs"
+    "test:voice": "node test/voice.mjs",
+    "test:client": "node test/client.mjs",
+    "test:guard": "node test/guard.mjs",
+    "test:all": "node test/contract.mjs && node test/guard.mjs && node test/adhd.mjs && node test/voice.mjs && node test/client.mjs && node test/dock.mjs && node test/settings.mjs",
+    "test:smoke": "node test/smoke-restart.mjs",
+    "test:dock": "node test/dock.mjs",
+    "test:settings": "node test/settings.mjs",
+    "test:adhd": "node test/adhd.mjs"
   },
   "dsh": {
     "bundle": {

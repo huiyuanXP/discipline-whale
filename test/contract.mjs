@@ -22,11 +22,25 @@ import { mkdtemp, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
+/**
+ * The Host installation the contract tests read along with. The paths below are
+ * the same installation `dsh-tools` is imported from, so a checkout or npx cache
+ * move keeps the whole suite pointed at one Host.
+ */
+const DSH_MODULES = process.env.DSH_INSTALL
+  ?? '/Users/huiyuan/.npm/_npx/b86ed90107c62dab/node_modules'
+
 import {
   assertSupportedJsonSchema,
   validateJsonSchemaValue,
 } from '/Users/huiyuan/.npm/_npx/b86ed90107c62dab/node_modules/@deepseek-ai/dsh-tools/lib/index.js'
 
+import {
+  VOICE_ROUTE,
+  VOICE_SAY_ROUTE,
+  VOICE_STATUS_ROUTE,
+} from '../voice.js'
+import { VOICE_SETTINGS_ROUTE, VOICE_TEST_ROUTE } from '../voice-settings.js'
 import {
   isDispatchAbandoned,
   listDispatchCheckpoints,
@@ -36,6 +50,7 @@ import {
 } from '../checkpoint.js'
 import { HOME_ROUTE, MAIN_PRESET, MAIN_TITLE, WAKE_PROMPT, ensureHome, homeHandler, interruptedNotice, readState, startupCheck } from '../home.js'
 import * as mainRow from '../main.js'
+import { DELIVERY_TIMINGS, resolveTiming } from '../main.js'
 import { RESUME_BRIEF } from '../main.js'
 import * as workerRow from '../worker.js'
 import { resetRegistry } from '../registry.js'
@@ -72,7 +87,7 @@ let sessionSeq = 0
 /** Mount one row against a fresh fake Host and capture what it registers. */
 function mount(row, config = {}) {
   const tools = new Map()
-  const calls = { create: [], rename: [], prompt: [] }
+  const calls = { create: [], rename: [], prompt: [], cancel: [] }
   const listeners = new Map()
 
   const ctx = {
@@ -100,6 +115,11 @@ function mount(row, config = {}) {
       prompt: async (request, signal) => {
         signal.throwIfAborted()
         calls.prompt.push(request)
+        return { accepted: true }
+      },
+      // Mirrors the Host: cancel aborts the active turn and keeps the inbox.
+      cancel: async (request) => {
+        calls.cancel.push(request)
         return { accepted: true }
       },
     },
@@ -386,14 +406,24 @@ const execAs = (sessionId) => ({ agent: { session: { id: sessionId } } })
     execAs('main-1'),
   )
   assert.equal(value.accepted, true)
+  assert.equal(value.delivered, 'step', 'a new decision defaults to the step boundary')
+  assert.equal(value.aborted, false)
+  // The default is the PLAIN steer path: it must reach `next-step` without
+  // touching cancel. `aborted` being false is not enough on its own — a future
+  // refactor could cancel and still report false.
+  assert.equal(calls.cancel.length, 0, 'the default decision must not abort the running turn')
   assert.equal(calls.prompt.at(-1).sessionId, 'worker-9')
-  assert.equal(calls.prompt.at(-1).mode, 'queue', 'a new decision must wake the worker')
+  assert.equal(calls.prompt.at(-1).mode, 'steer', 'step delivery uses the steer inbox target')
   assert.match(calls.prompt.at(-1).content[0].text, /use Postgres/)
   await assert.rejects(
     () => run(tools, 'send_to_session', { session_id: 'w', message: '  ' }, execAs('m')),
     /`message` is empty/,
   )
-  console.log('ok 9 — send_to_session delivers a new decision to an existing session')
+  await assert.rejects(
+    () => run(tools, 'send_to_session', { session_id: 'w', message: 'x', at: 'later' }, execAs('m')),
+    /`at` must be one of/,
+  )
+  console.log('ok 9 — send_to_session delivers a new decision at the step boundary by default')
 }
 
 
@@ -1135,6 +1165,618 @@ const checkpointPath = (workerSessionId) =>
   assert.equal(workerMount.calls.prompt.length, 0, 'abandoning never escalates to the main session')
   assert.equal(await readDispatchCheckpoint(home, 'worker-early'), undefined, 'the checkpoint stays gone')
   console.log('ok 19 — interrupted dispatches are reported at startup and can be resumed or abandoned')
+}
+
+// --- 20. the voice routes ride the same connection ------------------------
+
+{
+  // The home row is the only row that holds connection + sessionController, so
+  // it also owns the voice routes. Mount it and read back what it registered.
+  const routes = []
+  const prompts = []
+  // The credential seam the real Host mounts; `home.js` reads it through
+  // `ctx.get('credentials')` and must survive its absence too.
+  const credentialStore = new Map()
+  const credentials = {
+    async describe() {
+      return credentialStore.has('SOCLAAS_API_KEY')
+        ? { configured: true, source: 'file', writable: true }
+        : { configured: false, writable: true }
+    },
+    async resolve() {
+      return credentialStore.has('SOCLAAS_API_KEY')
+        ? { value: credentialStore.get('SOCLAAS_API_KEY'), source: 'file' }
+        : undefined
+    },
+    async set(_ref, value) { credentialStore.set('SOCLAAS_API_KEY', value) },
+    async unset() { credentialStore.delete('SOCLAAS_API_KEY') },
+  }
+  const ctx = {
+    logger: { warn() {} },
+    effect: (fn) => fn(),
+    // `ctx.get('credentials')` is how home.js finds the Host's credential seam;
+    // this fake Host exposes one (the same describe/resolve/set shape the real
+    // provider has) so the composition path is exercised, not skipped.
+    get: (name) => (name === 'credentials' ? credentials : undefined),
+    inject: (_services, run) => run({
+      sessionController: {
+        prompt: async (request, signal) => {
+          signal.throwIfAborted()
+          prompts.push(request)
+          return { accepted: true }
+        },
+      },
+      connection: { fetch: { register: async (route) => { routes.push(route); return async () => {} } } },
+      webServer: {},
+    }),
+  }
+  const homeRow = await import('../home.js')
+  homeRow.apply(ctx)
+  // apply() registers synchronously inside ctx.inject above; the startup check
+  // is fire-and-forget, so give it a tick before asserting on routes.
+  await new Promise((resolve) => setTimeout(resolve, 10))
+
+  const paths = routes.map((route) => route.path)
+  assert.ok(paths.includes(HOME_ROUTE), 'the home route stays registered')
+  assert.ok(paths.includes(VOICE_ROUTE), 'the transcribe route is registered')
+  assert.ok(paths.includes(VOICE_STATUS_ROUTE), 'the status route is registered')
+  assert.ok(paths.includes(VOICE_SAY_ROUTE), 'the say route is registered')
+  // The settings pair rides the same connection, so the browser half never
+  // needs a second server to configure voice.
+  assert.ok(paths.includes(VOICE_SETTINGS_ROUTE), 'the settings route is registered')
+  assert.ok(paths.includes(VOICE_TEST_ROUTE), 'the connection-test route is registered')
+
+  const say = routes.find((route) => route.path === VOICE_SAY_ROUTE)
+  assert.deepEqual(say.methods, ['POST'])
+  assert.equal(say.requestBody, 'buffered')
+
+  // The say route queues into the recorded main session and nothing else.
+  const response = await say.fetch(new Request(`http://dsh${VOICE_SAY_ROUTE}`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ text: '帮我看看今天的派工' }),
+  }))
+  assert.equal(response.status, 200)
+  assert.equal(prompts.length, 1)
+  assert.equal(prompts[0].sessionId, 'session-main-1')
+  assert.equal(prompts[0].mode, 'queue')
+  assert.equal(prompts[0].content[0].text, '帮我看看今天的派工')
+  console.log('ok 20 — the voice routes are mounted by the home row and reach the main session')
+}
+
+// --- 21. continuation: the two delivery timings on the same Session --------
+//
+// The distinction that matters (verified against the Host, see
+// VERIFICATION.md §11): `queue` waits for the whole turn, `steer` lands at the
+// nearest STEP boundary — inside the same turn. The second one is "Interrupt"
+// in the user's sense. `abort` is a separate, last-resort third behaviour.
+
+{
+  resetRegistry()
+  const { tools, calls } = mount(mainRow)
+
+  // queue: wait for the current TURN to finish, then take the new instruction.
+  const queued = await run(
+    tools,
+    'send_to_session',
+    { session_id: 'worker-live', message: 'Also cover the empty case.', at: 'queue' },
+    execAs('main-1'),
+  )
+  assert.deepEqual(queued, {
+    sessionId: 'worker-live',
+    accepted: true,
+    delivered: 'queue',
+    aborted: false,
+  })
+  assert.equal(calls.cancel.length, 0, 'queue must not abort anything')
+  assert.equal(calls.prompt.at(-1).mode, 'queue')
+
+  // step boundary (the user's "Interrupt"): `steer` — admitted before the next
+  // step of the SAME turn, so the worker re-plans with the new instruction and
+  // keeps its context. No abort: the in-flight tool call finishes normally.
+  const stepped = await run(
+    tools,
+    'send_to_session',
+    { session_id: 'worker-live', message: 'Stop reading; the answer is in guard.js.', at: 'step' },
+    execAs('main-1'),
+  )
+  assert.deepEqual(stepped, {
+    sessionId: 'worker-live',
+    accepted: true,
+    delivered: 'step',
+    aborted: false,
+  })
+  assert.equal(calls.cancel.length, 0, 'a step-boundary insert must never abort the running turn')
+  assert.equal(calls.prompt.at(-1).mode, 'steer', 'step delivery is the steer inbox target')
+
+  // abort: the last-resort third behaviour, explicit and separately named.
+  const aborted = await run(
+    tools,
+    'send_to_session',
+    { session_id: 'worker-live', message: 'Wrong file. Stop now.', at: 'abort' },
+    execAs('main-1'),
+  )
+  assert.deepEqual(aborted, {
+    sessionId: 'worker-live',
+    accepted: true,
+    delivered: 'abort',
+    aborted: true,
+  })
+  assert.deepEqual(calls.cancel.at(-1), { sessionId: 'worker-live' }, 'abort cancels that Session')
+  assert.equal(calls.prompt.at(-1).mode, 'steer', 'after the abort, the instruction still steers in')
+
+  // A cold Session has no live Agent to abort: cancelling is best effort, the
+  // instruction is still delivered, and `aborted` honestly reports false.
+  const coldMount = mount(mainRow)
+  coldMount.ctx.sessionController.cancel = async () => {
+    throw new Error('session/not-found')
+  }
+  const cold = await run(
+    coldMount.tools,
+    'send_to_session',
+    { session_id: 'worker-cold', message: 'Resume this work.', at: 'abort' },
+    execAs('main-1'),
+  )
+  assert.equal(cold.aborted, false, 'no turn was aborted, and the answer must not claim one was')
+  assert.equal(cold.accepted, true, 'a failed abort must not drop the instruction')
+  assert.equal(coldMount.calls.prompt.at(-1).mode, 'steer')
+
+  // The step boundary is also the default when `at` is omitted, and that
+  // default must not abort anything.
+  const defaulted = await run(
+    tools,
+    'send_to_session',
+    { session_id: 'worker-live', message: 'One more requirement.' },
+    execAs('main-1'),
+  )
+  assert.equal(defaulted.delivered, 'step', 'an omitted `at` means the step boundary')
+  assert.equal(calls.cancel.length, 1, 'the default must not add another abort')
+  console.log('ok 21 — queue waits for the turn, `at:"step"` inserts at the step boundary, `at:"abort"` aborts')
+}
+
+// --- 22. one thread of work keeps one Session ------------------------------
+
+{
+  resetRegistry()
+  const mainMount = mount(mainRow, { workerPreset: 'discipline-whale-worker' })
+  const workerMount = mount(workerRow)
+  const { tools, calls } = mainMount
+
+  const first = await run(
+    tools,
+    'dispatch_task',
+    { workspace: 'soc-api-test', task: 'Add the voice input toggle.', title: 'voice', topic: 'voice-input' },
+    execAs('main-1'),
+  )
+  assert.equal(first.status, 'dispatched')
+  assert.equal(first.reused, false)
+  assert.equal(calls.create.length, 1)
+
+  // Same workspace + same topic, still running: continue that Session instead
+  // of minting a second one that would fight it over the same files. The
+  // default delivery is the step boundary — the user's "Interrupt".
+  const second = await run(
+    tools,
+    'dispatch_task',
+    { workspace: 'soc-api-test', task: '也支持长按说话。', topic: 'voice-input' },
+    execAs('main-1'),
+  )
+  assert.equal(second.status, 'reused', 'a live dispatch on the same topic is reused')
+  assert.equal(second.reused, true)
+  assert.equal(second.workerSessionId, first.workerSessionId)
+  assert.equal(second.dispatchId, first.dispatchId)
+  assert.equal(calls.create.length, 1, 'no second Session is created')
+  assert.equal(second.deliveredAs, 'step', 'continuing a live dispatch inserts at the step boundary by default')
+  assert.equal(calls.prompt.at(-1).sessionId, first.workerSessionId)
+  assert.equal(calls.prompt.at(-1).mode, 'steer', 'step delivery uses the steer inbox target')
+  assert.equal(calls.cancel.length, 0, 'the default continuation never aborts the worker')
+
+  // `at: "queue"` is available when the caller really wants the whole turn to
+  // finish first.
+  const queuedContinuation = await run(
+    tools,
+    'dispatch_task',
+    { workspace: 'soc-api-test', task: '不着急，跑完再说。', topic: 'voice-input', at: 'queue' },
+    execAs('main-1'),
+  )
+  assert.equal(queuedContinuation.status, 'reused')
+  assert.equal(queuedContinuation.deliveredAs, 'queue')
+  assert.equal(calls.prompt.at(-1).mode, 'queue')
+
+  // An explicit abort continues it too, but interrupts the running tool call.
+  const third = await run(
+    tools,
+    'dispatch_task',
+    { workspace: 'soc-api-test', task: '别再看文档了，直接改 guard.js。', topic: 'Voice-Input ', at: 'abort' },
+    execAs('main-1'),
+  )
+  assert.equal(third.status, 'reused')
+  assert.equal(third.deliveredAs, 'abort')
+  assert.equal(calls.cancel.at(-1).sessionId, first.workerSessionId)
+  assert.equal(calls.prompt.at(-1).mode, 'steer')
+
+  // A different topic is a different job: a new Session is allowed — provided
+  // its declared write scope does not collide with a live Session.
+  const other = await run(
+    tools,
+    'dispatch_task',
+    { workspace: 'soc-api-test', task: 'Rework the voice panel.', topic: 'sdk-bump', writes: ['src/voice'] },
+    execAs('main-1'),
+  )
+  assert.equal(other.status, 'dispatched')
+  assert.equal(calls.create.length, 2)
+
+  // Two live Sessions in one workspace may write the same tree only when their
+  // declared scopes do not overlap.
+  await assert.rejects(
+    () =>
+      run(
+        tools,
+        'dispatch_task',
+        { workspace: 'soc-api-test', task: 'Touch the same file.', topic: 'other-work', writes: ['src/voice/panel'] },
+        execAs('main-1'),
+      ),
+    /overlap/i,
+    'overlapping write scopes in one workspace must be refused',
+  )
+  const disjoint = await run(
+    tools,
+    'dispatch_task',
+    { workspace: 'soc-api-test', task: 'Unrelated area.', topic: 'docs-work', writes: ['docs/'] },
+    execAs('main-1'),
+  )
+  assert.equal(disjoint.status, 'dispatched')
+
+  // Once the first worker reports, the thread is finished: a new dispatch on
+  // that topic is a new Session, not a resurrection.
+  await run(workerMount.tools, 'report_to_main', { summary: 'voice input done' }, execAs(first.workerSessionId))
+  const afterReport = await run(
+    tools,
+    'dispatch_task',
+    { workspace: 'soc-api-test', task: 'Follow-up polish.', topic: 'voice-input' },
+    execAs('main-1'),
+  )
+  assert.equal(afterReport.status, 'dispatched', 'a reported dispatch is never reused')
+  assert.notEqual(afterReport.workerSessionId, first.workerSessionId)
+  console.log('ok 22 — one topic keeps one Session; write-scope overlap is refused; reported work starts fresh')
+}
+
+// --- 23. the persona really reaches the assembled system prompt -----------
+
+{
+  const { assemblePresetPrompt } = await import('../prompt-probe.mjs')
+
+  const main = await assemblePresetPrompt('discipline-whale')
+  // The dispatch-first discipline, verbatim in the assembled prompt.
+  for (const needle of [
+    '派工优先',
+    '最多 2 次',
+    '那就该立刻停手派工',
+    '往正在跑的会话插话',
+    '最近一个步边界',
+    '合成一个 brief',
+    '派工不等于完成',
+  ]) {
+    assert.ok(main.includes(needle), `the main persona must contain ${JSON.stringify(needle)}`)
+  }
+  // The timing must not be over-promised: the persona has to say the insert is
+  // NOT instant, and must keep the abort path as a last resort with its cost.
+  assert.ok(main.includes('不是「立刻」'), 'the persona must not imply an instant interrupt')
+  assert.ok(main.includes('上下文不丢'), 'the persona must state why the step boundary is preferred')
+  assert.ok(main.includes('最后手段'), 'abort stays a last resort, not the default')
+  assert.ok(!main.includes('interrupt: true'), 'the old abort-flavoured alias must be gone from the persona')
+  assert.ok(main.includes('dispatch_task'), 'the persona names the dispatch tool')
+  // The discussion exception must survive: talking to the whale is not work.
+  assert.ok(main.includes('不派工的例外'), 'the persona keeps the no-dispatch exceptions')
+  assert.ok(main.includes('架构权衡'), 'architecture discussion is an explicit exception')
+
+  // Scoped, not global: the worker preset has its own persona and must not
+  // inherit the dispatch discipline.
+  const worker = await assemblePresetPrompt('discipline-whale-worker')
+  assert.ok(worker.includes('Discipline Whale worker'))
+  for (const needle of ['派工优先', '那就该立刻停手派工', '往正在跑的会话插话']) {
+    assert.ok(!worker.includes(needle), `the worker persona must not contain ${JSON.stringify(needle)}`)
+  }
+  console.log('ok 23 — the main persona discipline is in the assembled system prompt, scoped to that preset')
+}
+
+// --- 24. the main row actually installs the guard, end to end --------------
+//
+// The guard's own tests drive `installGuard` directly. This one goes through
+// the real mount path — `main.apply(ctx, config)` — so a row that forgets the
+// call, or a Config schema that silently drops the knobs, fails here.
+
+{
+  const { installGuard } = await import('../guard.js')
+  assert.equal(typeof installGuard, 'function')
+
+  const listeners = []
+  const ctx = {
+    logger: { warn() {} },
+    effect: (fn) => fn(),
+    tools: { register: () => () => {} },
+    workspaceRegistry: { list: () => workspaces },
+    sessionController: { prompt: async () => ({ accepted: true }) },
+    on: (event, handler) => {
+      listeners.push({ event, handler })
+      return () => {}
+    },
+  }
+
+  // Row config as the Loader would hand it over after Config validation.
+  const validated = mainRow.Config['~standard'].validate({
+    workerPreset: 'discipline-whale-worker',
+    readQuota: 3,
+    watchdogThreshold: 4,
+    maxInterventions: 1,
+    watchdogCounting: 'read-only',
+    // A knob the schema does not know must not reach the guard.
+    nonsense: true,
+  })
+  assert.equal(validated.issues, undefined)
+  mainRow.apply(ctx, validated.value)
+
+  const gate = listeners.find((entry) => entry.event === 'tools/pre-execute')
+  assert.ok(gate, 'main.apply must install the pre-execute gate through installGuard')
+  assert.ok(listeners.some((entry) => entry.event === 'agent/assistant-stream'), 'the reply signal must be wired')
+  assert.ok(listeners.some((entry) => entry.event === 'agent/inbox/claimed'), 'the user-turn re-arm must be wired')
+  assert.equal(validated.value.nonsense, undefined, 'unknown config never reaches the guard')
+
+  // The configured quota (3, not the default 10) is what actually applies.
+  const agent = {
+    cancelled: [],
+    steered: [],
+    session: { id: 'contract-guard', header: { agentPreset: 'discipline-whale', cwd: home } },
+    cancel(cause) {
+      agent.cancelled.push(cause)
+    },
+    steer(message) {
+      agent.steered.push(message)
+    },
+  }
+  const call = async (name, args, who = agent) => {
+    let reached = false
+    const decision = await gate.handler(
+      { callId: 'c1', name, arguments: args, agent: who, signal: new AbortController().signal },
+      async () => {
+        reached = true
+        return { kind: 'allow' }
+      },
+    )
+    return { decision: decision.kind, reason: decision.reason, reached }
+  }
+  const inHome = join(home, 'discipline-whale', 'home', 'note.md')
+  for (let index = 0; index < 3; index += 1) {
+    assert.equal((await call('read', { file_path: inHome })).decision, 'allow', `read ${index + 1} of the configured 3`)
+  }
+  const fourth = await call('read', { file_path: inHome })
+  assert.equal(fourth.decision, 'deny', 'the configured quota of 3 is the one enforced')
+  assert.match(fourth.reason, /0 of 3/, 'the refusal quotes the configured limit')
+
+  // A worker Session going through the very same gate is untouched.
+  const workerAgent = {
+    cancelled: [],
+    steered: [],
+    session: { id: 'contract-guard-worker', header: { agentPreset: 'discipline-whale-worker', cwd: home } },
+    cancel(cause) {
+      workerAgent.cancelled.push(cause)
+    },
+    steer(message) {
+      workerAgent.steered.push(message)
+    },
+  }
+  for (let index = 0; index < 20; index += 1) {
+    const result = await call('read', { file_path: join(home, 'src', `f${index}.js`) }, workerAgent)
+    assert.equal(result.decision, 'allow', 'a worker reads twenty source files through the same gate')
+  }
+  void workerAgent
+  console.log('ok 24 — main.apply installs the guard; configured thresholds apply; a worker Session is untouched')
+}
+
+// --- 25. the timings match the Host's own inbox semantics ------------------
+//
+// This is the test that decides the design question: is a step-boundary insert
+// already available, and does `queue` really wait for the whole turn? It reads
+// the Host's agent loop source rather than trusting our own comments, so a Host
+// upgrade that changes the inbox semantics fails here instead of silently
+// turning "Interrupt" back into "wait for the turn".
+
+{
+  const { readFile } = await import('node:fs/promises')
+  const loop = await readFile(
+    join(DSH_MODULES, '@deepseek-ai/dsh-agent-loop/lib/index.js'),
+    'utf8',
+  )
+
+  // followup -> next-turn, steer -> next-step.
+  assert.match(
+    loop,
+    /followup\(input\)\s*\{\s*this\.send\(input, "next-turn", true\)/,
+    'followup must target the next-turn inbox (the `queue` timing)',
+  )
+  assert.match(
+    loop,
+    /steer\(input\)\s*\{\s*this\.send\(input, "next-step", true\)/,
+    'steer must target the next-step inbox (the step-boundary timing)',
+  )
+
+  // claim() drains next-step on EVERY boundary, but next-turn only for the
+  // next-turn target: that is what makes steer land inside the current turn.
+  assert.match(
+    loop,
+    /claim\(target, turn\) \{\s*const claimed = this\.mutate\("next-step"/,
+    'claim must drain next-step unconditionally',
+  )
+  assert.match(
+    loop,
+    /if \(target === "next-turn"\) claimed\.push\(\.\.\.this\.mutate\("next-turn"/,
+    'claim must drain next-turn only for the next-turn target',
+  )
+
+  // The turn loop opens on next-turn and switches to next-step after a step.
+  assert.match(loop, /let target = "next-turn"/, 'a turn opens claiming the next-turn target')
+  assert.match(loop, /target = "next-step"/, 'later steps of the same turn claim next-step')
+
+  // And the prompt mode is the only switch: two modes, no `interrupt`.
+  const controller = await readFile(
+    join(DSH_MODULES, '@deepseek-ai/dsh-api-session-controller/lib/index.js'),
+    'utf8',
+  )
+  assert.match(
+    controller,
+    /if \(request\.mode === "steer"\) agent\.steer\(message\);\s*else agent\.followup\(message\)/,
+    'prompt mode is exactly steer / otherwise-followup',
+  )
+  const host = await readFile(
+    join(DSH_MODULES, '@deepseek-ai/dsh-api-session-controller/lib/typert.host.js'),
+    'utf8',
+  )
+  assert.match(host, /"mode":\{"type":"string","enum":\["queue","steer"\]\}/, 'there is no interrupt mode')
+
+  // Our own surface must name the three timings and map them the same way.
+  assert.deepEqual(DELIVERY_TIMINGS, ['queue', 'step', 'abort'])
+  assert.equal(resolveTiming(undefined), 'step', 'the default is the step boundary, not queue and not abort')
+  assert.equal(resolveTiming('queue'), 'queue')
+  assert.throws(() => resolveTiming('interrupt'), /`at` must be one of/)
+  console.log('ok 25 — `steer` is a step-boundary insert, `queue` waits for the turn; default is step')
+}
+
+// --- 26. the plain `steer` path never cancels anything ---------------------
+//
+// The user's "Interrupt" is exactly this and nothing more: a message that waits
+// for the in-flight tool call to finish and is admitted at the next step
+// boundary of the SAME turn. It carries no abort, so no half-written state.
+// This block exists so that reading `cancel` anywhere in the step path fails
+// the suite, even if a later refactor merges `step` and `abort` by accident.
+
+{
+  resetRegistry()
+  const { tools, calls } = mount(mainRow)
+
+  // 1. Default (no `at`): the plain step-boundary insert.
+  const defaulted = await run(
+    tools,
+    'send_to_session',
+    { session_id: 'worker-s', message: 'Also handle the empty string.' },
+    execAs('main-1'),
+  )
+  assert.equal(defaulted.delivered, 'step')
+  assert.equal(defaulted.aborted, false)
+  assert.equal(calls.cancel.length, 0, 'the default must never cancel')
+  assert.equal(calls.prompt.at(-1).mode, 'steer', 'the plain path is mode:"steer"')
+  assert.equal(calls.prompt.at(-1).sessionId, 'worker-s')
+
+  // 2. Explicit `at: "step"` behaves identically.
+  const explicit = await run(
+    tools,
+    'send_to_session',
+    { session_id: 'worker-s', message: 'Second requirement.', at: 'step' },
+    execAs('main-1'),
+  )
+  assert.equal(explicit.delivered, 'step')
+  assert.equal(calls.cancel.length, 0, '`at:"step"` must never cancel')
+  assert.equal(calls.prompt.at(-1).mode, 'steer')
+
+  // 3. The two step-path deliveries both used the step inbox and never the
+  //    turn inbox: that is what makes them visible inside the current turn.
+  const stepPayloads = calls.prompt.slice(-2)
+  assert.equal(stepPayloads.length, 2)
+  for (const payload of stepPayloads) assert.equal(payload.mode, 'steer')
+
+  // 4. `queue` is the only branch that targets the turn inbox, and it does not
+  //    cancel either — it simply waits.
+  const queued = await run(
+    tools,
+    'send_to_session',
+    { session_id: 'worker-s', message: 'No rush, just note this.', at: 'queue' },
+    execAs('main-1'),
+  )
+  assert.equal(queued.delivered, 'queue')
+  assert.equal(calls.cancel.length, 0, '`queue` waits, it does not abort')
+  assert.equal(calls.prompt.at(-1).mode, 'queue')
+
+  // 5. Only `abort` touches `cancel`, and only then is `aborted` true.
+  const aborted = await run(
+    tools,
+    'send_to_session',
+    { session_id: 'worker-s', message: 'Wrong file — stop now.', at: 'abort' },
+    execAs('main-1'),
+  )
+  assert.equal(aborted.delivered, 'abort')
+  assert.equal(aborted.aborted, true)
+  assert.equal(calls.cancel.length, 1, 'exactly one cancel, from the abort branch only')
+  assert.equal(calls.prompt.at(-1).mode, 'steer', 'after aborting, the instruction still steers in')
+
+  // 6. `dispatch_task` reuse defaults to the same plain path: no cancel.
+  const mainMount = mount(mainRow, { workerPreset: 'discipline-whale-worker' })
+  const first = await run(
+    mainMount.tools,
+    'dispatch_task',
+    { workspace: 'soc-api-test', task: 'Add the toggle.', topic: 'toggle' },
+    execAs('main-1'),
+  )
+  const cancelsBefore = mainMount.calls.cancel.length
+  const reused = await run(
+    mainMount.tools,
+    'dispatch_task',
+    { workspace: 'soc-api-test', task: 'Also support long-press.', topic: 'toggle' },
+    execAs('main-1'),
+  )
+  assert.equal(reused.status, 'reused')
+  assert.equal(reused.workerSessionId, first.workerSessionId)
+  assert.equal(reused.deliveredAs, 'step', 'continuing a live dispatch defaults to the plain step insert')
+  assert.equal(mainMount.calls.cancel.length, cancelsBefore, 'reuse must not cancel the running worker')
+  assert.equal(mainMount.calls.prompt.at(-1).mode, 'steer')
+  assert.equal(mainMount.calls.create.length, 1, 'no second Session')
+  console.log('ok 26 — the plain step insert defaults everywhere and never cancels; only `at:"abort"` does')
+}
+
+// --- 27. the brevity row is declared in the main preset and only there -----
+//
+// `test/adhd.mjs` proves the behaviour. This one proves the *declaration*,
+// against the real patch file rather than a rendered prompt: the row must be in
+// `preset-discipline-whale`'s plugin list and absent from
+// `preset-discipline-whale-worker`'s. A row that drifted into the worker preset
+// would constrain the detailed reports the main session depends on.
+
+{
+  const { readFile } = await import('node:fs/promises')
+  const { presetPlugins } = await import('../prompt-probe.mjs')
+  const yamlModule = await import(join(DSH_MODULES, 'js-yaml/index.js'))
+  const yaml = yamlModule.default ?? yamlModule
+
+  // The Loader's YAML dialect: the worker preset pins shells with `!!js`, so a
+  // plain schema load would refuse the real file.
+  const JsExpr = new yaml.Type('tag:yaml.org,2002:js', {
+    kind: 'scalar',
+    resolve: (data) => typeof data === 'string',
+    construct: (data) => ({ __jsExpr: data }),
+  })
+  const text = await readFile(new URL('../cordis.patch.yml', import.meta.url), 'utf8')
+  const patches = yaml.load(text, { schema: yaml.DEFAULT_SCHEMA.extend([JsExpr]) }) ?? []
+  const inserted = patches.flatMap((entry) => (Array.isArray(entry?.insert) ? entry.insert : []))
+
+  const rowOf = (presetId) => presetPlugins(patches, presetId).find((row) => row?.name === 'discipline-whale/adhd')
+
+  const brevityRow = rowOf('discipline-whale')
+  assert.ok(brevityRow, 'the main preset must declare the brevity row')
+  assert.equal(brevityRow.id, 'discipline-whale-brevity')
+  assert.ok(brevityRow.config, 'the knobs are spelled out so an operator can see and change them')
+  assert.equal(brevityRow.config.maxProseChars, 1200)
+  assert.equal(brevityRow.config.maxCorrections, 1)
+  assert.equal(brevityRow.config.enabled, true)
+
+  assert.equal(rowOf('discipline-whale-worker'), undefined, 'the worker preset must NOT declare the brevity row')
+
+  // Belt and braces: exactly one preset owns the row, so a future copy-paste
+  // into the worker preset fails here rather than in production.
+  const owners = inserted
+    .filter((entry) => Array.isArray(entry?.config?.plugins) && typeof entry.config.id === 'string')
+    .map((entry) => entry.config.id)
+    .filter((id) => presetPlugins(patches, id).some((row) => row?.name === 'discipline-whale/adhd'))
+  assert.deepEqual(owners, ['discipline-whale'], `the brevity row belongs to one preset only, found ${JSON.stringify(owners)}`)
+
+  console.log('ok 27 — the brevity row is declared in the main preset and absent from the worker preset')
 }
 
 await rm(home, { recursive: true, force: true })
