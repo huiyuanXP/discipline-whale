@@ -443,6 +443,9 @@ export function installMemory(ctx, config = {}, deps = {}) {
         if (result.ok) {
           await writeCursor(root(), { flushSeq: { ...(cursor.flushSeq ?? {}), [sessionId]: events.length } })
           cache.memoryDirty = true
+          // The flush runs beside the turn, so the idle check may have looked
+          // before these daily entries existed; check again now that they do.
+          if (result.daily > 0) startDream(agent)
         } else {
           warn(`${reason} flush failed: ${result.error}`)
         }

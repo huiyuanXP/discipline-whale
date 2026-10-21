@@ -354,6 +354,29 @@ try {
   assert.equal(allowed.kind, 'allow')
   console.log('ok 13 — the guard turns dsh-auto-memory tools away and lets remember through')
 
+  // 14: a flush that lands daily entries re-checks the dream, since the idle check
+  // may have run while the flush was still in flight.
+  const lateRoot = await mkdtemp(join(tmpdir(), 'whale-memory-late-'))
+  try {
+    const late = host()
+    const lateHandle = installMemory(late.ctx, { nudgeInterval: 1, dreamMinEntries: 1, dreamMinHours: 0.0001 }, { root: () => lateRoot, now: () => new Date() })
+    await lateHandle.ready
+    await late.emit('agent/status', { agent, status: 'idle' })
+    assert.equal((await lateHandle.startDream(agent)).skipped, 'not due', 'nothing to consolidate before the flush')
+    await userSays(late, 1, '记一下：博客评论区下周再做')
+    await lateHandle.sessions.get(MAIN).flushing
+    const dreamsLog = join(whaleHomeDir(lateRoot), 'memory', 'DREAMS.md')
+    let logged = ''
+    for (let attempt = 0; attempt < 50 && logged === ''; attempt += 1) {
+      logged = await readFile(dreamsLog, 'utf8').catch(() => '')
+      if (logged === '') await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+    assert.match(logged, /mode: full/, 'the dream ran right after the flush wrote daily entries')
+  } finally {
+    await rm(lateRoot, { recursive: true, force: true })
+  }
+  console.log('ok 14 — a flush that writes daily entries starts the due dream')
+
   console.log('All memory wiring checks passed.')
 } finally {
   clearStoreRoot()
