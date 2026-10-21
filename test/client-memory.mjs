@@ -481,4 +481,40 @@ const closedTurn = (turn) => ({ turn, status: 'closed', start: undefined, end: u
   console.log('ok 9 — chip labels keep WCAG AA contrast, the main session is shared, and both dictionaries carry the copy')
 }
 
+// --- 10. "new main session" in the main session's header -------------------
+
+{
+  const view = client.newMainActionView({ t, busy: false, failure: null, onClick: () => {} })
+  assert.equal(view.type, 'button')
+  assert.equal(view.props.disabled, false)
+  assert.ok(textsOf(view).includes('New main session'))
+  const busy = client.newMainActionView({ t, busy: true, failure: null, onClick: () => {} })
+  assert.equal(busy.props.disabled, true)
+  assert.ok(textsOf(busy).includes('Creating…'))
+  const failed = client.newMainActionView({ t, busy: false, failure: 'HTTP 500', onClick: () => {} })
+  assert.equal(failed.props.title, 'Could not create a main session: HTTP 500')
+
+  const calls = []
+  const opened = []
+  const id = await client.createNewMainSession({
+    fetch: async (url, init) => {
+      calls.push([url, init.method])
+      return json(200, { home: '/h', mainSessionId: 'session-new-main' })
+    },
+    openSession: (sessionId) => opened.push(sessionId),
+  })
+  assert.equal(id, 'session-new-main')
+  assert.deepEqual(calls, [['/api/discipline-whale/home', 'POST']])
+  assert.deepEqual(opened, ['session-new-main'])
+  assert.equal(client.memoryStore.getSnapshot().mainSessionId, 'session-new-main', 'chips follow the new main session')
+  await assert.rejects(
+    client.createNewMainSession({ fetch: async () => json(500, { error: 'boom' }), openSession: () => {} }),
+    /HTTP 500/,
+  )
+  for (const key of ['newMain', 'newMainBusy', 'newMainFailed']) {
+    assert.equal(typeof client.DICTIONARIES.zh[key], 'string', `zh has ${key}`)
+  }
+  console.log('ok 10 — the header button posts home, opens the new main session and shows failures')
+}
+
 console.log('\nAll discipline-whale memory client checks passed.')

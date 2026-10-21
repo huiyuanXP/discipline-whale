@@ -215,6 +215,9 @@ window.__ModuleLoader__.load({
         workspaceDot: "工作区：{title}",
         tagOpen: "打开 {title} 的会话",
         tagNoSession: "{title}（这个 turn 没有对应的会话）",
+        newMain: "新建主会话",
+        newMainBusy: "正在新建…",
+        newMainFailed: "新建主会话失败：{reason}",
       },
       en: {
         panel: "Discipline Whale",
@@ -343,6 +346,9 @@ window.__ModuleLoader__.load({
         workspaceDot: "Workspace: {title}",
         tagOpen: "Open the {title} session",
         tagNoSession: "{title} (no session found for this turn)",
+        newMain: "New main session",
+        newMainBusy: "Creating…",
+        newMainFailed: "Could not create a main session: {reason}",
       },
     };
 
@@ -394,6 +400,62 @@ window.__ModuleLoader__.load({
       // The workspace chips render only inside this session.
       if (id !== null) memoryStore.setMainSession(id);
       return id;
+    }
+
+    /**
+     * Start a fresh main session: the host creates, titles and wakes it, and
+     * records it as the main session. The previous one stays in the session
+     * list. Returns the new id.
+     */
+    async function createNewMainSession(deps) {
+      const created = await homeRoute("POST", deps.fetch);
+      const id = created?.mainSessionId;
+      if (typeof id !== "string" || id === "") throw new Error("the host recorded no main session");
+      memoryStore.setMainSession(id);
+      if (typeof deps.openSession === "function") deps.openSession(id);
+      return id;
+    }
+
+    /**
+     * The "new main session" button in the main session's header. It renders
+     * only inside the recorded main session.
+     */
+    function makeNewMainAction(store, t, deps) {
+      return function DisciplineWhaleNewMain(props) {
+        const snapshot = React.useSyncExternalStore(store.subscribe, store.getSnapshot);
+        const [busy, setBusy] = React.useState(false);
+        const [failure, setFailure] = React.useState(null);
+        React.useEffect(() => {
+          void store.loadMain();
+        }, []);
+        if (typeof props.sessionId !== "string" || props.sessionId !== snapshot.mainSessionId) return null;
+        const onClick = () => {
+          if (busy) return;
+          setBusy(true);
+          setFailure(null);
+          createNewMainSession(deps)
+            .catch((reason) => setFailure(String(reason?.message ?? reason)))
+            .finally(() => setBusy(false));
+        };
+        return newMainActionView({ t, busy, failure, onClick });
+      };
+    }
+
+    /** Pure view of the header button. */
+    function newMainActionView({ t, busy, failure, onClick }) {
+      return h(
+        "button",
+        {
+          type: "button",
+          className: "dw-new-main",
+          disabled: busy,
+          onClick,
+          title: failure === null ? t("newMain") : t("newMainFailed", { reason: failure }),
+          "aria-label": t("newMain"),
+        },
+        h("span", { "aria-hidden": true }, "+"),
+        h("span", null, busy ? t("newMainBusy") : t("newMain"))
+      );
     }
 
     async function resolveRecordedOrNew(deps) {
@@ -3113,6 +3175,11 @@ window.__ModuleLoader__.load({
         // Each chip carries its workspace color as --dw-tag and the label
         // color picked for contrast as --dw-tag-fg, so it reads the same on
         // the light and the dark theme.
+        // ---- "new main session" in the main session's header ----
+        ".dw-new-main{display:inline-flex;align-items:center;gap:4px;height:26px;padding:0 10px;border-radius:8px;corner-shape:round;font:inherit;font-size:12px;cursor:pointer;",
+        "background:transparent;color:var(--dsw-alias-label-secondary,inherit);border:1px solid var(--dsw-alias-border-default,rgba(128,128,128,.35))}",
+        ".dw-new-main:hover{background:var(--dsw-alias-interactive-bg-hover,rgba(128,128,128,.12))}",
+        ".dw-new-main:disabled{cursor:default;opacity:.6}",
         ".dw-tags{display:flex;flex-wrap:wrap;gap:6px;margin:6px 0 2px}",
         ".dw-tag{display:inline-flex;align-items:center;max-width:220px;height:22px;padding:0 10px;border-radius:999px;corner-shape:round;font:inherit;font-size:12px;font-weight:600;line-height:1;cursor:pointer;",
         "background:var(--dw-tag,var(--dsw-alias-interactive-bg-active,rgba(38,49,72,.1)));color:var(--dw-tag-fg,var(--dsw-alias-label-primary,#0f1115));",
@@ -3180,6 +3247,7 @@ window.__ModuleLoader__.load({
     const COLOR_POST_DELAY_MS = 250;
     const TAG_TAIL_ORDER = 30;
     const SESSION_DOT_ORDER = 20;
+    const NEW_MAIN_ORDER = 40;
 
     /** The error text of a failed JSON answer: `{ error }` as a string or as `{ message | code }`. */
     function memoryErrorText(payload, status) {
@@ -3665,6 +3733,13 @@ window.__ModuleLoader__.load({
           makeTurnTags(memoryStore, t)
         )
       );
+      // "New main session" in the main session's header.
+      ctx.slots.inject("conversation.session.header.actions", () =>
+        ctx.slots.register(
+          { name: "conversation.session.header.actions", id: "discipline-whale-new-main", order: NEW_MAIN_ORDER, locale: NS },
+          makeNewMainAction(memoryStore, t, { fetch: (url, init) => fetch(url, init), openSession })
+        )
+      );
       // The workspace-color dot before a dispatched session's sidebar row.
       ctx.slots.inject("sidebar.session.row.leading", () =>
         ctx.slots.register(
@@ -3703,6 +3778,8 @@ window.__ModuleLoader__.load({
     module.exports.makeVoiceDock = makeVoiceDock;
     module.exports.createSessionWatcher = createSessionWatcher;
     module.exports.resolveMainSession = resolveMainSession;
+    module.exports.createNewMainSession = createNewMainSession;
+    module.exports.newMainActionView = newMainActionView;
     module.exports.WORKSPACE_PALETTE = WORKSPACE_PALETTE;
     module.exports.createMemoryStore = createMemoryStore;
     module.exports.memoryStore = memoryStore;

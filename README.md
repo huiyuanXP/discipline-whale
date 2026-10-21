@@ -19,6 +19,7 @@ DSH 里已经有 `subagent`（同一会话内的子代理）和 `dsh-webhook`（
 - 插件启动时（profile 级的 `discipline-whale` 行，即 `home.js`）创建 home，并提供接口 `/api/discipline-whale/home`：`GET` 返回 home 路径和主会话 id，`POST` 新建主会话
 - 主会话 id 记录在 `$DSH_HOME/discipline-whale/state.json`，换浏览器也是同一个主会话
 - 入口打开时：记录的主会话仍在且未归档就直接打开；否则由 Host 以 `discipline-whale` preset、cwd = home 新建一个，标题「自律鲸鱼」，并立即发一条**唤醒**消息（自我介绍 + `list_dispatches` 汇报）。不属于任何工作区的会话要有过一轮才能在 Web 里输入，唤醒这一轮正好满足
+- 主会话标题栏有「+ 新建主会话」按钮（只在主会话里显示）：Host 新建并唤醒一个主会话、记为新的主会话并直接打开；旧主会话保留在会话列表里
 
 ## 两个 preset，两种角色
 
