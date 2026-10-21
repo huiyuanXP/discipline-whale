@@ -425,9 +425,10 @@ export function installMemory(ctx, config = {}, deps = {}) {
     state.flushing = (async () => {
       try {
         const cursor = await readCursor(root())
-        const seen = Number.isInteger(cursor.flushSeq?.[sessionId]) ? cursor.flushSeq[sessionId] : 0
+        const recorded = Number.isInteger(cursor.flushSeq?.[sessionId]) ? cursor.flushSeq[sessionId] : 0
         const events = agent.session?.snapshotEvents?.() ?? []
-        const fresh = events.slice(seen)
+        // A log shorter than the recorded position was rewritten: read it from the start.
+        const fresh = events.slice(recorded > events.length ? 0 : recorded)
         const transcript = transcriptFromEvents(fresh)
         if (transcript.every((item) => item.role === 'context')) return { ok: true, skipped: 'nothing new' }
         const turn = userTurns.get(sessionId)?.turn
@@ -462,7 +463,10 @@ export function installMemory(ctx, config = {}, deps = {}) {
 
   let dreaming = null
   function startDream(agent, { force = false } = {}) {
-    if (dreaming !== null) return dreaming
+    // A forced dream that meets an idle check still in flight runs once more if that check skipped.
+    if (dreaming !== null) {
+      return force ? dreaming.then((result) => (result?.skipped ? startDream(agent, { force: true }) : result)) : dreaming
+    }
     dreaming = (async () => {
       try {
         const cursor = await readCursor(root())

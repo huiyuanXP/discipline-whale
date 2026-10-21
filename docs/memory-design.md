@@ -15,7 +15,7 @@
 | 你要保留的 | 落点 | 复用 / 自建 |
 |---|---|---|
 | ① Claude Code 的 compact | 宿主 `dsh-compaction-basic`（已挂载） | 复用 |
-| ② 先清工具 output 再摘要 | 换一个「清空型」pruner，替掉宿主的截断型 pruner | 自建 ~300 行（自包含实现，以 `toolResultPruner` 服务挂载） |
+| ② 先清工具 output 再摘要 | 鲸鱼的清空型 pruner：最近 3 个用户 turn 之前的工具输出换成一行占位 | 自建 ~300 行（自包含实现，以 `toolResultPruner` 服务挂载） |
 | ③ chat 自动写 memory | **压缩前 flush** + **每 10 个用户 turn 的 nudge**，后台隐藏模型调用 | 自建 ~200 行 |
 | ④ AGENTS.md 只在用户要求时写 | 唯一写入口 `update_instructions`，带「用户原话」结构门 | 自建 ~60 行 |
 | ⑤ AutoDream 清理 memory | 复用 dream 的四阶段 prompt + OpenClaw 的改写门禁；触发与执行自建 | 半复用，见 §7 |
@@ -217,14 +217,13 @@ update_instructions({ user_quote, op: "add" | "replace" | "remove", text, match?
 
 宿主已经有 Claude Code 同构的压缩链路，鲸鱼两个 preset 都已挂载：`agent/pre-step` 检测压力 → 先剪工具输出 → 仍超阈值再摘要（摘要请求复用同一前缀缓存）。
 
-**要改的只有一处：工具输出从「截断」改成「清空」**。
+工具输出由鲸鱼的 `discipline-whale/pruner` 处理（`pruner.js`），它以 `toolResultPruner` 服务挂进两个 preset 的 compaction 组：
 
-| | 宿主现状 `dsh-compaction-tool-result-pruner` | 鲸鱼的 `whale-pruner` |
-|---|---|---|
-| 范围 | 超过 8,192 字符的工具结果 | 最近 3 个用户 turn（DSH turn，含其全部 step）之前的**全部**工具结果 |
-| 处理 | 保留头 4,096 + 尾 1,024 | 换成一行占位：`[工具输出已清理 · read_report r-3f2a · 9,929 字符 · 原文在 session log]` |
-| 最近 3 个 turn | 同样截断 | 沿用宿主的头尾截断 |
-| 实现 | — | 自包含实现（插件安装方式下宿主包解析不稳定），`apply` 里 `ctx.reflect.provide('toolResultPruner', …)`，替换 compaction 组里宿主的 pruner 行 |
+| 项 | 做法 |
+|---|---|
+| 清空 | 最近 3 个用户 turn（DSH turn，含其全部 step）之前的**全部**工具结果，换成一行占位：`[工具输出已清理 · read_report r-3f2a · 9,929 字符 · 原文在 session log]` |
+| 最近 3 个用户 turn | 超过 8,192 字符的结果保留头 4,096 + 尾 1,024 |
+| 挂载 | 自包含实现，`apply` 里 `ctx.reflect.provide('toolResultPruner', …)`；同一 compaction 组里只挂这一个 pruner |
 
 运行时机与宿主一致：只在压缩压力成立时运行；清完如果已经低于阈值，就跳过摘要。原文永远留在 session log。
 
