@@ -90,7 +90,7 @@
     "test:dock": "node test/dock.mjs",
     "test:settings": "node test/settings.mjs",
     "test:adhd": "node test/adhd.mjs",
-    "test:memory": "node test/memory.mjs && node test/activity.mjs && node test/memory-flush.mjs && node test/dream.mjs && node test/pruner.mjs && node test/memory-integration.mjs && node test/memory-wiring.mjs"
+    "test:memory": "node test/memory.mjs && node test/activity.mjs && node test/memory-flush.mjs && node test/dream.mjs && node test/pruner.mjs && node test/memory-integration.mjs && node test/memory-wiring.mjs && node test/client-memory.mjs"
   },
   "dsh": {
     "bundle": {

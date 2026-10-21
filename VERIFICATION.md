@@ -1596,3 +1596,56 @@ worker preset adhd hits: 0
 - 旁边有人**凑近麦克风**说话：音量门与过滤都分不出来，会被当成本人说话（README「已知限制」已写明）。
 - Document PiP 真窗口里的收音（检测组件在主页面运行，理论上不受影响）。
 
+
+## 20. 记忆系统：分层记忆、Activity、flush / dream、清空型 pruner、工作区颜色与 Tag（2026-10-22）
+
+设计见 [`docs/memory-design.md`](./docs/memory-design.md)。
+
+### 20a. 测试
+
+`npm run test:all` 退出码 0，其中 `npm run test:memory` 包含 8 个文件：
+- `memory.mjs` 10 组
+- `activity.mjs` 8 组
+- `memory-flush.mjs` 6 组
+- `dream.mjs` 10 组
+- `pruner.mjs` 9 组
+- `memory-integration.mjs` 5 组
+- `memory-wiring.mjs` 14 组
+- `client-memory.mjs` 10 组
+
+### 20b. 隔离实例实机验证
+
+全程使用隔离实例，你的 `dsh web`（3080）没有被碰过：
+- `DSH_HOME` 指向临时目录，内含 `~/.dsh/profiles/web` 的 APFS 克隆，插件目录换成工作树。
+- 工作区存储里只有两个演示工作区：`blog-demo`、`whale-demo`。
+- 使用真实模型 provider（soc-deepseek）。
+- 启动参数 `--port 3099 --host 127.0.0.1`。
+- 用 Claude 内置浏览器驱动。
+
+| 验证点 | 结果 |
+|---|---|
+| dsh-auto-memory 迁移 | 启动时导入 1 条 feedback 条目，进 USER Preferences（`source: dsh-auto-memory:reply-first`）；原目录改名为 `*.migrated-20261022` |
+| 消息 Tag | 一句话派往两个工作区：`tags.jsonl` 里第 2 轮有一条 turn 记录，加两条 tag（`ws-blog-demo`、`ws-whale-demo`），各带 dispatchId |
+| 派工 bootstrap | whale-demo 的 worker brief 以 `## 工作区背景 / ### 用户最近说过` 开头，内容是用户原话 |
+| 记忆注入 | 主会话 system prompt 含长期记忆区块（User Preferences）、`## 工作区` 卡片（介绍由派工后的 `set_workspace_intro` / `workspace_note` 写入）、`## 记忆的写法` |
+| Activity 快照 | runtime-context 快照：blog-demo 那条列在「正在进行」，whale-demo 那条列在「最近结束」并带报告 summary |
+| nudge flush | 第 2 条真实用户消息后，后台隐藏调用写出 1 条 daily，`## Now` 轮换为「本周主要目标：做完 memory 系统，博客搁置」；主会话自己调用 `remember` 写入「Always 汇报先给结论」（source 为第 7 轮） |
+| dream | `dream_now` 返回 `mode: full`，把 daily 提升进 MEMORY.md，`DREAMS.md` 有记录；主会话空闲后自动跑了一次，只读新增的那条 daily，提升进 USER Preferences |
+| 工作区标签 | 第 2 轮下出现 `blog-demo`、`whale-demo` 两枚彩色标签；点击 `blog-demo` 跳到对应的 worker 会话 |
+| 侧栏色点 | 派出去的会话行前有工作区色点 |
+| 改色 | 设置面板「工作区颜色」把 blog-demo 改为 `#8B5CF6`：侧栏色点和对话标签立即同步，`memory-state/workspaces.json` 已落盘 |
+| 主题 | 深色、浅色下标签文字都清晰（文字颜色按背景对比度自动选择） |
+
+### 20c. 实机发现并修复的两个缺陷
+
+1. **工具结果被吞**
+   - 现象：memory 行在 `tools/post-execute` 上挂了一个只观察、不返回的监听器。这个事件是瀑布式的，必须调用 `next()` 并把结果返回，监听器返回空导致主会话每个工具结果都变成 `undefined`，界面上报 `Cannot read properties of undefined (reading 'kind')`。
+   - 修复：改用 emit 型的 `tools/result`。`memory-wiring` ok 1 断言 memory 行不挂任何工具瀑布事件。
+2. **到期的 dream 被跳过**
+   - 现象：flush 在后台调用模型、不阻塞回合。主会话变成空闲时 flush 还没写完 daily，dream 检查认为「没有新笔记」而跳过。
+   - 修复：flush 写入 daily 后再检查一次 dream。由 `memory-wiring` ok 14 覆盖。
+
+### 20d. 尚未实机验证
+
+- 压缩前 flush 的真实触发：要等上下文涨到约 806K token（1M 窗口），这里只做了单测（`memory-wiring` ok 7）。
+- 清空型 pruner 在真实压缩中的表现：只在压缩压力成立时运行。已用真实 cordis 挂载验证过服务注册（`pruner` ok 8），清理行为由假 session 覆盖。

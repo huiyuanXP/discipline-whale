@@ -17,6 +17,11 @@
 // SoCLaaS cloud transcriber, which is why the dock states that in its own copy
 // and in the README.
 //
+// The memory system shows up in three places: colored workspace chips under
+// each tagged turn of the main session (click one to open the session that
+// turn dispatched), a workspace-color dot before every dispatched session in
+// the sidebar, and a "workspace colors" section in the dock's settings panel.
+//
 // Plain JS in dsh's module wrapper, so the package needs no build step: React
 // comes from the shell's module table.
 window.__ModuleLoader__.load({
@@ -199,6 +204,17 @@ window.__ModuleLoader__.load({
         testNotFound: "路径可能不对",
         settingsSavedNoKey: "已保存，但还没有配置 key。",
         settingsRestartHint: "保存后立即生效，下一次录音就会用新配置，不需要重启。",
+        settingsSectionWorkspaces: "工作区颜色",
+        workspacesLoading: "正在读取工作区…",
+        workspacesEmpty: "还没有工作区。",
+        workspacesUnavailable: "读取工作区失败，稍后重新打开设置再试。",
+        workspacePalette: "{title} 的颜色",
+        workspacePaletteColor: "改成 {color}",
+        workspaceCustomColor: "自定义颜色",
+        workspaceColorFailed: "改颜色失败：{reason}",
+        workspaceDot: "工作区：{title}",
+        tagOpen: "打开 {title} 的会话",
+        tagNoSession: "{title}（这个 turn 没有对应的会话）",
       },
       en: {
         panel: "Discipline Whale",
@@ -316,6 +332,17 @@ window.__ModuleLoader__.load({
         testNotFound: "the path may be wrong",
         settingsSavedNoKey: "Saved, but no API key is configured yet.",
         settingsRestartHint: "Changes apply immediately: the next recording uses the new settings, no restart needed.",
+        settingsSectionWorkspaces: "Workspace colors",
+        workspacesLoading: "Loading workspaces…",
+        workspacesEmpty: "No workspaces yet.",
+        workspacesUnavailable: "Could not load the workspaces; reopen settings to retry.",
+        workspacePalette: "Colors for {title}",
+        workspacePaletteColor: "Use {color}",
+        workspaceCustomColor: "Custom color",
+        workspaceColorFailed: "Could not change the color: {reason}",
+        workspaceDot: "Workspace: {title}",
+        tagOpen: "Open the {title} session",
+        tagNoSession: "{title} (no session found for this turn)",
       },
     };
 
@@ -363,6 +390,13 @@ window.__ModuleLoader__.load({
      * @returns the session id, or null when the host cannot provide one.
      */
     async function resolveMainSession(deps) {
+      const id = await resolveRecordedOrNew(deps);
+      // The workspace chips render only inside this session.
+      if (id !== null) memoryStore.setMainSession(id);
+      return id;
+    }
+
+    async function resolveRecordedOrNew(deps) {
       const sessions = deps.sessions;
       const workspaces = deps.workspaces;
       const live = (id) => isLive(id, sessions?.list?.getSnapshot(), workspaces?.list?.getSnapshot());
@@ -1529,6 +1563,10 @@ window.__ModuleLoader__.load({
             navRow("tts", "tts", t("settingsTtsEntry"), h("span", { className: "dw-badge" }, t("settingsNotIntegrated"))),
           ]),
           h("p", { className: "dw-settings-note", key: "intro" }, t("settingsIntro")),
+          // Workspace colors, when the panel is wired to the memory store.
+          input.workspaces === undefined || input.workspaces === null
+            ? null
+            : workspaceColorsSection({ t, workspaces: input.workspaces, choose: actions.chooseWorkspaceColor }),
         ];
       }
       return h("section", { className: "dw-settings", "aria-label": t("settingsOpen"), "data-dw-panel": "settings", "data-dw-page": page },
@@ -1705,7 +1743,11 @@ window.__ModuleLoader__.load({
       return { done, speech };
     }
 
-    function makeVoiceDock(ctx, t) {
+    /**
+     * The voice dock component. `memory` is the shared memory store; with it
+     * the settings panel also offers the workspace colors.
+     */
+    function makeVoiceDock(ctx, t, memory) {
       return function VoiceDock() {
         const [open, setOpen] = React.useState(false);
         const [status, setStatus] = React.useState("ready");
@@ -2278,6 +2320,9 @@ window.__ModuleLoader__.load({
           setSettingsSaved(false);
           setSettingsTest(null);
           void loadSettings();
+          // Opening the panel re-reads the workspaces, so a workspace added
+          // since the page loaded is listed too.
+          if (memory !== undefined && memory !== null) void memory.loadWorkspaces(true);
         }
 
         /** Save the draft. An untouched key field is omitted, never sent empty. */
@@ -2666,6 +2711,12 @@ window.__ModuleLoader__.load({
 
         const busy = status === "transcribing" || status === "thinking" || status === "speaking";
 
+        // The workspace colors the settings panel edits; the same store paints
+        // the chips and the sidebar dots.
+        const memorySnapshot = memory === undefined || memory === null
+          ? null
+          : React.useSyncExternalStore(memory.subscribe, memory.getSnapshot);
+
         // The dock may be rendered into a detached document (Document PiP or a
         // popup). React renders the same tree; only the host container changes.
         const container = renderDocument();
@@ -2702,6 +2753,9 @@ window.__ModuleLoader__.load({
             page: settingsPage,
             speak,
             redemptionMs,
+            workspaces: memorySnapshot === null
+              ? undefined
+              : { list: memorySnapshot.workspaces, failed: memorySnapshot.workspacesFailed, errors: memorySnapshot.colorErrors },
             actions: {
               save: () => { void saveSettings(); },
               test: () => { void testSettings(); },
@@ -2709,6 +2763,9 @@ window.__ModuleLoader__.load({
               navigate: setSettingsPage,
               toggleSpeak,
               chooseRedemptionMs,
+              chooseWorkspaceColor: (workspaceId, color, delayMs) => {
+                if (memory !== undefined && memory !== null) void memory.setColor(workspaceId, color, delayMs);
+              },
             },
           })
           : !open
@@ -3052,6 +3109,38 @@ window.__ModuleLoader__.load({
         "body.dw-detached .dw-card{flex:1;min-height:0;max-height:none;box-shadow:none}",
         "body.dw-detached .dw-round,body.dw-detached .dw-pill,body.dw-detached .dw-settings{box-shadow:none}",
 
+        // ---- workspace chips under a main-session turn ----
+        // Each chip carries its workspace color as --dw-tag and the label
+        // color picked for contrast as --dw-tag-fg, so it reads the same on
+        // the light and the dark theme.
+        ".dw-tags{display:flex;flex-wrap:wrap;gap:6px;margin:6px 0 2px}",
+        ".dw-tag{display:inline-flex;align-items:center;max-width:220px;height:22px;padding:0 10px;border-radius:999px;corner-shape:round;font:inherit;font-size:12px;font-weight:600;line-height:1;cursor:pointer;",
+        "background:var(--dw-tag,var(--dsw-alias-interactive-bg-active,rgba(38,49,72,.1)));color:var(--dw-tag-fg,var(--dsw-alias-label-primary,#0f1115));",
+        "border:1px solid color-mix(in srgb,var(--dw-tag,transparent) 78%,#000);transition:filter .15s,transform .15s}",
+        ".dw-tag:hover{filter:brightness(1.08)}",
+        ".dw-tag:active{transform:scale(.97)}",
+        ".dw-tag:disabled{cursor:default;opacity:.7;filter:none;transform:none}",
+        ".dw-tag:focus-visible{outline:2px solid var(--dw-tag,var(--dsw-alias-state-business-primary,#4176e6));outline-offset:2px}",
+        ".dw-tag-text{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}",
+
+        // ---- the workspace dot before a dispatched session's sidebar row ----
+        ".dw-ws-dot-cell{display:inline-flex;align-items:center;justify-content:center;width:16px;height:16px;flex:none}",
+        ".dw-ws-dot{display:block;width:8px;height:8px;border-radius:50%;corner-shape:round;background:var(--dw-tag);box-shadow:0 0 0 1px color-mix(in srgb,var(--dw-tag) 70%,#000)}",
+
+        // ---- settings: workspace colors ----
+        ".dw-ws-row{display:flex;flex-direction:column;gap:8px;padding:10px 14px}",
+        ".dw-group>.dw-ws-row+.dw-ws-row{box-shadow:inset 0 1px 0 var(--dw-line)}",
+        ".dw-ws-head{display:flex;align-items:center;gap:10px;min-width:0}",
+        ".dw-ws-head .dw-row-title{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}",
+        ".dw-ws-swatch{flex:none;width:14px;height:14px;border-radius:50%;corner-shape:round;background:var(--dw-tag);box-shadow:0 0 0 1px var(--dw-line)}",
+        ".dw-ws-palette{display:flex;flex-wrap:wrap;align-items:center;gap:6px}",
+        ".dw-ws-choice{width:22px;height:22px;padding:0;border-radius:50%;corner-shape:round;border:2px solid transparent;background:var(--dw-tag);cursor:pointer;",
+        "box-shadow:inset 0 0 0 1px rgba(0,0,0,.12);transition:transform .15s}",
+        ".dw-ws-choice:hover{transform:scale(1.1)}",
+        ".dw-ws-choice[aria-pressed='true']{border-color:var(--dw-surface);box-shadow:0 0 0 2px var(--dw-fg)}",
+        ".dw-ws-custom{width:30px;height:24px;padding:0;border:1px solid var(--dw-line);border-radius:8px;background:var(--dw-surface);cursor:pointer}",
+        ".dw-ws-custom:focus-visible,.dw-ws-choice:focus-visible{outline:2px solid var(--dw-accent);outline-offset:2px}",
+
         // ---- narrow windows ----
         "@media (max-width:768px){.dw-dock-host{right:8px;width:calc(100vw - 16px);max-width:none}.dw-card{max-height:42vh}.dw-settings{max-height:calc(100vh - var(--dw-dock-bottom) - 24px)}}",
       ].join("\n");
@@ -3064,6 +3153,478 @@ window.__ModuleLoader__.load({
       document.head.appendChild(style);
       return () => style.remove();
     }
+
+    // ---- memory: workspace tags, colors and dispatched sessions -----------
+    //
+    // Three surfaces read one in-module store: the chips under a main-session
+    // turn (`conversation.chat.turnTail`), the dot before a dispatched
+    // session's sidebar row (`sidebar.session.row.leading`), and the
+    // "workspace colors" section of the settings panel. A color change goes
+    // into the store first, so every chip and dot repaints at once, and the
+    // POST that follows either confirms it or puts the stored color back.
+
+    const MEMORY_WORKSPACES_ROUTE = "/api/discipline-whale/memory/workspaces";
+    const MEMORY_TAGS_ROUTE = "/api/discipline-whale/memory/tags";
+    const MEMORY_DISPATCHED_ROUTE = "/api/discipline-whale/memory/dispatched";
+    // Copied from activity.js PALETTE (the server's default workspace colors);
+    // the browser half is a plain script and cannot import it.
+    const WORKSPACE_PALETTE = ["#3B82F6", "#10B981", "#F59E0B", "#EF4444", "#8B5CF6", "#EC4899", "#14B8A6", "#F97316"];
+    const WORKSPACE_COLOR_PATTERN = /^#[0-9a-fA-F]{6}$/;
+    // Turn tails of one page load mount together; one tags request serves them.
+    const TAGS_COALESCE_MS = 300;
+    // A sidebar row of a session the store has never heard of may be a fresh
+    // dispatch; the dispatched map is re-read at most this often for it.
+    const DISPATCHED_REFRESH_MS = 15000;
+    // The custom color input fires while the picker is dragged; the POST waits
+    // for the pointer to rest. Palette clicks post at once.
+    const COLOR_POST_DELAY_MS = 250;
+    const TAG_TAIL_ORDER = 30;
+    const SESSION_DOT_ORDER = 20;
+
+    /** The error text of a failed JSON answer: `{ error }` as a string or as `{ message | code }`. */
+    function memoryErrorText(payload, status) {
+      const error = payload?.error;
+      if (typeof error === "string" && error !== "") return error;
+      if (typeof error?.message === "string" && error.message !== "") return error.message;
+      if (typeof error?.code === "string" && error.code !== "") return error.code;
+      return `HTTP ${status}`;
+    }
+
+    function isWorkspace(value) {
+      return value !== null && typeof value === "object" && typeof value.id === "string" && value.id !== ""
+        && typeof value.color === "string" && WORKSPACE_COLOR_PATTERN.test(value.color);
+    }
+
+    /**
+     * The shared memory store. `deps` injects `fetch`, `setTimeout`,
+     * `clearTimeout` and `now`; the browser uses the globals.
+     *
+     * Snapshot fields:
+     *   mainSessionId     the whale's main session, or null until known
+     *   workspaces        registry-ordered `{ id, title, path, color, intro, updatedAt }`, or null until loaded
+     *   workspacesFailed  true when the last workspace read failed
+     *   tags              `{ [sessionId]: { [turn]: { turn, messageId, at, workspaces, sessions } } }`
+     *   dispatched        `{ [workerSessionId]: workspaceId }`, or null until loaded
+     *   colorErrors       `{ [workspaceId]: message }` from the last refused color change
+     */
+    function createMemoryStore(deps) {
+      const options = deps || {};
+      const request = (url, init) => (typeof options.fetch === "function" ? options.fetch : fetch)(url, { cache: "no-store", ...(init || {}) });
+      const later = typeof options.setTimeout === "function" ? options.setTimeout : (fn, ms) => setTimeout(fn, ms);
+      const cancel = typeof options.clearTimeout === "function" ? options.clearTimeout : (id) => clearTimeout(id);
+      const now = typeof options.now === "function" ? options.now : () => Date.now();
+
+      let snapshot = { mainSessionId: null, workspaces: null, workspacesFailed: false, tags: {}, dispatched: null, colorErrors: {} };
+      const listeners = new Set();
+      const inflight = new Map();
+      // Per main session: the highest closed turn asked for, the highest one a
+      // request has covered, the coalescing timer and the request generation.
+      const tagWindows = new Map();
+      // Per workspace: the color the server holds, a color waiting to post,
+      // the timer that posts it, and the number of the latest POST.
+      const confirmed = new Map();
+      const pendingColors = new Map();
+      const colorTimers = new Map();
+      const postSequence = new Map();
+      let dispatchedAt = 0;
+
+      function publish(patch) {
+        snapshot = { ...snapshot, ...patch };
+        for (const listener of [...listeners]) listener();
+      }
+
+      function once(key, task) {
+        if (inflight.has(key)) return inflight.get(key);
+        const running = task().finally(() => inflight.delete(key));
+        inflight.set(key, running);
+        return running;
+      }
+
+      async function getJson(url) {
+        const response = await request(url);
+        if (!response.ok) throw new Error(`${url} answered HTTP ${response.status}`);
+        return response.json();
+      }
+
+      /** Repaint one workspace in the snapshot. */
+      function paint(workspaceId, color) {
+        if (snapshot.workspaces === null) return;
+        publish({ workspaces: snapshot.workspaces.map((workspace) => workspace.id === workspaceId ? { ...workspace, color } : workspace) });
+      }
+
+      function setMainSession(sessionId) {
+        if (typeof sessionId === "string" && sessionId !== "" && sessionId !== snapshot.mainSessionId) publish({ mainSessionId: sessionId });
+      }
+
+      /** Read the recorded main session once; the sidebar entry and the call keep it current after that. */
+      function loadMain() {
+        if (snapshot.mainSessionId !== null) return Promise.resolve(snapshot.mainSessionId);
+        return once("home", async () => {
+          try {
+            const body = await getJson(HOME_ROUTE);
+            setMainSession(body?.mainSessionId);
+          } catch (_error) {
+            // No main session known: no chips render, and the next tail asks again.
+          }
+          return snapshot.mainSessionId;
+        });
+      }
+
+      function loadWorkspaces(force) {
+        if (force !== true && snapshot.workspaces !== null) return Promise.resolve(snapshot.workspaces);
+        return once("workspaces", async () => {
+          try {
+            const body = await getJson(MEMORY_WORKSPACES_ROUTE);
+            const list = (Array.isArray(body?.workspaces) ? body.workspaces : []).filter(isWorkspace);
+            for (const workspace of list) confirmed.set(workspace.id, workspace.color);
+            // A color still waiting to post keeps showing.
+            const shown = list.map((workspace) => pendingColors.has(workspace.id) ? { ...workspace, color: pendingColors.get(workspace.id) } : workspace);
+            publish({ workspaces: shown, workspacesFailed: false });
+          } catch (_error) {
+            publish({ workspacesFailed: true });
+          }
+          return snapshot.workspaces;
+        });
+      }
+
+      async function loadTags(sessionId) {
+        const tagWindow = tagWindows.get(sessionId);
+        const generation = tagWindow.generation + 1;
+        tagWindow.generation = generation;
+        try {
+          const body = await getJson(`${MEMORY_TAGS_ROUTE}?sessionId=${encodeURIComponent(sessionId)}`);
+          if (tagWindow.generation !== generation) return;
+          const byTurn = {};
+          for (const record of Array.isArray(body?.turns) ? body.turns : []) {
+            if (record === null || typeof record !== "object" || typeof record.turn !== "number" || !Array.isArray(record.workspaces)) continue;
+            byTurn[record.turn] = record;
+          }
+          publish({ tags: { ...snapshot.tags, [sessionId]: byTurn } });
+          // A tag can name a workspace registered after the list was read, and
+          // a tagged turn means new dispatched sessions: refresh both.
+          const known = new Set((snapshot.workspaces || []).map((workspace) => workspace.id));
+          const unknown = Object.values(byTurn).some((record) => record.workspaces.some((id) => !known.has(id)));
+          if (unknown || snapshot.workspaces === null) void loadWorkspaces(true);
+          void loadDispatched(true);
+        } catch (_error) {
+          // The next closed turn asks again.
+          if (tagWindow.generation === generation) tagWindow.covered = -1;
+        }
+      }
+
+      /**
+       * A turn tail of `sessionId` reports a closed turn. The first report, and
+       * every report of a turn newer than the last request covered, schedules
+       * one coalesced tags request: that is how a just-completed turn's tags
+       * arrive without polling.
+       */
+      function requestTags(sessionId, turn) {
+        if (typeof sessionId !== "string" || sessionId === "" || typeof turn !== "number") return;
+        let tagWindow = tagWindows.get(sessionId);
+        if (tagWindow === undefined) {
+          tagWindow = { wanted: -1, covered: -1, timer: null, generation: 0 };
+          tagWindows.set(sessionId, tagWindow);
+        }
+        tagWindow.wanted = Math.max(tagWindow.wanted, turn);
+        if (tagWindow.wanted <= tagWindow.covered || tagWindow.timer !== null) return;
+        tagWindow.timer = later(() => {
+          tagWindow.timer = null;
+          tagWindow.covered = tagWindow.wanted;
+          void loadTags(sessionId);
+        }, TAGS_COALESCE_MS);
+      }
+
+      function loadDispatched(force) {
+        if (force !== true && snapshot.dispatched !== null) return Promise.resolve(snapshot.dispatched);
+        return once("dispatched", async () => {
+          dispatchedAt = now();
+          try {
+            const body = await getJson(MEMORY_DISPATCHED_ROUTE);
+            const map = {};
+            const sessions = body?.sessions !== null && typeof body?.sessions === "object" ? body.sessions : {};
+            for (const [sessionId, workspaceId] of Object.entries(sessions)) {
+              if (typeof workspaceId === "string" && workspaceId !== "") map[sessionId] = workspaceId;
+            }
+            publish({ dispatched: map });
+          } catch (_error) {
+            if (snapshot.dispatched === null) publish({ dispatched: {} });
+          }
+          return snapshot.dispatched;
+        });
+      }
+
+      /** A sidebar row of `sessionId` mounted: load the map, or refresh it for an unknown session. */
+      function requestDispatched(sessionId) {
+        if (snapshot.dispatched === null) {
+          void loadDispatched(false);
+          return;
+        }
+        if (typeof sessionId === "string" && snapshot.dispatched[sessionId] === undefined && now() - dispatchedAt >= DISPATCHED_REFRESH_MS) {
+          void loadDispatched(true);
+        }
+      }
+
+      function refuse(workspaceId, message) {
+        // A newer change already waiting keeps its color; otherwise the
+        // server's color comes back.
+        if (!pendingColors.has(workspaceId) && confirmed.has(workspaceId)) paint(workspaceId, confirmed.get(workspaceId));
+        publish({ colorErrors: { ...snapshot.colorErrors, [workspaceId]: message } });
+        return { ok: false, error: message };
+      }
+
+      async function postColor(workspaceId, color) {
+        // Only the latest POST for a workspace may touch the store: an answer
+        // to an earlier one that arrives late is reported to its caller only.
+        const sequence = (postSequence.get(workspaceId) ?? 0) + 1;
+        postSequence.set(workspaceId, sequence);
+        const superseded = () => postSequence.get(workspaceId) !== sequence;
+        try {
+          const response = await request(MEMORY_WORKSPACES_ROUTE, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ id: workspaceId, color }),
+          });
+          const payload = await response.json().catch(() => ({}));
+          if (!response.ok) {
+            const message = memoryErrorText(payload, response.status);
+            return superseded() ? { ok: false, error: message } : refuse(workspaceId, message);
+          }
+          if (superseded()) return { ok: true };
+          const workspace = payload?.workspace;
+          if (isWorkspace(workspace) && workspace.id === workspaceId) {
+            confirmed.set(workspaceId, workspace.color);
+            if (!pendingColors.has(workspaceId) && snapshot.workspaces !== null) {
+              publish({ workspaces: snapshot.workspaces.map((current) => current.id === workspaceId ? workspace : current) });
+            }
+          }
+          return { ok: true };
+        } catch (error) {
+          const message = String(error?.message ?? error);
+          return superseded() ? { ok: false, error: message } : refuse(workspaceId, message);
+        }
+      }
+
+      /**
+       * Change one workspace's color. A valid color repaints at once; the POST
+       * goes out after `delayMs`, and a later change for the same workspace
+       * replaces a waiting one. Resolves with `{ ok, error? }` from the POST.
+       */
+      function setColor(workspaceId, color, delayMs) {
+        const value = String(color);
+        if (WORKSPACE_COLOR_PATTERN.test(value)) {
+          pendingColors.set(workspaceId, value);
+          paint(workspaceId, value);
+        }
+        if (snapshot.colorErrors[workspaceId] !== undefined) {
+          const errors = { ...snapshot.colorErrors };
+          delete errors[workspaceId];
+          publish({ colorErrors: errors });
+        }
+        const waiting = colorTimers.get(workspaceId);
+        if (waiting !== undefined) cancel(waiting.timer);
+        const waiters = waiting === undefined ? [] : waiting.waiters;
+        return new Promise((resolve) => {
+          waiters.push(resolve);
+          const timer = later(() => {
+            colorTimers.delete(workspaceId);
+            pendingColors.delete(workspaceId);
+            void postColor(workspaceId, value).then((result) => {
+              for (const waiter of waiters) waiter(result);
+            });
+          }, typeof delayMs === "number" ? delayMs : 0);
+          colorTimers.set(workspaceId, { timer, waiters });
+        });
+      }
+
+      return {
+        subscribe(listener) {
+          listeners.add(listener);
+          return () => listeners.delete(listener);
+        },
+        getSnapshot() {
+          return snapshot;
+        },
+        setMainSession,
+        loadMain,
+        loadWorkspaces,
+        requestTags,
+        loadDispatched,
+        requestDispatched,
+        setColor,
+      };
+    }
+
+    /** One workspace from a snapshot, or undefined. */
+    function workspaceOf(snapshot, workspaceId) {
+      return Array.isArray(snapshot?.workspaces) ? snapshot.workspaces.find((workspace) => workspace.id === workspaceId) : undefined;
+    }
+
+    /** The WCAG relative luminance of a `#RRGGBB` color. */
+    function relativeLuminance(hex) {
+      const channel = (offset) => {
+        const value = parseInt(hex.slice(offset, offset + 2), 16) / 255;
+        return value <= 0.03928 ? value / 12.92 : Math.pow((value + 0.055) / 1.055, 2.4);
+      };
+      return 0.2126 * channel(1) + 0.7152 * channel(3) + 0.0722 * channel(5);
+    }
+
+    /**
+     * The label color for text on a solid `#RRGGBB` background: black or
+     * white, whichever has the higher contrast ratio. Between the two, every
+     * background reaches at least 4.58:1 (WCAG AA for small text). The chip
+     * carries its own background, so this holds in the light and the dark
+     * theme alike.
+     */
+    function readableTextOn(hex) {
+      if (typeof hex !== "string" || !WORKSPACE_COLOR_PATTERN.test(hex)) return "#000000";
+      const background = relativeLuminance(hex);
+      return (background + 0.05) / 0.05 >= 1.05 / (background + 0.05) ? "#000000" : "#ffffff";
+    }
+
+    /** The CSS custom properties one workspace color paints with. */
+    function tagStyle(color) {
+      return { "--dw-tag": color, "--dw-tag-fg": readableTextOn(color) };
+    }
+
+    /**
+     * The chips under one main-session turn: one per tagged workspace, in the
+     * record's order, each opening that workspace's session for this turn.
+     * Renders nothing outside the main session, for a turn still running, and
+     * for a turn without tags.
+     */
+    function turnTagsView(input) {
+      const t = input.t;
+      const snapshot = input.snapshot;
+      const turn = input.turn;
+      if (typeof input.sessionId !== "string" || input.sessionId !== snapshot.mainSessionId) return null;
+      if (turn === null || typeof turn !== "object" || typeof turn.turn !== "number" || turn.status === "open") return null;
+      const record = snapshot.tags[input.sessionId]?.[turn.turn];
+      if (record === undefined) return null;
+      const ids = [...new Set(record.workspaces.filter((id) => typeof id === "string" && id !== ""))];
+      if (ids.length === 0) return null;
+      const chips = ids.map((id) => {
+        const workspace = workspaceOf(snapshot, id);
+        const title = typeof workspace?.title === "string" && workspace.title !== "" ? workspace.title : id;
+        const sessions = Array.isArray(record.sessions?.[id]) ? record.sessions[id].filter((sessionId) => typeof sessionId === "string" && sessionId !== "") : [];
+        // The latest session this turn sent to the workspace.
+        const target = sessions.length > 0 ? sessions[sessions.length - 1] : null;
+        const label = target === null ? t("tagNoSession", { title }) : t("tagOpen", { title });
+        return h("button", {
+          key: id,
+          type: "button",
+          className: "dw-tag",
+          "data-dw-workspace": id,
+          "data-dw-session": target === null ? undefined : target,
+          style: workspace === undefined ? undefined : tagStyle(workspace.color),
+          disabled: target === null,
+          title: label,
+          "aria-label": label,
+          onClick: target === null ? undefined : () => input.onOpen(target),
+        }, h("span", { className: "dw-tag-text" }, title));
+      });
+      return h("div", { className: "dw-tags", "data-dw-turn": turn.turn }, chips);
+    }
+
+    /** The sidebar dot of one session: present only for a session the whale dispatched to a known workspace. */
+    function sessionDotView(input) {
+      const workspaceId = input.snapshot.dispatched?.[input.sessionId];
+      if (typeof workspaceId !== "string") return null;
+      const workspace = workspaceOf(input.snapshot, workspaceId);
+      if (workspace === undefined) return null;
+      const title = typeof workspace.title === "string" && workspace.title !== "" ? workspace.title : workspaceId;
+      const label = input.t("workspaceDot", { title });
+      return h("span", { className: "dw-ws-dot-cell", "data-dw-workspace": workspaceId, title: label },
+        h("i", { className: "dw-ws-dot", role: "img", "aria-label": label, style: tagStyle(workspace.color) }));
+    }
+
+    /**
+     * The settings section "workspace colors": every workspace with its
+     * swatch, the eight palette colors and a custom color input; a refused
+     * change shows the server's reason under that workspace.
+     */
+    function workspaceColorsSection(input) {
+      const t = input.t;
+      const list = input.workspaces.list;
+      const errors = input.workspaces.errors || {};
+      const choose = typeof input.choose === "function" ? input.choose : () => {};
+      let rows;
+      if (list === null) {
+        rows = [h("div", { className: "dw-row", key: "state" }, h("span", { className: "dw-row-sub" }, input.workspaces.failed === true ? t("workspacesUnavailable") : t("workspacesLoading")))];
+      } else if (list.length === 0) {
+        rows = [h("div", { className: "dw-row", key: "state" }, h("span", { className: "dw-row-sub" }, t("workspacesEmpty")))];
+      } else {
+        rows = list.map((workspace) => {
+          const title = typeof workspace.title === "string" && workspace.title !== "" ? workspace.title : workspace.id;
+          const current = workspace.color.toUpperCase();
+          const error = errors[workspace.id];
+          return h("div", { className: "dw-ws-row", key: workspace.id, "data-dw-workspace": workspace.id },
+            h("div", { className: "dw-ws-head" },
+              h("i", { className: "dw-ws-swatch", style: tagStyle(workspace.color), "aria-hidden": true }),
+              h("span", { className: "dw-row-title" }, title),
+              h("span", { className: "dw-row-value" }, current)),
+            h("div", { className: "dw-ws-palette", role: "group", "aria-label": t("workspacePalette", { title }) },
+              WORKSPACE_PALETTE.map((color) => h("button", {
+                key: color,
+                type: "button",
+                className: "dw-ws-choice",
+                "data-dw-color": color,
+                "aria-pressed": color === current,
+                title: color,
+                "aria-label": t("workspacePaletteColor", { color }),
+                style: tagStyle(color),
+                onClick: () => choose(workspace.id, color, 0),
+              })),
+              h("input", {
+                type: "color",
+                className: "dw-ws-custom",
+                value: workspace.color.toLowerCase(),
+                title: t("workspaceCustomColor"),
+                "aria-label": t("workspaceCustomColor"),
+                onChange: (event) => choose(workspace.id, event.target.value, COLOR_POST_DELAY_MS),
+              })),
+            typeof error === "string" ? h("p", { className: "dw-error", role: "alert" }, t("workspaceColorFailed", { reason: error })) : null);
+        });
+      }
+      return h("div", { className: "dw-section", key: "workspaces", "data-dw-section": "workspaces" },
+        h("h3", { className: "dw-section-title" }, t("settingsSectionWorkspaces")),
+        h("div", { className: "dw-group" }, rows));
+    }
+
+    /** The `conversation.chat.turnTail` entry; `props` are the Turn owner props plus the injected session face. */
+    function makeTurnTags(store, t) {
+      return function DisciplineWhaleTurnTags(props) {
+        const snapshot = React.useSyncExternalStore(store.subscribe, store.getSnapshot);
+        const turn = props.turn;
+        const turnNumber = typeof turn?.turn === "number" ? turn.turn : null;
+        const closed = turn?.status !== "open";
+        const isMain = typeof props.sessionId === "string" && props.sessionId === snapshot.mainSessionId;
+        React.useEffect(() => {
+          void store.loadMain();
+        }, []);
+        React.useEffect(() => {
+          if (!isMain || turnNumber === null || !closed) return;
+          void store.loadWorkspaces(false);
+          store.requestTags(props.sessionId, turnNumber);
+        }, [isMain, props.sessionId, turnNumber, closed]);
+        return turnTagsView({ t, snapshot, sessionId: props.sessionId, turn, onOpen: props.openSession });
+      };
+    }
+
+    /** The `sidebar.session.row.leading` entry; `props.sessionId` is the row's session. */
+    function makeSessionDot(store, t) {
+      return function DisciplineWhaleSessionDot(props) {
+        const snapshot = React.useSyncExternalStore(store.subscribe, store.getSnapshot);
+        React.useEffect(() => {
+          store.requestDispatched(props.sessionId);
+          void store.loadWorkspaces(false);
+        }, [props.sessionId]);
+        return sessionDotView({ t, snapshot, sessionId: props.sessionId });
+      };
+    }
+
+    // The page's one memory store, shared by the chips, the dots and the
+    // settings panel. `resolveMainSession` keeps its main session current.
+    const memoryStore = createMemoryStore();
 
     // ---- activation -------------------------------------------------------
 
@@ -3080,11 +3641,35 @@ window.__ModuleLoader__.load({
       );
       // The voice dock floats over every panel, so a call survives navigation
       // to the conversation and back — the point of a phone-like mode.
-      const VoiceDock = makeVoiceDock(ctx, t);
+      const VoiceDock = makeVoiceDock(ctx, t, memoryStore);
       ctx.slots.inject("shell.overlay", () =>
         ctx.slots.register(
           { name: "shell.overlay", id: "discipline-whale-voice", order: VOICE_DOCK_ORDER, locale: NS },
           VoiceDock
+        )
+      );
+      // Workspace chips under each tagged turn of the main session. The seat
+      // is session-scoped: `inject` receives the conversation's session id.
+      const openSession = (sessionId) => {
+        if (typeof ctx.uiWorkspace?.openSession === "function") ctx.uiWorkspace.openSession(sessionId);
+      };
+      ctx.slots.inject("conversation.chat.turnTail", () =>
+        ctx.slots.register(
+          {
+            name: "conversation.chat.turnTail",
+            id: "discipline-whale-tags",
+            order: TAG_TAIL_ORDER,
+            locale: NS,
+            inject: (sessionId) => ({ sessionId, openSession }),
+          },
+          makeTurnTags(memoryStore, t)
+        )
+      );
+      // The workspace-color dot before a dispatched session's sidebar row.
+      ctx.slots.inject("sidebar.session.row.leading", () =>
+        ctx.slots.register(
+          { name: "sidebar.session.row.leading", id: "discipline-whale-workspace", order: SESSION_DOT_ORDER, locale: NS },
+          makeSessionDot(memoryStore, t)
         )
       );
     }
@@ -3118,6 +3703,15 @@ window.__ModuleLoader__.load({
     module.exports.makeVoiceDock = makeVoiceDock;
     module.exports.createSessionWatcher = createSessionWatcher;
     module.exports.resolveMainSession = resolveMainSession;
+    module.exports.WORKSPACE_PALETTE = WORKSPACE_PALETTE;
+    module.exports.createMemoryStore = createMemoryStore;
+    module.exports.memoryStore = memoryStore;
+    module.exports.readableTextOn = readableTextOn;
+    module.exports.turnTagsView = turnTagsView;
+    module.exports.sessionDotView = sessionDotView;
+    module.exports.workspaceColorsSection = workspaceColorsSection;
+    module.exports.makeTurnTags = makeTurnTags;
+    module.exports.makeSessionDot = makeSessionDot;
     return module.exports;
   },
 });
