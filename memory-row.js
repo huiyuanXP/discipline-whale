@@ -34,10 +34,12 @@ import {
   tagTurn,
 } from './activity.js'
 import { isDispatchAbandoned, listDispatchCheckpoints } from './checkpoint.js'
+import { AUTO_MEMORY_TOOLS } from './guard.js'
 import { collectNewDaily, runDream, shouldDream } from './dream.js'
 import { readCursor, runFlush, shouldFlush, shouldNudge, writeCursor } from './memory-flush.js'
 import {
   appendDaily,
+  ensureLayers,
   importAutoMemory,
   listDailyDays,
   loadMemorySection,
@@ -248,6 +250,28 @@ export async function migrateAutoMemory(root = storeRoot(), now = new Date()) {
   return imported.length
 }
 
+/**
+ * Take dsh-auto-memory's tools out of one agent's tool list, so the main
+ * session has a single memory surface. Names the composition never registered
+ * are skipped. The restriction lives as long as the agent.
+ *
+ * @returns the tool names now hidden from the agent.
+ */
+export function hideAutoMemoryTools(agent) {
+  const tools = agent?.ctx?.tools
+  if (typeof tools?.restrict !== 'function') return []
+  const hidden = []
+  for (const name of AUTO_MEMORY_TOOLS) {
+    try {
+      tools.restrict({ deny: [name] })
+      hidden.push(name)
+    } catch {
+      // Not registered in this composition: nothing to hide.
+    }
+  }
+  return hidden
+}
+
 /* ------------------------------------------------------------------ *
  * the row
  * ------------------------------------------------------------------ */
@@ -390,7 +414,7 @@ export function installMemory(ctx, config = {}, deps = {}) {
   const stateFor = (sessionId) => {
     let state = sessions.get(sessionId)
     if (state === undefined) {
-      state = { userTurns: 0, flushedThisCycle: false, flushing: null, threshold: undefined }
+      state = { nudging: false, flushedThisCycle: false, flushing: null, threshold: undefined }
       sessions.set(sessionId, state)
     }
     return state
@@ -500,8 +524,36 @@ export function installMemory(ctx, config = {}, deps = {}) {
 
   /* -------- hooks -------- */
 
+  /**
+   * Every `nudgeInterval` DSH turns since the last nudge start one flush. The
+   * position is kept per Session in the cursor, so it carries across restarts.
+   */
+  async function noteNudge(agent, sessionId, turn) {
+    if (!Number.isInteger(turn)) return
+    const state = stateFor(sessionId)
+    if (state.nudging) return
+    state.nudging = true
+    try {
+      const cursor = await readCursor(root())
+      const last = Number.isInteger(cursor.nudgeTurn?.[sessionId]) ? cursor.nudgeTurn[sessionId] : 0
+      if (!shouldNudge({ turnsSinceLast: turn - last, interval: resolved.nudgeInterval })) return
+      await writeCursor(root(), { nudgeTurn: { ...(cursor.nudgeTurn ?? {}), [sessionId]: turn } })
+      startFlush(agent, 'nudge')
+    } catch (error) {
+      warn(`could not check the nudge: ${error?.message ?? error}`)
+    } finally {
+      state.nudging = false
+    }
+  }
+
+  // The main session sees one memory surface: dsh-auto-memory's tools leave its
+  // tool list as soon as the agent exists (startup, resume, clear, compact).
+  ctx.on('agent/created', ({ agent }) => {
+    if (isMainAgent(agent)) hideAutoMemoryTools(agent)
+  })
+
   // A real user message: remember its turn for tagging, refresh both blocks,
-  // and count toward the nudge.
+  // and check the nudge.
   ctx.on('agent/inbox/claimed', ({ agent, message, turn }) => {
     if (!isMainAgent(agent)) return
     const sessionId = sessionIdOf(agent)
@@ -512,12 +564,7 @@ export function installMemory(ctx, config = {}, deps = {}) {
     const record = { turn, messageId: message?.id, text, at: now().toISOString() }
     userTurns.set(sessionId, record)
     recordUserTurn(root(), { sessionId, ...record }).catch((error) => warn(`could not record the user turn: ${error?.message ?? error}`))
-    const state = stateFor(sessionId)
-    state.userTurns += 1
-    if (shouldNudge({ userTurnsSinceLast: state.userTurns, interval: resolved.nudgeInterval })) {
-      state.userTurns = 0
-      startFlush(agent, 'nudge')
-    }
+    return noteNudge(agent, sessionId, turn)
   })
 
   // Before each step: bring the cached blocks up to date, and start the flush
@@ -708,6 +755,11 @@ export function installMemory(ctx, config = {}, deps = {}) {
         warn(`dsh-auto-memory migration failed: ${error?.message ?? error}`)
       }
     }
+    try {
+      await ensureLayers(root())
+    } catch (error) {
+      warn(`could not create the memory files: ${error?.message ?? error}`)
+    }
     await refreshMemory()
     await refreshActivity()
   })()
@@ -725,6 +777,7 @@ const MEMORY_RULES = [
   '- 派工后工作区介绍缺失或过时 → `set_workspace_intro`（≤200 字符：用途 + 现状 + 下一步）。',
   '- AGENTS.md 只经 `update_instructions` 修改，且只在用户本轮明确要求时。',
   '- 日常观察由后台自动写入 daily 笔记，定期整理进上面的条目；你专注于用户明确交代的内容。',
+  '- 宿主注入的 `<memory_context>`（用户级记忆）是只读参考；本会话写记忆只用 `remember`。',
 ].join('\n')
 
 export function apply(ctx, config = {}) {

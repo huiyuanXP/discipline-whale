@@ -90,9 +90,9 @@ try {
     assert.equal(shouldFlush({ ...base, contextTokens: 900000, flushedThisCycle: true }), false, 'once per cycle')
     assert.equal(shouldFlush({ ...base, contextTokens: 1000, margin: 837000 }), true, 'margin is configurable')
     assert.equal(shouldFlush({ ...base, contextTokens: undefined }), false, 'unknown token count waits')
-    assert.equal(shouldNudge({ userTurnsSinceLast: 9 }), false)
-    assert.equal(shouldNudge({ userTurnsSinceLast: 10 }), true)
-    assert.equal(shouldNudge({ userTurnsSinceLast: 3, interval: 3 }), true)
+    assert.equal(shouldNudge({ turnsSinceLast: 9 }), false)
+    assert.equal(shouldNudge({ turnsSinceLast: 10 }), true)
+    assert.equal(shouldNudge({ turnsSinceLast: 3, interval: 3 }), true)
     console.log('ok 1 — shouldFlush / shouldNudge boundaries')
   }
 

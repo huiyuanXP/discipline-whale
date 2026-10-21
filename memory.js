@@ -20,7 +20,7 @@
  */
 
 import { createHash } from 'node:crypto'
-import { readdir, readFile } from 'node:fs/promises'
+import { mkdir, readdir, readFile } from 'node:fs/promises'
 import { join } from 'node:path'
 
 import {
@@ -142,6 +142,29 @@ export async function readLayer(homeDir, target) {
  *   hash throws {@link MemoryConflictError}. Omit to skip the check.
  * @throws {MemoryBudgetError} when `text` is over the layer budget.
  */
+/**
+ * Create every layer file that is missing (from its template) and the daily
+ * directory, so the whole structure is on disk and readable before the first
+ * write. Existing files are left untouched.
+ *
+ * @returns the targets whose file was created.
+ */
+export async function ensureLayers(homeDir) {
+  await mkdir(dailyDir(homeDir), { recursive: true })
+  const created = []
+  for (const target of Object.keys(LAYERS)) {
+    if ((await readText(layerPath(homeDir, target))) !== undefined) continue
+    try {
+      await writeLayer(homeDir, target, layerTemplate(target), { expectHash: sha256('') })
+      created.push(target)
+    } catch (error) {
+      // Another writer created it first; its content wins.
+      if (error?.name !== 'MemoryConflictError') throw error
+    }
+  }
+  return created
+}
+
 export async function writeLayer(homeDir, target, text, { expectHash } = {}) {
   return withLock(layerPath(homeDir, target), () => writeLayerLocked(homeDir, target, text, { expectHash }))
 }

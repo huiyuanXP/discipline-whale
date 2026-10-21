@@ -30,12 +30,14 @@ import { readTags, readWorkspaceCards, setWorkspaceIntro } from '../activity.js'
 import { writeDispatchCheckpoint } from '../checkpoint.js'
 import { AUTO_MEMORY_TOOLS, installGuard } from '../guard.js'
 import * as mainRow from '../main.js'
+import { readCursor } from '../memory-flush.js'
 import { readDaily, readLayer } from '../memory.js'
 import {
   ACTIVITY_CONTEXT_NAME,
   MEMORY_SECTION_NAME,
   autoMemoryProjectDir,
   currentUserTurn,
+  hideAutoMemoryTools,
   installMemory,
   noteDispatch,
 } from '../memory-row.js'
@@ -163,7 +165,23 @@ try {
     [],
   )
   assert.ok(h.listeners.has('tools/result'))
-  console.log('ok 1 — four tools with supported schemas, one section, one required context, no tool waterfalls')
+  // dsh-auto-memory's tools leave the main agent's tool list; names the composition lacks are skipped.
+  const restricted = []
+  const toolsOf = (lacking) => ({
+    restrict: ({ deny }) => {
+      if (deny[0] === lacking) throw new Error(`unknown global tool "${lacking}"`)
+      restricted.push(deny[0])
+      return () => {}
+    },
+  })
+  assert.deepEqual(hideAutoMemoryTools({ ctx: { tools: toolsOf('memory_prune') } }), [...AUTO_MEMORY_TOOLS].filter((name) => name !== 'memory_prune'))
+  restricted.length = 0
+  await h.emit('agent/created', { agent: { ...agent, ctx: { tools: toolsOf(undefined) } }, source: 'startup' })
+  assert.deepEqual(restricted, [...AUTO_MEMORY_TOOLS])
+  restricted.length = 0
+  await h.emit('agent/created', { agent: { session: { id: 'w', header: { agentPreset: 'discipline-whale-worker' } }, ctx: { tools: toolsOf(undefined) } }, source: 'startup' })
+  assert.deepEqual(restricted, [], 'a worker keeps its tools')
+  console.log('ok 1 — four tools, one section, one required context, no tool waterfalls, auto-memory tools hidden from the main agent')
 
   // 2
   assert.match((await readLayer(root, 'user')).text, /回复先给结论 \[source: dsh-auto-memory:reply-audience/)
@@ -171,7 +189,9 @@ try {
   assert.ok(memoryRoot.some((entry) => entry.includes('.migrated-20261021')), 'the source directory is renamed')
   assert.ok(!memoryRoot.includes(autoDir.split('/').pop()), 'the host index for the whale home now reads empty')
   assert.match(h.sections[0].text(), /回复先给结论/)
-  console.log('ok 2 — dsh-auto-memory entries imported, source directory renamed aside')
+  const memoryFiles = await readdir(join(whaleHomeDir(root), 'memory'))
+  for (const name of ['SOUL.md', 'USER.md', 'MEMORY.md', 'daily']) assert.ok(memoryFiles.includes(name), `${name} exists from the start`)
+  console.log('ok 2 — dsh-auto-memory entries imported, source renamed aside, every layer file and daily/ on disk')
 
   // 3
   await userSays(h, 3, '把博客 RSS 迁到 Astro')
@@ -243,14 +263,23 @@ try {
   h.tokens.value = 1000
   console.log('ok 7 — the pre-compaction flush runs once per cycle, beside the turn')
 
-  // 8: the counter already holds turns 3, 4 and 5.
+  // 8: the nudge counts DSH turns since the last nudge, and the position survives a restart.
   const beforeNudge = h.llmCalls.length
-  for (let turn = 6; turn <= 11; turn += 1) await userSays(h, turn, `第 ${turn} 句`)
-  assert.equal(h.llmCalls.length, beforeNudge, 'nine user turns are below the interval')
-  await userSays(h, 12, '第 12 句')
+  for (let turn = 6; turn <= 9; turn += 1) await userSays(h, turn, `第 ${turn} 句`)
+  assert.equal(h.llmCalls.length, beforeNudge, 'turn 9 is below the interval')
+  await userSays(h, 10, '第 10 句')
   await handle.sessions.get(MAIN).flushing
-  assert.equal(h.llmCalls.length, beforeNudge + 1, 'the tenth user turn starts one nudge flush')
-  console.log('ok 8 — every ten real user turns start one nudge flush')
+  assert.equal(h.llmCalls.length, beforeNudge + 1, 'turn 10 starts one nudge flush')
+  assert.equal((await readCursor(root)).nudgeTurn[MAIN], 10)
+  const restarted = host()
+  const restartedHandle = installMemory(restarted.ctx, { dreamMinEntries: 50 }, { root: () => root, now: () => now })
+  await restartedHandle.ready
+  await userSays(restarted, 15, '重启后第 15 轮')
+  assert.equal(restarted.llmCalls.length, 0, 'five turns after the last nudge')
+  await userSays(restarted, 20, '重启后第 20 轮')
+  await restartedHandle.sessions.get(MAIN).flushing
+  assert.equal(restarted.llmCalls.length, 1, 'ten turns after the last nudge, counted across the restart')
+  console.log('ok 8 — every ten DSH turns start one nudge flush, and the count survives a restart')
 
   // 9
   await h.emit('agent/status', { agent, status: 'idle' })

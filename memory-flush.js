@@ -88,9 +88,9 @@ export function shouldFlush({ contextTokens, compactThreshold, margin = 32768, f
   return contextTokens >= compactThreshold - margin
 }
 
-/** True once `interval` user turns have passed since the last flush or nudge. */
-export function shouldNudge({ userTurnsSinceLast, interval = 10 }) {
-  return Number.isFinite(userTurnsSinceLast) && userTurnsSinceLast >= interval
+/** True once `interval` DSH turns have passed since the last nudge. */
+export function shouldNudge({ turnsSinceLast, interval = 10 }) {
+  return Number.isFinite(turnsSinceLast) && turnsSinceLast >= interval
 }
 
 /**

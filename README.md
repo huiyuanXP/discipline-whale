@@ -496,10 +496,10 @@ worker 每次即将结束回合时，插件会检查本轮是否调用过 `repor
 - 清工具输出：压缩压力成立时先清工具输出（`pruner.js`）。最近 3 个用户 turn 保留，更早的换成一行占位，原文仍在 session log。
 - 压缩：沿用 `dsh-compaction-basic`。
 - flush：距压缩阈值 32K token 时跑一次后台隐藏调用，把值得留下的观察写进 daily，并更新 Now 和工作区介绍。
-- nudge：每 10 个真实用户 turn 也跑一次，逻辑同 flush。
+- nudge：距上次 nudge 满 10 个 DSH turn 时也跑一次，逻辑同 flush；进度存在游标里，重启后接着计。
 - dream：主会话空闲、且距上次 ≥24h、新 daily ≥5 条时运行。它只输出操作列表，由代码执行，并受 6 条门禁约束（删除 ≤25%、条目必须有来源、hash 校验、预算、结构可解析，失败时只追加）。`dream_now` 可以手动触发。
 
-**和宿主 `dsh-auto-memory` 的关系**：主会话的记忆由鲸鱼接管。首次启动时，鲸鱼 home 下已有的 auto-memory 条目会被迁进 USER / MEMORY，原目录改名为 `*.migrated-YYYYMMDD` 保留。主会话里调用 `memory_*` 工具会被 guard 引导去用 `remember`。其它会话照常使用 auto-memory。
+**和宿主 `dsh-auto-memory` 的关系**：主会话的记忆由鲸鱼接管。首次启动时，鲸鱼 home 下已有的 auto-memory 条目会被迁进 USER / MEMORY，原目录改名为 `*.migrated-YYYYMMDD` 保留；SOUL / USER / MEMORY 三个文件和 `daily/` 目录在启动时就建好。主会话 agent 创建时，`memory_*` 工具从它的工具列表里移除，guard 再兜一层：万一被调用，引导去用 `remember`。宿主注入的用户级记忆（`<memory_context>`）在主会话里是只读参考。其它会话照常使用 auto-memory。
 
 **客户端**：主会话每轮的回复尾部显示彩色工作区标签，点击打开对应的工作会话。派出去的会话在侧栏有工作区色点。工作区颜色在鲸鱼设置面板里修改。数据来自 `/api/discipline-whale/memory/{workspaces,tags,dispatched}`。
 
