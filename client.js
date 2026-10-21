@@ -50,16 +50,32 @@ window.__ModuleLoader__.load({
     // is on screen; a higher order puts it above the shipped overlays.
     const VOICE_DOCK_ORDER = 40;
 
-    // One place for the call's timing rules. The detector reads them from here,
-    // and the tests assert these exact values, so changing 10s is one edit.
+    // Where the page loads its speech detector from: this plugin's own routes
+    // (voice-assets.js), never a CDN.
+    const VOICE_ASSET_ROUTE = "/api/discipline-whale/voice/vad";
+
+    // One place for the call's turn rules, mirrored verbatim from
+    // voice-silence.js; `test/client.mjs` proves the copies match.
     const VOICE_CONSTANTS = {
-      silenceMs: 10000,
-      calibrationMs: 500,
-      noiseMargin: 0.02,
-      minThreshold: 0.012,
-      minSpeechMs: 500,
-      maxRecordingMs: 60000,
-      minRecordingMs: 1000,
+      // Silero VAD turn-taking for vad-web's MicVAD (TURN_OPTIONS).
+      turn: {
+        model: "v5",
+        positiveSpeechThreshold: 0.5,
+        negativeSpeechThreshold: 0.35,
+        redemptionMs: 2000,
+        preSpeechPadMs: 500,
+        minSpeechMs: 500,
+      },
+      // The pauses the settings offer for "the turn is over".
+      redemptionChoicesMs: [1000, 2000, 3000, 5000, 8000],
+      // Speech that never pauses is cut and sent here.
+      maxSpeechMs: 60000,
+      // Quieter than this was not said into this microphone.
+      minSpeechLevelDbfs: -45,
+      // Away rules: listening this long without an accepted turn, or this many
+      // utterances in a row refused as background sound, closes the microphone.
+      awayIdleMs: 120000,
+      awayMaxRejections: 3,
       // How long to wait for the whale's turn to settle before giving up.
       replyTimeoutMs: 180000,
       // Turn polling cadence; a real turn-end event is not available here.
@@ -80,8 +96,8 @@ window.__ModuleLoader__.load({
         callExpand: "展开",
         callClose: "关闭",
         statusReady: "待命 · 可以直接说话",
-        statusCalibrating: "正在听环境噪音…",
-        statusListening: "正在听 · 停口 10 秒自动发送",
+        statusCalibrating: "正在准备收音…",
+        statusListening: "正在听 · 说完停顿一下就发送",
         statusTranscribing: "识别中…",
         statusThinking: "鲸鱼思考中…",
         statusSpeaking: "朗读中…",
@@ -107,6 +123,12 @@ window.__ModuleLoader__.load({
         errNoMainSession: "还没有主会话，请先从侧边栏打开自律鲸鱼。",
         errNoSpeech: "没听到有效语音，未发送。",
         errReplyTimeout: "等鲸鱼回复超时，可以到会话里查看。",
+        errVadLoad: "语音检测组件没能加载，请确认插件安装完整后重试。",
+        noticeRejected: "这段听起来是背景声，没有发送。",
+        noticeTooQuiet: "声音离麦克风太远，没有发送。",
+        noticeAwayIdle: "2 分钟没有发出新消息，已关闭话筒。点话筒继续。",
+        noticeAwayRejected: "连续几段都像背景声，已关闭话筒。点话筒继续。",
+        noticeHidden: "页面切到了后台，已关闭话筒。点话筒继续。",
         micOn: "话筒：开",
         micOff: "话筒：关",
         micHintOn: "点击关闭话筒并释放麦克风设备",
@@ -125,12 +147,18 @@ window.__ModuleLoader__.load({
         detachHint: "把通话条放进一个独立的置顶小窗；切换页面或会话都不会中断通话。浏览器最小化时小窗会随之隐藏——普通网页无法画在浏览器之外。",
         detachFailed: "无法打开独立窗口（可能被浏览器拦截或缺少用户手势）。通话条仍在页面内，通话未中断。",
         detachReturn: "收回窗口",
+        dockedHintCall: "点按开关话筒；拖离边缘展开",
+        dockedHintIdle: "点按开始通话；拖离边缘展开",
+        resizeHint: "拖动调整大小",
         settingsOpen: "语音设置",
         settingsBack: "返回",
         settingsSectionCall: "通话",
         settingsSectionAsr: "语音识别",
         settingsSectionTts: "朗读引擎",
         settingsSpeakLabel: "朗读回复",
+        settingsRedemption: "说完后停顿多久发送",
+        settingsRedemptionHint: "越短回应越快；越长越不会把思考时的停顿当成说完。",
+        settingsSeconds: "{n} 秒",
         settingsService: "服务与密钥",
         settingsTtsEntry: "真实 TTS",
         settingsLanguageAuto: "跟随界面",
@@ -185,8 +213,8 @@ window.__ModuleLoader__.load({
         callExpand: "Expand",
         callClose: "Close",
         statusReady: "Ready · just talk",
-        statusCalibrating: "Listening to the room…",
-        statusListening: "Listening · sends after 10s of silence",
+        statusCalibrating: "Getting the microphone ready…",
+        statusListening: "Listening · pause when you're done",
         statusTranscribing: "Transcribing…",
         statusThinking: "The whale is thinking…",
         statusSpeaking: "Speaking…",
@@ -212,6 +240,12 @@ window.__ModuleLoader__.load({
         errNoMainSession: "There is no main session yet; open the whale from the sidebar first.",
         errNoSpeech: "No usable speech was heard, so nothing was sent.",
         errReplyTimeout: "The reply took too long; open the conversation to check.",
+        errVadLoad: "The speech detector failed to load; check the plugin installation and retry.",
+        noticeRejected: "That sounded like background sound, so nothing was sent.",
+        noticeTooQuiet: "That was too far from the microphone, so nothing was sent.",
+        noticeAwayIdle: "No message for 2 minutes, so the microphone is off. Tap it to continue.",
+        noticeAwayRejected: "Several clips in a row sounded like background sound, so the microphone is off. Tap it to continue.",
+        noticeHidden: "The page went to the background, so the microphone is off. Tap it to continue.",
         micOn: "Microphone: on",
         micOff: "Microphone: off",
         micHintOn: "Click to close the microphone and release the device",
@@ -230,12 +264,18 @@ window.__ModuleLoader__.load({
         detachHint: "Move the dock into a separate always-on-top window; switching pages or sessions never interrupts the call. Minimizing the browser hides that window too — a web page cannot draw outside the browser.",
         detachFailed: "Could not open the detached window (blocked, or no user gesture). The dock stays in the page and the call continues.",
         detachReturn: "Bring it back",
+        dockedHintCall: "Tap to switch the microphone; drag away from the edge to open",
+        dockedHintIdle: "Tap to start a call; drag away from the edge to open",
+        resizeHint: "Drag to resize",
         settingsOpen: "Voice settings",
         settingsBack: "Back",
         settingsSectionCall: "Call",
         settingsSectionAsr: "Transcription",
         settingsSectionTts: "Read-aloud engine",
         settingsSpeakLabel: "Read replies aloud",
+        settingsRedemption: "Pause that ends your turn",
+        settingsRedemptionHint: "Shorter answers faster; longer keeps a thinking pause from ending your turn.",
+        settingsSeconds: "{n} s",
         settingsService: "Service and key",
         settingsTtsEntry: "Real TTS",
         settingsLanguageAuto: "Follow the UI",
@@ -345,101 +385,45 @@ window.__ModuleLoader__.load({
     // ---- the voice call: pure rules (mirrored from voice-silence.js) ------
     //
     // The shared module is ESM for the host/tests; the browser half is a plain
-    // script in the shell's wrapper, so it cannot import it. The algorithm is
+    // script in the shell's wrapper, so it cannot import it. These rules are
     // therefore mirrored here verbatim and `test/client.mjs` proves both copies
-    // decide identically frame for frame — a drift fails that test rather than
-    // silently changing when a call ends.
+    // decide identically.
 
-    /** One 20ms synthetic frame at 16kHz, for tests and for the mirrored check. */
-    function testFrame(amplitude, samples) {
-      const count = typeof samples === "number" ? samples : 320;
-      const out = new Float32Array(count);
-      for (let i = 0; i < count; i += 1) out[i] = amplitude * Math.sin((2 * Math.PI * 220 * i) / 16000);
-      return out;
+    /** The 90th-percentile level of an utterance's 30 ms frames, in dBFS. */
+    function speechLevelDbfs(samples, sampleRate) {
+      const rate = typeof sampleRate === "number" ? sampleRate : 16000;
+      const frame = Math.max(1, Math.round(rate * 0.03));
+      const levels = [];
+      for (let start = 0; start + frame <= samples.length; start += frame) {
+        let sum = 0;
+        for (let i = start; i < start + frame; i += 1) sum += samples[i] * samples[i];
+        levels.push(Math.sqrt(sum / frame));
+      }
+      if (levels.length === 0) return -Infinity;
+      levels.sort((a, b) => a - b);
+      const loud = levels[Math.min(levels.length - 1, Math.floor(levels.length * 0.9))];
+      return loud > 0 ? 20 * Math.log10(loud) : -Infinity;
     }
 
-    function rmsOf(samples) {
-      if (!samples || samples.length === 0) return 0;
-      let sum = 0;
-      for (let i = 0; i < samples.length; i += 1) sum += samples[i] * samples[i];
-      return Math.sqrt(sum / samples.length);
-    }
-
-    function createSilenceDetector(options) {
-      const config = Object.assign({}, VOICE_CONSTANTS, options || {});
-      let elapsedMs = 0;
-      let calibrationFrames = 0;
-      let calibrationSum = 0;
-      let calibrated = false;
-      let floor = 0;
-      let threshold = config.minThreshold;
-      let silenceMs = 0;
-      let speechMs = 0;
-
-      function calibrate() {
-        floor = calibrationSum / Math.max(1, calibrationFrames);
-        threshold = Math.max(config.minThreshold, floor * 2 + config.noiseMargin);
-        calibrated = true;
-      }
-
-      function decide(reason) {
-        const upload = speechMs >= config.minSpeechMs;
-        return {
-          action: "stop",
-          reason: upload ? reason : "no-speech",
-          upload,
-          speechMs,
-          elapsedMs,
-          threshold,
-        };
-      }
-
+    /** Notices the person has walked away; only listening time counts. */
+    function createAwayGuard(options) {
+      const idleMs = options?.idleMs ?? VOICE_CONSTANTS.awayIdleMs;
+      const maxRejections = options?.maxRejections ?? VOICE_CONSTANTS.awayMaxRejections;
+      let since = null;
+      let banked = 0;
+      let rejections = 0;
       return {
-        push(samples, frameMs) {
-          const duration = Math.max(0, Number(frameMs) || 0);
-          const level = rmsOf(samples);
-          if (!calibrated) {
-            calibrationFrames += 1;
-            calibrationSum += level;
-            elapsedMs += duration;
-            if (elapsedMs >= config.calibrationMs) calibrate();
-            return undefined;
-          }
-          elapsedMs += duration;
-          if (level > threshold) {
-            speechMs += duration;
-            silenceMs = 0;
-          } else {
-            silenceMs += duration;
-          }
-          if (elapsedMs >= config.maxRecordingMs) return decide("max-duration");
-          if (silenceMs >= config.silenceMs) return decide(speechMs >= config.minSpeechMs ? "silence" : "no-speech");
-          return undefined;
-        },
-        threshold() { return threshold; },
-        floor() { return floor; },
-        elapsedMs() { return elapsedMs; },
-        speechMs() { return speechMs; },
-        silenceMs() { return silenceMs; },
-        canStop() { return elapsedMs >= config.minRecordingMs; },
-        // Muted frames are not quiet-room frames: pause() clears the silence
-        // run so unmuting cannot end the utterance on its first frame, and
-        // resume() restarts the run without touching calibration or speech.
-        pause() { silenceMs = 0; },
-        resume() { silenceMs = 0; },
-        stop() {
-          if (!this.canStop()) return { action: "stop", reason: "too-short", upload: false, speechMs, elapsedMs, threshold };
-          return decide(speechMs >= config.minSpeechMs ? "manual" : "no-speech");
-        },
-        reset() {
-          elapsedMs = 0;
-          calibrationFrames = 0;
-          calibrationSum = 0;
-          calibrated = false;
-          floor = 0;
-          threshold = config.minThreshold;
-          silenceMs = 0;
-          speechMs = 0;
+        resume(now) { if (since === null) since = now; },
+        suspend(now) { if (since !== null) banked += now - since; since = null; },
+        accepted(now) { banked = 0; rejections = 0; if (since !== null) since = now; },
+        present(now) { banked = 0; rejections = 0; if (since !== null) since = now; },
+        rejected() { rejections += 1; },
+        reset() { since = null; banked = 0; rejections = 0; },
+        reason(now) {
+          if (rejections >= maxRejections) return "rejections";
+          const listened = banked + (since === null ? 0 : now - since);
+          if (listened >= idleMs) return "idle";
+          return null;
         },
       };
     }
@@ -472,15 +456,17 @@ window.__ModuleLoader__.load({
     //   microphone ("话筒") = the DEVICE. On acquires the stream (the OS
     //                         indicator lights). Off stops every track and
     //                         releases the device.
-    //   mute ("静音")       = PROCESSING. The stream may still be live, but each
-    //                         audio frame is discarded: no VAD, no upload, no
-    //                         send. Unmuting resumes at the next frame.
+    //   mute ("静音")       = PROCESSING. The stream stays live, but the speech
+    //                         detector is paused: no frame is analysed, nothing
+    //                         is uploaded or sent, and a segment in progress is
+    //                         dropped. Unmuting resumes detection on the same
+    //                         stream.
     //
     // Consequences this encodes, rather than leaving to the UI:
     //   * mute is unavailable while the device is off (there is nothing to mute)
     //   * muting never stops a track, and stopping the device never leaves a
     //     mute latched behind it
-    //   * `processing` is the single flag the frame path consults
+    //   * `processing` is the single flag listening consults
     function createCallControls() {
       let device = false;
       let muted = false;
@@ -513,35 +499,197 @@ window.__ModuleLoader__.load({
       };
     }
 
+    // ---- listening: vad-web's MicVAD under the call's rules -----------------
+    //
+    // When a turn starts and ends is Silero VAD's decision, made by
+    // `@ricky0123/vad-web` (MicVAD): speech probabilities per frame, the start
+    // and end hysteresis, the pre-speech pad, misfires under the minimum
+    // speech. This wrapper only maps the call's controls onto it.
+
     /**
-     * The frame path's gate: the one place that decides whether a frame is
-     * processed.
+     * One call's listener.
      *
-     * Muting flips `processing` to false; `push` then returns immediately, so
-     * the detector never sees the frame and the VAD's silence accounting cannot
-     * advance while muted. The detector is told about the transition with
-     * `pause()`/`resume()`, which is what keeps a long mute from reading as a
-     * ten-second pause.
+     *   listen(muted)  open the microphone and detect speech (muted: open it,
+     *                  but process nothing)
+     *   hold()         half-duplex while the whale works: stop detecting and
+     *                  release the microphone; a segment in progress is dropped
+     *   mute()         stop detecting, keep the microphone open; a segment in
+     *                  progress is dropped
+     *   unmute()       detect again on the same stream
+     *   finish()       "done talking": end the segment now and hand it over;
+     *                  answers whether there was one
+     *   close()        release everything
+     *
+     * Each finished segment reaches `onUtterance(audio)` as 16 kHz Float32
+     * samples. A segment still going after `maxSpeechMs` is finished
+     * automatically. MicVAD is created lazily through `createVad(options)`, so
+     * tests drive this with a fake.
+     * @param deps `createVad`, `getStream`, VAD `options`, `maxSpeechMs`,
+     *   `onUtterance`, and injectable `setTimeout` / `clearTimeout`.
+     * @returns the listener.
      */
-    function createFrameGate(options) {
-      const onFrame = options.onFrame;
-      const onProcessingChange = options.onProcessingChange;
-      let processing = false;
+    function createTurnTaker(deps) {
+      const schedule = deps.setTimeout ?? ((fn, ms) => setTimeout(fn, ms));
+      const cancel = deps.clearTimeout ?? ((id) => clearTimeout(id));
+      let vad = null;
+      let creating = null;
+      let stream = null;
+      // Set by close(): a detector or a stream that arrives afterwards (the
+      // model still loading, the permission prompt still open) is released at
+      // once instead of starting.
+      let closed = false;
+      let keepStream = false;
+      let delivered = false;
+      let capTimer = null;
+      let options = { ...deps.options };
+
+      const clearCap = () => {
+        if (capTimer !== null) cancel(capTimer);
+        capTimer = null;
+      };
+      const stopTracks = () => {
+        const current = stream;
+        stream = null;
+        try { current?.getTracks().forEach((track) => track.stop()); } catch (_error) { /* already stopped */ }
+      };
+      const closedError = () => Object.assign(new Error("listening closed"), { code: "closed" });
+      const acquire = async () => {
+        const next = await deps.getStream();
+        if (closed) {
+          try { next?.getTracks().forEach((track) => track.stop()); } catch (_error) { /* already stopped */ }
+          throw closedError();
+        }
+        stream = next;
+        return stream;
+      };
+
+      async function ensure() {
+        if (closed) throw closedError();
+        if (vad !== null) return vad;
+        if (creating === null) {
+          creating = Promise.resolve(deps.createVad({
+            ...options,
+            startOnLoad: false,
+            submitUserSpeechOnPause: false,
+            getStream: acquire,
+            // Half-duplex releases the device; mute keeps it open.
+            pauseStream: async () => { if (!keepStream) stopTracks(); },
+            resumeStream: async (current) => {
+              const live = current?.getTracks().some((track) => track.readyState === "live") === true;
+              return live ? current : acquire();
+            },
+            onSpeechRealStart: () => {
+              clearCap();
+              capTimer = schedule(() => { void finish(); }, deps.maxSpeechMs);
+            },
+            onSpeechEnd: (audio) => {
+              clearCap();
+              delivered = true;
+              deps.onUtterance(audio);
+            },
+            onVADMisfire: () => { clearCap(); },
+          })).then((created) => {
+            if (closed) {
+              Promise.resolve().then(() => created.destroy()).catch(() => { /* never started */ });
+              throw closedError();
+            }
+            vad = created;
+            return created;
+          }).finally(() => { creating = null; });
+        }
+        return creating;
+      }
+
+      async function pause(keep, submit) {
+        clearCap();
+        if (vad !== null) {
+          keepStream = keep;
+          if (submit) vad.setOptions({ submitUserSpeechOnPause: true });
+          try {
+            await vad.pause();
+          } finally {
+            if (submit) vad.setOptions({ submitUserSpeechOnPause: false });
+            keepStream = false;
+          }
+        }
+        // MicVAD.pause() does nothing once detection is already paused (muted),
+        // so releasing the device never depends on its pauseStream call.
+        if (!keep) stopTracks();
+      }
+
+      async function finish() {
+        delivered = false;
+        await pause(false, true);
+        return delivered;
+      }
+
       return {
-        setProcessing(next) {
-          const value = Boolean(next);
-          if (value === processing) return;
-          processing = value;
-          if (typeof onProcessingChange === "function") onProcessingChange(value);
+        async listen(muted) {
+          const created = await ensure();
+          await created.start();
+          if (closed) {
+            stopTracks();
+            throw closedError();
+          }
+          if (muted === true) await pause(true, false);
         },
-        processing() {
-          return processing;
+        hold() { return pause(false, false); },
+        mute() { return pause(true, false); },
+        async unmute() {
+          if (vad !== null) await vad.start();
         },
-        push(samples, frameMs) {
-          if (!processing) return;
-          onFrame(samples, frameMs);
+        finish,
+        /** Change how long a pause ends the turn, now and for a later start. */
+        setRedemptionMs(ms) {
+          options = { ...options, redemptionMs: ms };
+          if (vad !== null) vad.setOptions({ redemptionMs: ms });
+        },
+        async close() {
+          closed = true;
+          clearCap();
+          const current = vad;
+          vad = null;
+          if (current !== null) {
+            try { await current.destroy(); } catch (_error) { /* already destroyed */ }
+          }
+          stopTracks();
         },
       };
+    }
+
+    /**
+     * Load vad-web once, from the plugin's own routes: onnxruntime-web first
+     * (it defines the global `ort` the vad-web bundle expects), then the bundle,
+     * which defines `vad`.
+     */
+    let vadLibrary = null;
+    function loadVadLibrary() {
+      if (vadLibrary === null) {
+        vadLibrary = (async () => {
+          if (window.vad?.MicVAD === undefined) {
+            if (window.ort === undefined) await loadScript(`${VOICE_ASSET_ROUTE}/ort.wasm.min.js`);
+            await loadScript(`${VOICE_ASSET_ROUTE}/bundle.min.js`);
+          }
+          if (window.vad?.MicVAD === undefined) throw Object.assign(new Error("vad-web did not load"), { code: "vad-load" });
+          return window.vad;
+        })().catch((error) => {
+          vadLibrary = null;
+          throw Object.assign(error instanceof Error ? error : new Error(String(error)), { code: "vad-load" });
+        });
+      }
+      return vadLibrary;
+    }
+
+    function loadScript(src) {
+      return new Promise((resolve, reject) => {
+        const element = document.createElement("script");
+        element.src = src;
+        element.async = true;
+        element.dataset.dshPlugin = "discipline-whale";
+        element.onload = () => resolve();
+        element.onerror = () => reject(new Error(`could not load ${src}`));
+        document.head.appendChild(element);
+      });
     }
 
     // ---- keeping the call outside the page ---------------------------------
@@ -621,6 +769,118 @@ window.__ModuleLoader__.load({
       if (Math.min(toLeft, toRight) <= snapDistance) edge = toLeft <= toRight ? "left" : "right";
       const snappedX = edge === "left" ? margin : edge === "right" ? Math.max(margin, maxX) : x;
       return { x: snappedX, y, edge };
+    }
+
+    /**
+     * Where a released dock settles, as the CSS anchoring the stylesheet uses.
+     *
+     * Two shapes, one rule each:
+     *   * The open panel, pushed past a side edge by 30% of its width (at most
+     *     120px), is stashed on that side as a single microphone button.
+     *     Released anywhere else it stays open, clamped and edge-snapped by
+     *     `snapDockPosition`.
+     *   * The stashed button, released within `snapDistance` of a side, stays
+     *     stashed there (it can slide along the edge). Released further in, it
+     *     opens again at `expanded` size, centred on where it was dropped.
+     *
+     * The result is anchored to the nearer side (`anchor`, distance `x` from
+     * it) and to the bottom (`y`), so a panel that grows or shrinks keeps its
+     * control bar where the user left it.
+     * @param input `left`/`top` of the dropped box (unclamped), its `width`/
+     *   `height`, the `viewport`, whether it is `docked`, the `expanded` size,
+     *   and optional `margin` / `dockMargin` / `snapDistance`.
+     * @returns `{ docked, anchor, x, y }`; `docked` is "left", "right" or null.
+     */
+    function dockRelease(input) {
+      const margin = input.margin ?? 16;
+      const dockMargin = input.dockMargin ?? 8;
+      const snapDistance = input.snapDistance ?? 72;
+      const viewport = input.viewport;
+      const width = Math.max(0, input.width);
+      const height = Math.max(0, input.height);
+      let docked = null;
+      if (input.docked === true) {
+        const toLeft = input.left;
+        const toRight = viewport.width - (input.left + width);
+        if (Math.min(toLeft, toRight) <= snapDistance) docked = toLeft <= toRight ? "left" : "right";
+      } else {
+        const push = Math.min(120, width * 0.3);
+        if (-input.left > push) docked = "left";
+        else if (input.left + width - viewport.width > push) docked = "right";
+      }
+      if (docked !== null) {
+        const top = Math.min(Math.max(input.top, margin), Math.max(margin, viewport.height - height - margin));
+        return { docked, anchor: docked, x: dockMargin, y: viewport.height - top - height };
+      }
+      // Opening from the stashed button uses the panel's own size, centred
+      // under the drop point with its bottom edge where the button was.
+      const box = input.docked === true && input.expanded
+        ? {
+          width: input.expanded.width,
+          height: input.expanded.height,
+          left: input.left + width / 2 - input.expanded.width / 2,
+          top: input.top + height - input.expanded.height,
+        }
+        : { width, height, left: input.left, top: input.top };
+      const placed = snapDockPosition({
+        x: box.left,
+        y: box.top,
+        width: box.width,
+        height: box.height,
+        viewport,
+        margin,
+        snapDistance,
+      });
+      const anchor = placed.x + box.width / 2 < viewport.width / 2 ? "left" : "right";
+      return {
+        docked: null,
+        anchor,
+        x: anchor === "left" ? placed.x : viewport.width - placed.x - box.width,
+        y: viewport.height - placed.y - box.height,
+      };
+    }
+
+    /**
+     * The panel's size while a corner grip is dragged.
+     *
+     * The grip sits on the panel's free top corner, so dragging it outward or
+     * up grows the panel away from its anchored side and bottom. `room` is the
+     * space left between the panel and the viewport margin on each side; the
+     * result never grows past it and never shrinks below the minimums.
+     * @param input `width`, `cardHeight`, pointer delta `dx`/`dy`, `corner`
+     *   ("left" or "right"), `room` `{ left, right, top }`, and optional minimums.
+     * @returns `{ width, cardHeight }` in pixels.
+     */
+    function dockResize(input) {
+      const minWidth = input.minWidth ?? 300;
+      const minCardHeight = input.minCardHeight ?? 120;
+      const clamp = (value, low, high) => Math.min(Math.max(value, low), Math.max(low, high));
+      const grow = input.corner === "right" ? input.dx : -input.dx;
+      const roomX = input.corner === "right" ? input.room.right : input.room.left;
+      return {
+        width: clamp(input.width + grow, minWidth, input.width + Math.max(0, roomX)),
+        cardHeight: clamp(input.cardHeight - input.dy, minCardHeight, input.cardHeight + Math.max(0, input.room.top)),
+      };
+    }
+
+    /** How far a press must travel before it moves the dock instead of clicking. */
+    const DRAG_THRESHOLD = 5;
+
+    /**
+     * The geometry custom properties for the dock host, from the saved
+     * placement and size. Numbers only: the stylesheet decides what they move.
+     */
+    function dockGeometryStyle(placement, size) {
+      const style = {};
+      if (placement !== null && placement !== undefined) {
+        style["--dw-dock-x"] = String(Math.round(placement.x));
+        style["--dw-dock-y"] = String(Math.round(placement.y));
+      }
+      if (size !== null && size !== undefined) {
+        style["--dw-dock-w"] = String(Math.round(size.width));
+        style["--dw-card-h"] = String(Math.round(size.cardHeight));
+      }
+      return Object.keys(style).length === 0 ? undefined : style;
     }
 
     /**
@@ -825,104 +1085,6 @@ window.__ModuleLoader__.load({
       return bytes;
     }
 
-    /**
-     * One microphone session.
-     *
-     * Recording choice: AudioWorklet-free `ScriptProcessorNode` would be
-     * deprecated, and `MediaRecorder` gives opus/webm whose duration and level
-     * are awkward to read. So this uses `AudioWorkletNode` when available and
-     * falls back to `MediaRecorder` otherwise; either way the WAV path is
-     * canonical PCM16 16kHz mono, which is what the host route forwards.
-     *
-     * Simplicity is deliberate here: the browser is not the right place for
-     * cleverness, and all decisions live in `createSilenceDetector`.
-     */
-    function createMicrophone(options) {
-      const onFrame = options.onFrame;
-      const onFatal = options.onFatal;
-      let stream = null;
-      let context = null;
-      let source = null;
-      let node = null;
-      let analyser = null;
-      let recorder = null;
-      let chunks = [];
-      let samples = [];
-      let sampleRate = 48000;
-      let stopped = false;
-
-      async function start() {
-        const devices = typeof navigator !== "undefined" ? navigator.mediaDevices : undefined;
-        if (!devices || typeof devices.getUserMedia !== "function") throw Object.assign(new Error("unsupported"), { code: "unsupported" });
-        try {
-          stream = await devices.getUserMedia({
-            audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
-            video: false,
-          });
-        } catch (error) {
-          const denied = error && (error.name === "NotAllowedError" || error.name === "SecurityError");
-          throw Object.assign(new Error("permission"), { code: denied ? "permission" : "unsupported" });
-        }
-        if (typeof AudioContext === "undefined" && typeof webkitAudioContext === "undefined") {
-          // No Web Audio: no level metering, no silence detection. Record raw
-          // chunks so the user can still end the call manually.
-          const Ctor = window.MediaRecorder;
-          if (typeof Ctor !== "function") throw Object.assign(new Error("unsupported"), { code: "unsupported" });
-          recorder = new Ctor(stream);
-          chunks = [];
-          recorder.ondataavailable = (event) => { if (event.data && event.data.size > 0) chunks.push(event.data); };
-          recorder.start();
-          return;
-        }
-        const Ctx = typeof AudioContext === "undefined" ? window.webkitAudioContext : AudioContext;
-        context = new Ctx();
-        sampleRate = context.sampleRate;
-        source = context.createMediaStreamSource(stream);
-        analyser = context.createAnalyser();
-        analyser.fftSize = 512;
-        source.connect(analyser);
-        const buffer = new Float32Array(analyser.fftSize);
-        const frameMs = (analyser.fftSize / sampleRate) * 1000;
-        const tick = () => {
-          if (stopped || analyser === null) return;
-          analyser.getFloatTimeDomainData(buffer);
-          if (samples.length < sampleRate * 65) {
-            for (let i = 0; i < buffer.length; i += 1) samples.push(buffer[i]);
-          }
-          onFrame(buffer.slice(), frameMs);
-          window.setTimeout(tick, Math.max(10, frameMs));
-        };
-        tick();
-      }
-
-      /** Release the microphone and return the recorded PCM, if any. */
-      async function stop() {
-        stopped = true;
-        try { stream?.getTracks().forEach((track) => track.stop()); } catch (_error) { /* already gone */ }
-        if (recorder !== null && recorder.state !== "inactive") {
-          await new Promise((resolve) => { recorder.onstop = resolve; recorder.stop(); });
-        }
-        const contextToClose = context;
-        context = null;
-        analyser = null;
-        source = null;
-        if (contextToClose !== null && contextToClose.state !== "closed") {
-          try { await contextToClose.close(); } catch (_error) { /* already closed */ }
-        }
-        if (samples.length > 0) {
-          // Resample to 16k by simple decimation: the route only needs speech,
-          // not fidelity, and this avoids an OfflineAudioContext round-trip.
-          const ratio = sampleRate / 16000;
-          const out = new Float32Array(Math.floor(samples.length / ratio));
-          for (let i = 0; i < out.length; i += 1) out[i] = samples[Math.floor(i * ratio)];
-          return encodeWav(out, 16000);
-        }
-        return null;
-      }
-
-      return { start, stop, release: stop };
-    }
-
     /** Read the error code out of a failed JSON answer, falling back to a transport message. */
     async function failureCodeOf(response) {
       try {
@@ -942,6 +1104,7 @@ window.__ModuleLoader__.load({
       if (code === "voice/backend-timeout") return "errTimeout";
       if (code === "voice/audio-too-large") return "errTooLarge";
       if (code === "voice/empty-transcript") return "errEmptyTranscript";
+      if (code === "voice/rejected-transcript") return "noticeRejected";
       if (code === "voice/no-main-session") return "errNoMainSession";
       return "errUnreachable";
     }
@@ -989,7 +1152,7 @@ window.__ModuleLoader__.load({
           className: `dw-ctl dw-ctl-mic dw-orb${state.device ? " is-on" : ""}`,
           "data-dw-control": "mic",
           "aria-pressed": state.device,
-          title: state.device ? t("micHintOn") : t("micHintOff"),
+          title: input.micTitle ?? (state.device ? t("micHintOn") : t("micHintOff")),
           "aria-label": micLabel,
           onClick: action.toggleMic,
         }, h("span", { className: "dw-orb-core", "aria-hidden": true }, h(MicGlyph, { size: 20, muted: true })),
@@ -1054,12 +1217,17 @@ window.__ModuleLoader__.load({
       const visual = dockVisualState({ ...input, controls });
       const statusKey = dockStatusKey({ ...input, controls });
       const buttons = controlButtons({ t, controls, actions: input.actions });
-      // "Done talking" ends the utterance in progress, so it shows only while one
-      // is recording: muted still has one, a closed microphone has none.
-      const listening = visual !== "deviceoff" && (input.status === "listening" || input.status === "calibrating");
+      // "Done talking" ends the segment in progress, so it shows only while one
+      // can be recording: muting drops the segment, a closed microphone has none.
+      const listening = visual === "listening" || visual === "calibrating";
       const speakLabel = input.speak === true ? t("speakOn") : t("speakOff");
       const hasTranscript = input.heard !== "" || input.reply !== "";
       const card = h("div", { className: "dw-card" },
+        // Corner grips for resizing. The dock host owns the pointer handling
+        // (see `onDragStart`), so these only mark where a resize begins; the
+        // stylesheet shows the one on the panel's free side.
+        h("span", { className: "dw-resize dw-resize-left", "data-dw-resize": "left", title: t("resizeHint"), "aria-hidden": true }),
+        h("span", { className: "dw-resize dw-resize-right", "data-dw-resize": "right", title: t("resizeHint"), "aria-hidden": true }),
         h("div", { className: "dw-dock-head" },
           h("span", { className: "dw-status", "aria-live": "polite" },
             h("i", { className: "dw-dot" }),
@@ -1076,6 +1244,7 @@ window.__ModuleLoader__.load({
             }, h(DetachGlyph, { size: 16 }))
             : null),
         input.error === null ? null : h("p", { className: "dw-error", role: "alert" }, t(input.error)),
+        input.notice === null || input.notice === undefined ? null : h("p", { className: "dw-notice", role: "status" }, t(input.notice)),
         hasTranscript
           ? h("div", { className: "dw-transcript" },
             input.heard === "" ? null : h("div", { className: "dw-heard" },
@@ -1128,6 +1297,39 @@ window.__ModuleLoader__.load({
         card,
         bar
       );
+    }
+
+    /**
+     * The dock stashed against a side edge: the microphone button and nothing
+     * else.
+     *
+     * In a call it is the same microphone control as the open bar (same
+     * `data-dw-control`, same pressed state), and its orb keeps animating the
+     * call status. Without a call, tapping it starts one. Either way, dragging
+     * it away from the edge opens the panel again; the title says both.
+     */
+    function dockedView(input) {
+      const t = input.t;
+      if (input.open !== true) {
+        return h("div", { className: "dw-dock dw-dock-docked dw-status-idle", "data-dw-side": input.side },
+          h("button", {
+            type: "button",
+            className: "dw-ctl dw-orb dw-orb-start",
+            title: `${t("callStart")} · ${t("dockedHintIdle")}`,
+            "aria-label": t("callStart"),
+            onClick: input.actions.startCall,
+          }, h("span", { className: "dw-orb-core", "aria-hidden": true }, h(VoiceGlyph, { size: 20 }))));
+      }
+      const controls = typeof input.controls?.state === "function" ? input.controls.state() : input.controls;
+      const visual = dockVisualState({ ...input, controls });
+      const statusText = input.notice ? t(input.notice) : t(dockStatusKey({ ...input, controls }));
+      const buttons = controlButtons({ t, controls, actions: input.actions, micTitle: `${statusText} · ${t("dockedHintCall")}` });
+      return h("div", {
+        className: `dw-dock dw-dock-docked dw-status-${visual}`,
+        role: "dialog",
+        "aria-label": t("callTitle"),
+        "data-dw-side": input.side,
+      }, buttons.mic, h("span", { className: "dw-sr", "aria-live": "polite" }, statusText));
     }
 
     /** A boolean setting is a switch: a button with role="switch" and a sliding thumb. */
@@ -1305,6 +1507,15 @@ window.__ModuleLoader__.load({
                 h("span", { className: "dw-row-title" }, t("settingsSpeakLabel")),
                 h("span", { className: "dw-row-sub" }, t("speakNote"))),
               switchControl({ checked: input.speak === true, label: t("settingsSpeakLabel"), onToggle: actions.toggleSpeak })),
+            h("label", { className: "dw-row", key: "redemption" },
+              h("span", { className: "dw-row-text" },
+                h("span", { className: "dw-row-title" }, t("settingsRedemption")),
+                h("span", { className: "dw-row-sub" }, t("settingsRedemptionHint"))),
+              h("select", {
+                className: "dw-select",
+                value: String(input.redemptionMs ?? VOICE_CONSTANTS.turn.redemptionMs),
+                onChange: (event) => { if (typeof actions.chooseRedemptionMs === "function") actions.chooseRedemptionMs(Number(event.target.value)); },
+              }, VOICE_CONSTANTS.redemptionChoicesMs.map((ms) => h("option", { key: ms, value: String(ms) }, t("settingsSeconds", { n: ms / 1000 }))))),
           ]),
           section("asr", t("settingsSectionAsr"), [
             h("div", { className: "dw-row dw-source", key: "source", "data-dw-source": info?.keySource ?? "unknown" },
@@ -1402,6 +1613,24 @@ window.__ModuleLoader__.load({
 
 
     // ---- the voice dock ---------------------------------------------------
+
+    /** Where the chosen turn-ending pause is kept: per browser, nothing secret. */
+    const REDEMPTION_STORAGE_KEY = "discipline-whale.voice.redemptionMs";
+
+    /** The saved turn-ending pause, or the default when none (or storage is blocked). */
+    function readRedemptionMs() {
+      try {
+        const saved = Number(window.localStorage.getItem(REDEMPTION_STORAGE_KEY));
+        if (VOICE_CONSTANTS.redemptionChoicesMs.includes(saved)) return saved;
+      } catch (_error) {
+        // Storage blocked: the default applies.
+      }
+      return VOICE_CONSTANTS.turn.redemptionMs;
+    }
+
+    function writeRedemptionMs(ms) {
+      try { window.localStorage.setItem(REDEMPTION_STORAGE_KEY, String(ms)); } catch (_error) { /* kept for this page only */ }
+    }
 
     // The call is a small state machine: idle → calibrating → listening →
     // transcribing → thinking → (speaking) → idle, until the user hangs up.
@@ -1507,12 +1736,29 @@ window.__ModuleLoader__.load({
         // Which settings page is showing: the overview, or one of its two
         // secondary pages ("service", "tts").
         const [settingsPage, setSettingsPage] = React.useState("main");
+        // Where the dock sits once the user has moved it (`dockRelease`'s
+        // result, including a stashed side) and its size once resized. Kept in
+        // state so a remount — the detached window coming back — keeps both.
+        const [placement, setPlacement] = React.useState(null);
+        const [size, setSize] = React.useState(null);
+        // A neutral line on the card: why nothing was sent, or why listening
+        // paused. Errors keep their own red line.
+        const [notice, setNotice] = React.useState(null);
+        // How long a pause ends the turn; the person's choice, kept per browser.
+        const [redemptionMs, setRedemptionMsState] = React.useState(readRedemptionMs);
 
-        const micRef = React.useRef(null);
+        const takerRef = React.useRef(null);
+        const awayRef = React.useRef(null);
+        if (awayRef.current === null) awayRef.current = createAwayGuard();
+        // True while the detector is running for the call: device on, not
+        // muted, not held for the whale's reply. Segments arriving otherwise
+        // are not the call's to send.
+        const listeningRef = React.useRef(false);
+        const redemptionRef = React.useRef(redemptionMs);
+        const detachedRef = React.useRef(false);
         const guardRef = React.useRef(null);
         const callRef = React.useRef(null);
         const sessionRef = React.useRef(null);
-        const utteranceRef = React.useRef(null);
         const baselineRef = React.useRef(0);
         const disposedRef = React.useRef(false);
         const speakRef = React.useRef(false);
@@ -1520,12 +1766,15 @@ window.__ModuleLoader__.load({
         const statusRef = React.useRef("ready");
         const controlsRef = React.useRef(null);
         if (controlsRef.current === null) controlsRef.current = createCallControls();
-        const gateRef = React.useRef(null);
         const pipRef = React.useRef(null);
         const pipFailedRef = React.useRef(false);
         const dragRef = React.useRef(null);
-        const positionRef = React.useRef(null);
+        const suppressClickRef = React.useRef(false);
+        const expandedRef = React.useRef(null);
         const dockElRef = React.useRef(null);
+
+        // The visibility handler reads this outside React's render.
+        detachedRef.current = detached;
 
         function setPhase(next) {
           statusRef.current = next;
@@ -1536,25 +1785,38 @@ window.__ModuleLoader__.load({
           const devices = typeof navigator !== "undefined" ? navigator.mediaDevices : undefined;
           const hasAudio = typeof AudioContext !== "undefined"
             || typeof window !== "undefined" && typeof window.webkitAudioContext !== "undefined";
-          setSupported(Boolean(devices && (hasAudio || typeof window.MediaRecorder === "function")));
+          setSupported(Boolean(devices && typeof devices.getUserMedia === "function" && hasAudio && typeof WebAssembly === "object"));
           // The detached-window capability is fixed for the page's lifetime, so
           // it is resolved once rather than on every render.
           setDetach(detachCapability(window === undefined ? {} : window, { pipFailed: pipFailedRef.current }));
           const onVisibility = () => {
-            // A hidden page keeps the call alive (the audio path and timers keep
-            // running), but it must not keep the microphone hot: a background
-            // tab that nobody is looking at is not a conversation. Releasing the
-            // device here is also what turns the OS indicator off.
-            if (typeof document !== "undefined" && document.visibilityState === "hidden") void releaseDevice();
+            // A hidden page keeps the call alive, but it must not keep the
+            // microphone hot: a background tab nobody is looking at is not a
+            // conversation. A detached window is still on screen, so a call
+            // living there keeps listening.
+            if (typeof document === "undefined" || document.visibilityState !== "hidden" || detachedRef.current) return;
+            if (controlsRef.current.state().device) void closeMicrophone("noticeHidden");
           };
           if (typeof document !== "undefined") document.addEventListener("visibilitychange", onVisibility);
+          // The away rule's clock: listening for AWAY_IDLE_MS without an
+          // accepted turn closes the microphone.
+          const awayTimer = setInterval(() => {
+            if (listeningRef.current && awayRef.current.reason(Date.now()) === "idle") void closeMicrophone("noticeAwayIdle");
+          }, 5000);
           return () => {
+            clearInterval(awayTimer);
             // Unmounting the plugin must never leave a track live.
             disposedRef.current = true;
             if (typeof document !== "undefined") document.removeEventListener("visibilitychange", onVisibility);
-            const mic = micRef.current;
-            micRef.current = null;
-            if (mic !== null) void mic.stop();
+            const drag = dragRef.current;
+            dragRef.current = null;
+            if (drag !== null && drag.listening !== undefined) {
+              drag.listening.doc.removeEventListener("pointermove", drag.listening.move);
+              drag.listening.doc.removeEventListener("pointerup", drag.listening.end);
+              drag.listening.doc.removeEventListener("pointercancel", drag.listening.end);
+            }
+            listeningRef.current = false;
+            void closeTaker();
             const guard = guardRef.current;
             const call = callRef.current;
             if (guard !== null && call !== null) guard.end(call.id);
@@ -1579,20 +1841,59 @@ window.__ModuleLoader__.load({
           setControls(controlsRef.current.state());
         }
 
-        /**
-         * Release the microphone device: stop every track, drop the recorder and
-         * the audio graph. This is the microphone button going off — the OS
-         * indicator turns off because the device is closed, not because the data
-         * is being ignored.
-         */
-        async function releaseDevice() {
-          utteranceRef.current = null;
-          gateRef.current?.setProcessing(false);
-          const mic = micRef.current;
-          micRef.current = null;
-          if (mic !== null) {
-            try { await mic.stop(); } catch (_error) { /* already released */ }
+        /** The call's listener, created on first use. */
+        function turnTaker() {
+          if (takerRef.current === null) {
+            takerRef.current = createTurnTaker({
+              createVad: async (options) => (await loadVadLibrary()).MicVAD.new(options),
+              // Automatic gain control would lift a conversation across the
+              // room to speaking level; echo cancellation and noise
+              // suppression stay on.
+              getStream: () => navigator.mediaDevices.getUserMedia({
+                audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: false },
+                video: false,
+              }),
+              options: {
+                ...VOICE_CONSTANTS.turn,
+                redemptionMs: redemptionRef.current,
+                baseAssetPath: `${VOICE_ASSET_ROUTE}/`,
+                onnxWASMBasePath: `${VOICE_ASSET_ROUTE}/`,
+                // The page is not cross-origin isolated, so onnxruntime runs
+                // on one thread.
+                ortConfig: (ort) => {
+                  ort.env.wasm.numThreads = 1;
+                  ort.env.logLevel = "error";
+                },
+              },
+              maxSpeechMs: VOICE_CONSTANTS.maxSpeechMs,
+              onUtterance: (audio) => { void utteranceDone(audio); },
+            });
           }
+          return takerRef.current;
+        }
+
+        /** Release the listener entirely: detector, model and microphone. */
+        async function closeTaker() {
+          const taker = takerRef.current;
+          takerRef.current = null;
+          if (taker !== null) await taker.close();
+        }
+
+        /**
+         * Close the microphone and say why: the microphone button going off, a
+         * hidden page, or the person having walked away. The OS indicator goes
+         * off because the device is released, not because data is ignored.
+         * @param noticeKey the line to show, or null for the button itself.
+         */
+        async function closeMicrophone(noticeKey) {
+          listeningRef.current = false;
+          awayRef.current.reset();
+          await takerRef.current?.hold();
+          controlsRef.current.setDevice(false);
+          publishControls();
+          if (disposedRef.current) return;
+          setNotice(noticeKey);
+          if (statusRef.current === "listening" || statusRef.current === "calibrating") setPhase("ready");
         }
 
         /**
@@ -1604,10 +1905,9 @@ window.__ModuleLoader__.load({
          */
         async function toggleMic() {
           const machine = controlsRef.current;
+          awayRef.current.present(Date.now());
           if (machine.state().device) {
-            await releaseDevice();
-            machine.setDevice(false);
-            publishControls();
+            await closeMicrophone(null);
             return;
           }
           if (!supported) {
@@ -1618,25 +1918,44 @@ window.__ModuleLoader__.load({
           machine.setDevice(true);
           publishControls();
           setError(null);
+          setNotice(null);
           await listen();
         }
 
         /**
          * The mute button: stop processing audio without touching the device.
          *
-         * `pause()` on the detector is the important half. Muted frames never
-         * reach it (the gate drops them), and clearing the silence run means a
-         * long mute is not mistaken for a long pause — otherwise the first
-         * frame after unmuting would look like the end of a ten-second silence
-         * and cut the utterance instantly.
+         * The detector pauses on the same live stream, so no frame is analysed
+         * and a segment in progress is dropped; unmuting resumes detection
+         * without asking for the microphone again.
          */
         function toggleMute() {
           const machine = controlsRef.current;
           if (!machine.state().device) return;
           machine.toggleMute();
           publishControls();
-          const gate = gateRef.current;
-          if (gate !== null) gate.setProcessing(machine.state().processing);
+          const now = Date.now();
+          awayRef.current.present(now);
+          if (machine.state().muted) {
+            listeningRef.current = false;
+            awayRef.current.suspend(now);
+            void takerRef.current?.mute();
+            return;
+          }
+          if (statusRef.current !== "listening") return;
+          void takerRef.current?.unmute().then(() => {
+            if (!controlsRef.current.state().processing) return;
+            listeningRef.current = true;
+            awayRef.current.resume(Date.now());
+          });
+        }
+
+        /** The pause that ends a turn, chosen in the settings. */
+        function chooseRedemptionMs(ms) {
+          redemptionRef.current = ms;
+          setRedemptionMsState(ms);
+          writeRedemptionMs(ms);
+          takerRef.current?.setRedemptionMs(ms);
         }
 
         // ---- taking the dock out of the page --------------------------------
@@ -1736,65 +2055,194 @@ window.__ModuleLoader__.load({
         // ---- dragging and edge snapping -------------------------------------
 
         /**
-         * Pointer-event dragging, no library.
+         * Pointer-event moving, stashing and resizing on the whole dock, no
+         * library.
+         *
+         * Any part of the dock moves it: a press that travels further than
+         * DRAG_THRESHOLD px is a drag, a press that does not is the click it
+         * always was, and the click that ends a drag is swallowed
+         * (`swallowDragClick`). Form fields keep their own pointer behaviour. A
+         * press on a corner grip (`data-dw-resize`) resizes instead of moving.
+         * Where a drag settles is `dockRelease`'s decision; how a resize clamps
+         * is `dockResize`'s.
          *
          * Why no dependency: this file is plain JS in the shell's module wrapper
          * with no build step and no external URLs allowed, so a React drag
          * library (react-rnd pulls react-draggable pulls clsx + prop-types)
          * would have to be vendored by hand. Pointer Events plus `setPointerCapture`
-         * give the same feel in ~30 lines, including touch and pen.
+         * cover move, resize, touch and pen in a few dozen lines.
          */
         function onDragStart(event) {
+          suppressClickRef.current = false;
           if (event.button !== undefined && event.button !== 0) return;
+          if (detached) return;
           const node = dockElRef.current;
           if (node === null || node === undefined) return;
-          const target = event.currentTarget;
+          const target = event.target;
+          if (target?.closest?.("input, textarea, select, [contenteditable='true']")) return;
           const rect = node.getBoundingClientRect();
+          const grip = target?.closest?.("[data-dw-resize]") ?? null;
+          const card = node.querySelector?.(".dw-card") ?? null;
+          const cardRect = card === null ? null : card.getBoundingClientRect();
+          const viewportWidth = window.innerWidth;
           dragRef.current = {
             pointerId: event.pointerId,
+            mode: grip !== null && cardRect !== null ? "resize" : "pending",
+            corner: grip === null ? null : grip.getAttribute("data-dw-resize"),
             startX: event.clientX,
             startY: event.clientY,
             originX: rect.left,
             originY: rect.top,
             width: rect.width,
             height: rect.height,
+            cardHeight: cardRect === null ? 0 : cardRect.height,
+            room: { left: rect.left - 16, right: viewportWidth - rect.right - 16, top: rect.top - 16 },
           };
-          // Tell the stylesheet the dock is now user-positioned; which box
-          // properties that switches is the CSS's decision, not this function's.
-          if (node.setAttribute !== undefined) node.setAttribute("data-dw-dragged", "true");
-          try { target.setPointerCapture(event.pointerId); } catch (_error) { /* older browsers */ }
-          event.preventDefault();
+          // Follow the pointer at the document level from the first moment, so a
+          // fast drag that leaves the dock before the threshold is still seen.
+          // Capture waits for the threshold: capturing on press would retarget
+          // the click away from the button that was pressed.
+          const doc = node.ownerDocument ?? document;
+          dragRef.current.listening = { doc, move: onDragMove, end: onDragEnd };
+          doc.addEventListener("pointermove", onDragMove);
+          doc.addEventListener("pointerup", onDragEnd);
+          doc.addEventListener("pointercancel", onDragEnd);
+          if (grip !== null) {
+            capturePointer(event.pointerId);
+            event.preventDefault();
+          }
         }
 
         function onDragMove(event) {
           const drag = dragRef.current;
           if (drag === null || drag.pointerId !== event.pointerId) return;
-          const next = snapDockPosition({
-            x: drag.originX + (event.clientX - drag.startX),
-            y: drag.originY + (event.clientY - drag.startY),
-            width: drag.width,
-            height: drag.height,
-            viewport: { width: window.innerWidth, height: window.innerHeight },
-            margin: 16,
-            snapDistance: 72,
-          });
-          positionRef.current = next;
           const node = dockElRef.current;
-          if (node !== null && node !== undefined) {
-            // Publish the pointer position as two numbers; the stylesheet decides
-            // which edge they anchor and what unit they mean. The drag code never
-            // names a CSS box property, so a replacement skin can lay the dock
-            // out differently without touching this function.
-            node.style.setProperty("--dw-dock-x", String(next.x));
-            node.style.setProperty("--dw-dock-y", String(next.y));
+          if (node === null || node === undefined) return;
+          const dx = event.clientX - drag.startX;
+          const dy = event.clientY - drag.startY;
+          if (drag.mode === "resize") {
+            const next = dockResize({ width: drag.width, cardHeight: drag.cardHeight, dx, dy, corner: drag.corner, room: drag.room });
+            drag.size = next;
+            // Size travels as two numbers too; the stylesheet decides which
+            // boxes they size.
+            node.setAttribute("data-dw-sized", "true");
+            node.style.setProperty("--dw-dock-w", String(Math.round(next.width)));
+            node.style.setProperty("--dw-card-h", String(Math.round(next.cardHeight)));
+            return;
           }
+          if (drag.mode === "pending") {
+            if (Math.hypot(dx, dy) < DRAG_THRESHOLD) return;
+            drag.mode = "move";
+            capturePointer(event.pointerId);
+            node.setAttribute("data-dw-dragging", "true");
+            try { node.ownerDocument?.getSelection?.()?.removeAllRanges(); } catch (_error) { /* nothing selected */ }
+          }
+          const viewport = { width: window.innerWidth, height: window.innerHeight };
+          const left = drag.originX + dx;
+          const top = drag.originY + dy;
+          // Follow the pointer in the same terms the stylesheet anchors by: the
+          // nearer side and the bottom. The drag code never names a CSS box
+          // property, so a replacement skin can lay the dock out differently.
+          const anchor = left + drag.width / 2 < viewport.width / 2 ? "left" : "right";
+          node.setAttribute("data-dw-anchor", anchor);
+          node.style.setProperty("--dw-dock-x", String(Math.round(anchor === "left" ? left : viewport.width - left - drag.width)));
+          node.style.setProperty("--dw-dock-y", String(Math.round(viewport.height - top - drag.height)));
+          // Show where letting go would land: stashed on an edge, or open again.
+          const settle = dockRelease({ left, top, width: drag.width, height: drag.height, viewport, docked: isStashed(), expanded: expandedSize() });
+          const change = isStashed() ? (settle.docked === null ? "open" : null) : (settle.docked === null ? null : "dock");
+          if (change === null) node.removeAttribute("data-dw-preview");
+          else node.setAttribute("data-dw-preview", change);
         }
 
         function onDragEnd(event) {
           const drag = dragRef.current;
           if (drag === null || drag.pointerId !== event.pointerId) return;
           dragRef.current = null;
-          try { event.currentTarget.releasePointerCapture(event.pointerId); } catch (_error) { /* already released */ }
+          const listening = drag.listening;
+          listening.doc.removeEventListener("pointermove", listening.move);
+          listening.doc.removeEventListener("pointerup", listening.end);
+          listening.doc.removeEventListener("pointercancel", listening.end);
+          releasePointer(event.pointerId);
+          const node = dockElRef.current;
+          if (node !== null && node !== undefined) {
+            node.removeAttribute("data-dw-dragging");
+            node.removeAttribute("data-dw-preview");
+          }
+          if (drag.mode === "resize") {
+            if (drag.size !== undefined) setSize(drag.size);
+            return;
+          }
+          // A press that never moved far enough was a click; let it through.
+          if (drag.mode !== "move") return;
+          suppressClickRef.current = true;
+          const viewport = { width: window.innerWidth, height: window.innerHeight };
+          const settle = dockRelease({
+            left: drag.originX + (event.clientX - drag.startX),
+            top: drag.originY + (event.clientY - drag.startY),
+            width: drag.width,
+            height: drag.height,
+            viewport,
+            docked: isStashed(),
+            expanded: expandedSize(),
+          });
+          // Remember the panel's size for its current shape (call panel or
+          // closed pills), so reopening from the stashed button lands where that
+          // shape actually fits.
+          if (!isStashed()) expandedRef.current = { open, width: drag.width, height: drag.height };
+          if (node !== null && node !== undefined) {
+            // Write the settled geometry now as well: React only re-applies
+            // props that changed, and the drag already moved the DOM.
+            node.setAttribute("data-dw-anchor", settle.anchor);
+            node.style.setProperty("--dw-dock-x", String(Math.round(settle.x)));
+            node.style.setProperty("--dw-dock-y", String(Math.round(settle.y)));
+          }
+          setPlacement(settle);
+        }
+
+        /** The click that ends a drag lands on whatever was under the pointer; drop it. */
+        function swallowDragClick(event) {
+          if (!suppressClickRef.current) return;
+          suppressClickRef.current = false;
+          event.stopPropagation();
+          event.preventDefault();
+        }
+
+        /**
+         * The size the stashed button opens into: the last measured size of the
+         * same shape, or the shape's usual size before it was ever measured.
+         */
+        function expandedSize() {
+          const last = expandedRef.current;
+          if (last !== null && last.open === open) return { width: last.width, height: last.height };
+          return open ? { width: size?.width ?? 380, height: 240 } : { width: 190, height: 48 };
+        }
+
+        function isStashed() {
+          return placement !== null && placement.docked !== null && !detached;
+        }
+
+        function capturePointer(pointerId) {
+          try { dockElRef.current?.setPointerCapture(pointerId); } catch (_error) { /* older browsers */ }
+        }
+
+        function releasePointer(pointerId) {
+          try { dockElRef.current?.releasePointerCapture(pointerId); } catch (_error) { /* already released */ }
+        }
+
+        /**
+         * Show the call's conversation in the main view.
+         *
+         * The dock shows the latest exchange; the main view shows the whole
+         * conversation. Both read the same main session, so opening it there
+         * when a call starts and whenever an utterance is sent keeps what was
+         * said and what came back visible in both places at once.
+         */
+        function showInMainView(sessionId) {
+          try {
+            if (typeof ctx.uiWorkspace?.openSession === "function") ctx.uiWorkspace.openSession(sessionId);
+          } catch (_error) {
+            // The main view keeps whatever it shows; the dock still has the text.
+          }
         }
 
         // ---- the settings panel ---------------------------------------------
@@ -1933,21 +2381,7 @@ window.__ModuleLoader__.load({
         }
 
 
-        /** Stop any live microphone and drop the current utterance. */
-        async function stopListeningOnly() {
-          utteranceRef.current = null;
-          // The gate belongs to the utterance that is ending. Silencing it
-          // first means a frame already in flight cannot reach a dead detector.
-          gateRef.current?.setProcessing(false);
-          gateRef.current = null;
-          const mic = micRef.current;
-          micRef.current = null;
-          if (mic !== null) {
-            try { await mic.stop(); } catch (_error) { /* already released */ }
-          }
-        }
-
-        /** Open the microphone for one utterance, unless the call is over. */
+        /** Listen for the next utterance, unless the call is over or the whale is still working. */
         async function listen() {
           const call = callRef.current;
           if (call === null || !callIsLive(call) || disposedRef.current) return;
@@ -1956,9 +2390,10 @@ window.__ModuleLoader__.load({
             setPhase("error");
             return;
           }
-          // Half-duplex: never open the mic while the whale is working.
-          await stopListeningOnly();
+          // Half-duplex: never listen while the whale is working.
+          listeningRef.current = false;
           if (sessionRow(sessionRef.current)?.running === true) {
+            await takerRef.current?.hold();
             setPhase("thinking");
             const until = Date.now() + VOICE_CONSTANTS.replyTimeoutMs;
             while (Date.now() < until && sessionRow(sessionRef.current)?.running === true) {
@@ -1973,97 +2408,81 @@ window.__ModuleLoader__.load({
             setPhase("ready");
             return;
           }
-          const utterance = { id: `u-${Date.now()}` };
-          utteranceRef.current = utterance;
           setUtteranceCount((n) => n + 1);
           setError(null);
-          const detector = createSilenceDetector();
-          utterance.detector = detector;
+          // The first listen loads the detector; later ones resume it.
           setPhase("calibrating");
-          let announced = false;
-          // Every frame goes through the gate, so muting is one flag flip and
-          // no later code path can bypass it.
-          const gate = createFrameGate({
-            onFrame(samples, frameMs) {
-              if (utteranceRef.current !== utterance) return;
-              const decision = detector.push(samples, frameMs);
-              if (decision === undefined) {
-                if (!announced && detector.threshold() > 0) {
-                  announced = true;
-                  if (statusRef.current === "calibrating") setPhase("listening");
-                }
-                return;
-              }
-              void utteranceDone(decision, utterance).catch(() => {});
-            },
-            onProcessingChange(processing) {
-              // Entering or leaving mute restarts the silence run: muted frames
-              // are neither speech nor silence, and the detector must not treat
-              // an unprocessed stretch as a pause.
-              if (processing) detector.resume();
-              else detector.pause();
-            },
-          });
-          gateRef.current = gate;
-          gate.setProcessing(controlsRef.current.state().processing);
-          const mic = createMicrophone({
-            onFrame(samples, frameMs) {
-              gate.push(samples, frameMs);
-            },
-            onFatal(code) {
-              if (utteranceRef.current !== utterance) return;
-              setError(code === "permission" ? "errPermission" : "errUnsupported");
-              setPhase("error");
-              controlsRef.current.setDevice(false);
-              publishControls();
-              void stopListeningOnly();
-            },
-          });
-          micRef.current = mic;
+          const muted = controlsRef.current.state().muted;
           try {
-            await mic.start();
-            if (utteranceRef.current === utterance) setPhase("listening");
+            await turnTaker().listen(muted);
           } catch (reason) {
-            if (micRef.current === mic) micRef.current = null;
-            if (utteranceRef.current !== utterance) return;
-            utteranceRef.current = null;
-            // A refused permission means the DEVICE never opened: reflect that
-            // on the microphone control instead of leaving it showing "on".
+            if (!callIsLive(call) || disposedRef.current) return;
+            await closeTaker();
+            // The DEVICE never opened (or the detector never loaded): reflect
+            // that on the microphone control instead of leaving it showing "on".
             controlsRef.current.setDevice(false);
             publishControls();
-            setError(reason?.code === "permission" ? "errPermission" : "errUnsupported");
+            awayRef.current.reset();
+            const denied = reason?.name === "NotAllowedError" || reason?.name === "SecurityError";
+            setError(denied ? "errPermission" : reason?.code === "vad-load" ? "errVadLoad" : "errUnsupported");
             setPhase("error");
-          }
-        }
-
-        /** The recording ended: discard it or send it, then show the reply (and read it if enabled). */
-        async function utteranceDone(decision, utterance) {
-          const call = callRef.current;
-          if (utteranceRef.current !== utterance) return;
-          utteranceRef.current = null;
-          const mic = micRef.current;
-          micRef.current = null;
-          let wav = null;
-          if (mic !== null) {
-            try { wav = await mic.stop(); } catch (_error) { wav = null; }
-          }
-          if (decision?.upload !== true || wav === null) {
-            // Nothing useful was said: no upload, no prompt.
-            if (callIsLive(call) && !disposedRef.current) {
-              setError(decision?.reason === "no-speech" ? "errNoSpeech" : null);
-              setPhase("ready");
-              await sleep(600);
-              // Only reopen for another utterance while the DEVICE is still on:
-              // a user who pressed the microphone off mid-turn stays off.
-              if (callIsLive(call) && utteranceRef.current === null && controlsRef.current.state().device) void listen();
-            }
             return;
           }
-          await submit(new Blob([wav], { type: "audio/wav" }), utterance);
+          if (!callIsLive(call) || disposedRef.current) return;
+          // The controls may have changed while the detector was starting.
+          const now = controlsRef.current.state();
+          if (!now.device) {
+            await takerRef.current?.hold();
+            setPhase("ready");
+            return;
+          }
+          setPhase("listening");
+          if (!now.processing) {
+            if (!muted) await takerRef.current?.mute();
+            return;
+          }
+          if (muted) await takerRef.current?.unmute();
+          listeningRef.current = true;
+          awayRef.current.resume(Date.now());
+        }
+
+        /**
+         * One segment came back from the detector: check it was said into this
+         * microphone, then send it. Half-duplex starts here: the microphone is
+         * released until the whale's turn is over.
+         */
+        async function utteranceDone(audio) {
+          const call = callRef.current;
+          if (!listeningRef.current || call === null || !callIsLive(call) || disposedRef.current) return;
+          listeningRef.current = false;
+          awayRef.current.suspend(Date.now());
+          await takerRef.current?.hold();
+          if (speechLevelDbfs(audio, 16000) < VOICE_CONSTANTS.minSpeechLevelDbfs) {
+            await refuseUtterance("noticeTooQuiet");
+            return;
+          }
+          await submit(new Blob([encodeWav(audio, 16000)], { type: "audio/wav" }));
+        }
+
+        /**
+         * A segment that was not said to the whale: count it, say so on the
+         * card, and listen again, or close the microphone once refusals pile up.
+         */
+        async function refuseUtterance(noticeKey) {
+          const call = callRef.current;
+          awayRef.current.rejected();
+          if (!callIsLive(call) || disposedRef.current) return;
+          if (awayRef.current.reason(Date.now()) === "rejections") {
+            await closeMicrophone("noticeAwayRejected");
+            return;
+          }
+          setNotice(noticeKey);
+          setPhase("ready");
+          if (controlsRef.current.state().device) void listen();
         }
 
         /** One round trip: transcribe, hand over, wait for the reply, show it, maybe read it. */
-        async function submit(blob, utterance) {
+        async function submit(blob) {
           const call = callRef.current;
           if (!callIsLive(call)) return;
           setPhase("transcribing");
@@ -2084,6 +2503,12 @@ window.__ModuleLoader__.load({
           if (!response.ok) {
             const code = await failureCodeOf(response);
             if (!callIsLive(call) || disposedRef.current) return;
+            // Background sound and empty recognitions are not failures: the
+            // segment simply was not for the whale.
+            if (code === "voice/rejected-transcript" || code === "voice/empty-transcript") {
+              await refuseUtterance("noticeRejected");
+              return;
+            }
             setError(errorKeyOf(code));
             setPhase("error");
             return;
@@ -2094,8 +2519,11 @@ window.__ModuleLoader__.load({
           if (text === "" || !callIsLive(call) || disposedRef.current) return;
           const sessionId = sessionRef.current;
           if (sessionId === null || !guardRef.current.accepts(call, sessionId)) return;
+          awayRef.current.accepted(Date.now());
+          setNotice(null);
           setHeard(text);
           setPhase("thinking");
+          showInMainView(sessionId);
           // The baseline is read HERE, not at call start: the whale must be
           // idle before we send, so "the turn above the current highest turn"
           // is unambiguously this utterance's reply.
@@ -2135,7 +2563,7 @@ window.__ModuleLoader__.load({
           // is the branch that used to stall on an `onend` that never fires.
           if (!speakRef.current) {
             setPhase("ready");
-            if (utteranceRef.current === null && controlsRef.current.state().device) void listen();
+            if (controlsRef.current.state().device) void listen();
             return;
           }
           // Read-aloud is ON: stay in "speaking" so the microphone stays shut
@@ -2148,24 +2576,29 @@ window.__ModuleLoader__.load({
             synth: typeof speechSynthesis === "undefined" ? undefined : speechSynthesis,
             Utterance: typeof SpeechSynthesisUtterance === "undefined" ? undefined : SpeechSynthesisUtterance,
           });
-          utterance.speech = speech.speech;
           await speech.done;
           if (!callIsLive(call) || disposedRef.current) return;
           setPhase("ready");
-          if (utteranceRef.current === null && controlsRef.current.state().device) void listen();
+          if (controlsRef.current.state().device) void listen();
         }
 
-        /** "Done talking": end this utterance with the 1s / speech minimums. */
+        /** "Done talking": end the segment now; with nothing said, say so and keep listening. */
         async function stopTalking() {
-          const utterance = utteranceRef.current;
-          if (utterance === null) return;
-          const decision = utterance.detector.stop();
-          await utteranceDone(decision, utterance);
+          awayRef.current.present(Date.now());
+          const taker = takerRef.current;
+          if (taker === null || !listeningRef.current) return;
+          const delivered = await taker.finish();
+          if (delivered || !callIsLive(callRef.current) || disposedRef.current) return;
+          listeningRef.current = false;
+          setNotice("errNoSpeech");
+          setPhase("ready");
+          if (controlsRef.current.state().device) void listen();
         }
 
         /** Start (or restart) the call. */
         async function startCall() {
           clearResult();
+          setNotice(null);
           // Starting a call leaves the settings panel: the dock is the surface
           // the call belongs to, and a form in front of it would hide the mic.
           setSettingsOpen(false);
@@ -2178,6 +2611,7 @@ window.__ModuleLoader__.load({
           const previous = guardRef.current;
           if (previous !== null) previous.end("restart");
           sessionRef.current = sessionId;
+          showInMainView(sessionId);
           // Retain the session so its event window exists even while the user
           // is on another panel; released on hangup and on unmount.
           if (watcherRef.current === null) watcherRef.current = createSessionWatcher(ctx.sessions);
@@ -2187,6 +2621,7 @@ window.__ModuleLoader__.load({
           guard.setTarget(sessionId);
           const call = guard.begin(`call-${Date.now()}`);
           callRef.current = call;
+          awayRef.current.reset();
           setOpen(true);
           // Starting a call opens the device through the microphone control, so
           // "call in progress" and "microphone on" can never disagree. A refused
@@ -2204,14 +2639,10 @@ window.__ModuleLoader__.load({
           const call = callRef.current;
           if (guard !== null && call !== null) guard.end(call.id);
           callRef.current = null;
-          utteranceRef.current = null;
-          const mic = micRef.current;
-          micRef.current = null;
-          if (mic !== null) {
-            try { await mic.stop(); } catch (_error) { /* already released */ }
-          }
+          listeningRef.current = false;
+          awayRef.current.reset();
+          await closeTaker();
           watcherRef.current?.release();
-          gateRef.current = null;
           // Hanging up closes the DEVICE (the OS indicator must go off) and
           // resets both controls for the next call.
           controlsRef.current.setDevice(false);
@@ -2220,6 +2651,7 @@ window.__ModuleLoader__.load({
           if (typeof speechSynthesis !== "undefined") speechSynthesis.cancel();
           if (!disposedRef.current) {
             setOpen(false);
+            setNotice(null);
             setPhase("ready");
           }
         }
@@ -2237,7 +2669,22 @@ window.__ModuleLoader__.load({
         // The dock may be rendered into a detached document (Document PiP or a
         // popup). React renders the same tree; only the host container changes.
         const container = renderDocument();
-        const View = settingsOpen
+        const stashed = isStashed();
+        const View = stashed
+          ? dockedView({
+            t,
+            open,
+            side: placement.docked,
+            status,
+            error,
+            notice,
+            controls,
+            actions: {
+              startCall: () => { void startCall(); },
+              toggleMic: () => { void toggleMic(); },
+            },
+          })
+          : settingsOpen
           ? settingsView({
             t,
             info: settingsInfo,
@@ -2254,12 +2701,14 @@ window.__ModuleLoader__.load({
             error: settingsError,
             page: settingsPage,
             speak,
+            redemptionMs,
             actions: {
               save: () => { void saveSettings(); },
               test: () => { void testSettings(); },
               close: () => setSettingsOpen(false),
               navigate: setSettingsPage,
               toggleSpeak,
+              chooseRedemptionMs,
             },
           })
           : !open
@@ -2285,6 +2734,7 @@ window.__ModuleLoader__.load({
               t,
               status,
               error,
+              notice,
               heard,
               reply,
               busy,
@@ -2307,18 +2757,13 @@ window.__ModuleLoader__.load({
         const surface = h("div", {
           className: "dw-dock-host",
           ref: dockElRef,
-        },
-          h("div", {
-            className: "dw-drag-handle",
-            "aria-hidden": true,
-            title: t("callTitle"),
-            onPointerDown: onDragStart,
-            onPointerMove: onDragMove,
-            onPointerUp: onDragEnd,
-            onPointerCancel: onDragEnd,
-          }),
-          View
-        );
+          "data-dw-anchor": placement === null ? undefined : placement.anchor,
+          "data-dw-docked": stashed ? placement.docked : undefined,
+          "data-dw-sized": size === null ? undefined : "true",
+          style: dockGeometryStyle(placement, size),
+          onPointerDown: onDragStart,
+          onClickCapture: swallowDragClick,
+        }, View);
 
         if (container !== undefined && container !== null && container !== document) {
           // Detached: portal the same React tree into the other document's body.
@@ -2388,21 +2833,32 @@ window.__ModuleLoader__.load({
         // ---- geometry ----
         // The host is a transparent column anchored bottom-right; only its
         // children take the pointer, so the empty part of the column never
-        // blocks the app underneath. Once dragged, the logic publishes
-        // --dw-dock-x / --dw-dock-y and the host is placed from the top-left
-        // instead, so the geometry contract lives entirely in this stylesheet.
+        // blocks the app underneath. Once moved, the logic publishes a side
+        // (data-dw-anchor) and two numbers: --dw-dock-x, the distance from that
+        // side, and --dw-dock-y, the distance from the bottom. Anchoring to the
+        // bottom keeps the control bar still while the card above it grows.
+        // Resizing publishes --dw-dock-w and --dw-card-h the same way.
         ".dw-dock-host{position:fixed;right:20px;bottom:var(--dw-dock-bottom);left:auto;top:auto;z-index:40;width:380px;max-width:calc(100vw - 32px);",
-        "display:flex;flex-direction:column;align-items:stretch;gap:6px;pointer-events:none;color:var(--dw-fg);font-size:13px;line-height:1.5;-webkit-font-smoothing:antialiased}",
+        "display:flex;flex-direction:column;align-items:stretch;gap:6px;pointer-events:none;color:var(--dw-fg);font-size:13px;line-height:1.5;-webkit-font-smoothing:antialiased;",
+        "touch-action:none;user-select:none;-webkit-user-select:none}",
         ".dw-dock-host>*{pointer-events:auto}",
-        ".dw-dock-host[data-dw-dragged='true']{left:calc(var(--dw-dock-x, 0) * 1px);top:calc(var(--dw-dock-y, 0) * 1px);right:auto;bottom:auto}",
-        ".dw-dock-host .dw-drag-handle{align-self:center;width:64px;height:12px;cursor:grab;touch-action:none;display:flex;align-items:center;justify-content:center;opacity:.4;transition:opacity .2s}",
-        ".dw-dock-host .dw-drag-handle:before{content:'';width:36px;height:4px;border-radius:2px;background:var(--dw-fg-3)}",
-        ".dw-dock-host:hover .dw-drag-handle{opacity:.9}",
-        ".dw-dock-host .dw-drag-handle:active{cursor:grabbing}",
-        // Closed: the grip stands to the left of the two round pills.
-        ".dw-dock-host:has(>.dw-dock-closed){flex-direction:row;align-items:center;justify-content:flex-end}",
-        ".dw-dock-host:has(>.dw-dock-closed) .dw-drag-handle{width:14px;height:32px}",
-        ".dw-dock-host:has(>.dw-dock-closed) .dw-drag-handle:before{width:4px;height:18px}",
+        ".dw-dock-host[data-dw-anchor]{top:auto;bottom:calc(var(--dw-dock-y, 144) * 1px)}",
+        ".dw-dock-host[data-dw-anchor='left']{left:calc(var(--dw-dock-x, 20) * 1px);right:auto}",
+        ".dw-dock-host[data-dw-anchor='right']{right:calc(var(--dw-dock-x, 20) * 1px);left:auto}",
+        ".dw-dock-host[data-dw-sized='true']{width:calc(var(--dw-dock-w, 380) * 1px);max-width:calc(100vw - 16px)}",
+        ".dw-dock-host[data-dw-sized='true'] .dw-card{height:calc(var(--dw-card-h, 200) * 1px);max-height:none}",
+        // The closed pills and the stashed button take only their own width,
+        // so they sit against whichever side the host is anchored to.
+        ".dw-dock-host:has(>.dw-dock-closed),.dw-dock-host[data-dw-docked]{width:auto}",
+        ".dw-card,.dw-dock-closed,.dw-settings-head{cursor:grab}",
+        ".dw-dock-host[data-dw-dragging='true'],.dw-dock-host[data-dw-dragging='true'] *{cursor:grabbing!important}",
+        ".dw-transcript,.dw-settings-body{touch-action:pan-y}",
+        ".dw-input{user-select:text;-webkit-user-select:text}",
+        // While dragging: a panel about to be stashed fades and shrinks; a
+        // stashed button about to open grows.
+        ".dw-dock-host>*{transition:opacity .15s,transform .15s}",
+        ".dw-dock-host[data-dw-preview='dock']>*{opacity:.55;transform:scale(.94)}",
+        ".dw-dock-host[data-dw-preview='open']>*{transform:scale(1.12)}",
 
         // ---- shared bits ----
         ".dw-sr{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}",
@@ -2413,8 +2869,9 @@ window.__ModuleLoader__.load({
         // The host draws every corner as a superellipse; circles and pills opt
         // back into round corners, exactly as the host's own pills do.
         ".dw-dot,.dw-busy i,.dw-chip,.dw-icon-button,.dw-call-button,.dw-orb-mini,.dw-round,.dw-pill,.dw-ctl-mute,.dw-toggle,.dw-orb,.dw-orb-core,.dw-orb:after,",
-        ".dw-switch,.dw-switch-thumb,.dw-badge,.dw-primary,.dw-secondary,.dw-retry,.dw-drag-handle:before{corner-shape:round}",
+        ".dw-switch,.dw-switch-thumb,.dw-badge,.dw-primary,.dw-secondary,.dw-retry{corner-shape:round}",
         ".dw-error{margin:0;padding:8px 12px;border-radius:12px;font-size:12.5px;line-height:1.5;color:var(--dw-danger);background:color-mix(in srgb,var(--dw-danger) 10%,transparent)}",
+        ".dw-notice{flex:none;margin:0;padding:8px 12px;border-radius:12px;font-size:12.5px;line-height:1.5;color:var(--dw-fg-2);background:var(--dw-fill)}",
 
         // ---- the closed dock: start a call, or open settings ----
         ".dw-dock.dw-dock-closed{flex-direction:row;align-items:center;gap:8px}",
@@ -2430,6 +2887,17 @@ window.__ModuleLoader__.load({
         ".dw-dock{display:flex;flex-direction:column;gap:10px}",
         ".dw-card{display:flex;flex-direction:column;gap:10px;padding:14px 16px 12px;border-radius:22px;max-height:min(52vh,440px);overflow:hidden;",
         "background:var(--dw-surface);border:1px solid var(--dw-line);box-shadow:var(--dw-shadow)}",
+        // Resize grips sit in the card's top corners; only the one on the free
+        // side shows, because the panel grows away from its anchored side.
+        ".dw-card{position:relative;box-sizing:border-box}",
+        ".dw-resize{position:absolute;top:0;z-index:1;width:16px;height:16px;opacity:0;transition:opacity .15s}",
+        ".dw-resize:before{content:'';position:absolute;top:5px;width:7px;height:7px;border-top:2px solid var(--dw-fg-3)}",
+        ".dw-resize-left{left:0;cursor:nwse-resize}",
+        ".dw-resize-left:before{left:5px;border-left:2px solid var(--dw-fg-3);border-top-left-radius:4px}",
+        ".dw-resize-right{right:0;cursor:nesw-resize}",
+        ".dw-resize-right:before{right:5px;border-right:2px solid var(--dw-fg-3);border-top-right-radius:4px}",
+        ".dw-card:hover .dw-resize{opacity:1}",
+        ".dw-dock-host:not([data-dw-anchor='left']) .dw-resize-right,.dw-dock-host[data-dw-anchor='left'] .dw-resize-left{display:none}",
         ".dw-dock-head{flex:none;display:flex;align-items:center;gap:8px;min-height:28px}",
         ".dw-status{display:inline-flex;align-items:center;gap:8px;flex:1;min-width:0;font-weight:600}",
         ".dw-status-text{min-width:0}",
@@ -2498,6 +2966,13 @@ window.__ModuleLoader__.load({
         ".dw-status-deviceoff .dw-orb-core{filter:grayscale(1) brightness(.72)}",
         ".dw-status-deviceoff .dw-orb-core svg{opacity:1}",
         `.dw-status-error .dw-orb-core{background:${orbError}}`,
+        // Stashed against an edge: the microphone button alone, on its own disc.
+        ".dw-dock-docked{display:flex}",
+        ".dw-dock-docked .dw-orb{position:relative;flex:none;width:60px;height:60px;margin:0;padding:0;border-radius:50%;cursor:pointer;isolation:isolate;",
+        "background:var(--dw-surface);border:1px solid var(--dw-line);box-shadow:var(--dw-shadow)}",
+        ".dw-dock-docked .dw-orb-core,.dw-dock-docked .dw-orb:after{inset:6px}",
+        ".dw-orb-start .dw-orb-core svg{opacity:1}",
+        ".dw-status-idle .dw-orb-core{animation:dw-breathe 4s ease-in-out infinite}",
         "@keyframes dw-pulse{0%,100%{opacity:1}50%{opacity:.35}}",
         "@keyframes dw-breathe{0%,100%{transform:scale(1)}50%{transform:scale(1.06)}}",
         "@keyframes dw-spin{to{transform:rotate(360deg)}}",
@@ -2545,6 +3020,8 @@ window.__ModuleLoader__.load({
         ".dw-input{width:100%;height:36px;box-sizing:border-box;padding:0 12px;border-radius:10px;font:inherit;font-size:13px;",
         "border:1px solid transparent;background:var(--dw-fill);color:var(--dw-fg);transition:border-color .15s,background .15s}",
         ".dw-input::placeholder{color:var(--dw-fg-3)}",
+        ".dw-select{flex:none;height:32px;padding:0 10px;border-radius:10px;border:1px solid var(--dw-line);background:var(--dw-surface);color:var(--dw-fg);font:inherit;font-size:12.5px;cursor:pointer}",
+        ".dw-select:focus-visible{outline:2px solid var(--dw-accent);outline-offset:2px}",
         ".dw-input:hover:not(:disabled){background:var(--dw-fill-2)}",
         ".dw-input:focus{outline:none;border-color:var(--dw-accent);background:var(--dw-surface)}",
         ".dw-input:disabled{opacity:.55;cursor:not-allowed}",
@@ -2568,7 +3045,9 @@ window.__ModuleLoader__.load({
         "font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC','Hiragino Sans GB','Microsoft YaHei',sans-serif}",
         `body.dw-detached[data-ds-dark-theme]{${darkTokens}}`,
         "body.dw-detached .dw-dock-host{position:static;width:auto;max-width:none;height:100vh;box-sizing:border-box;padding:12px}",
-        "body.dw-detached .dw-drag-handle{display:none}",
+        "body.dw-detached .dw-resize{display:none}",
+        "body.dw-detached .dw-dock-host[data-dw-sized]{width:auto;max-width:none}",
+        "body.dw-detached .dw-dock-host[data-dw-sized] .dw-card{height:auto}",
         "body.dw-detached .dw-dock,body.dw-detached .dw-settings{flex:1;min-height:0;max-height:none}",
         "body.dw-detached .dw-card{flex:1;min-height:0;max-height:none;box-shadow:none}",
         "body.dw-detached .dw-round,body.dw-detached .dw-pill,body.dw-detached .dw-settings{box-shadow:none}",
@@ -2616,17 +3095,21 @@ window.__ModuleLoader__.load({
     module.exports.isLive = isLive;
     module.exports.DICTIONARIES = DICTIONARIES;
     module.exports.VOICE_CONSTANTS = VOICE_CONSTANTS;
-    module.exports.createSilenceDetector = createSilenceDetector;
+    module.exports.createTurnTaker = createTurnTaker;
+    module.exports.createAwayGuard = createAwayGuard;
+    module.exports.speechLevelDbfs = speechLevelDbfs;
     module.exports.createCallGuard = createCallGuard;
     module.exports.createCallControls = createCallControls;
-    module.exports.createFrameGate = createFrameGate;
     module.exports.detachCapability = detachCapability;
     module.exports.snapDockPosition = snapDockPosition;
+    module.exports.dockRelease = dockRelease;
+    module.exports.dockResize = dockResize;
+    module.exports.dockGeometryStyle = dockGeometryStyle;
+    module.exports.dockedView = dockedView;
     module.exports.settingsDraftPatch = settingsDraftPatch;
     module.exports.dockView = dockView;
     module.exports.dockStyles = dockStyles;
     module.exports.settingsView = settingsView;
-    module.exports.testFrame = testFrame;
     module.exports.baselineTurnOf = baselineTurnOf;
     module.exports.replyTextOf = replyTextOf;
     module.exports.speakable = speakable;

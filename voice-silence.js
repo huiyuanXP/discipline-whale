@@ -1,221 +1,151 @@
 /**
- * discipline-whale — the voice call's two browser-side rules, kept as plain
- * data logic so they can be tested without a microphone.
+ * discipline-whale — the voice call's turn rules, kept as plain data and logic
+ * so they can be tested without a microphone.
  *
- * `createSilenceDetector` is the end-of-utterance decision: it measures the
- * room's noise floor during a short calibration window, then declares the
- * utterance over once the signal has stayed under `floor + margin` for the
- * full silence window. It also enforces the minimum useful speech, the minimum
- * recording length and the maximum recording length.
+ * When a turn starts and ends is decided by Silero VAD through
+ * `@ricky0123/vad-web` (its `MicVAD`), the detector LiveKit, Pipecat and the
+ * vad-web demos all build on. `TURN_OPTIONS` is the one place its parameters
+ * live; the browser half mirrors them verbatim and `test/client.mjs` proves the
+ * two copies match.
+ *
+ * `speechLevelDbfs` and `MIN_SPEECH_LEVEL_DBFS` keep distant talk out: an
+ * utterance quieter than the floor was not said into this microphone.
+ *
+ * `createAwayGuard` pauses listening when the person seems to have walked
+ * away: no accepted turn for `AWAY_IDLE_MS` of listening, or
+ * `AWAY_MAX_REJECTIONS` utterances in a row refused as background sound. It
+ * counts turns, not sound, because background talk is sound too.
  *
  * `createCallGuard` is the late-result rule: a transcript may only be delivered
  * while the call that produced it is still current and still pointed at the
  * same session. Hanging up or switching sessions invalidates it.
  *
- * Both are pure and synchronous: the browser half feeds them frames, it does
- * not decide anything itself.
- *
  * @module discipline-whale/voice-silence
  */
 
-/** How long the signal must stay quiet before the utterance is over. */
-export const SILENCE_MS = 10_000
-
-/** Calibration window at the start of a call: the room's noise floor. */
-export const CALIBRATION_MS = 500
-
-/** How much louder than the measured floor speech has to be. */
-export const NOISE_MARGIN = 0.02
-
-/** Absolute floor, so a digitally silent room cannot make the threshold zero. */
-export const MIN_THRESHOLD = 0.012
-
-
-/** Below this much total speech the recording is not worth transcribing. */
-export const MIN_SPEECH_MS = 500
-
-/** A recording shorter than this is a stray click, not an utterance. */
-export const MIN_RECORDING_MS = 1_000
-
-/** Hard cap: a call that never goes quiet is cut here. */
-export const MAX_RECORDING_MS = 60_000
-
-/** Default parameters, in one place so the 10s rule is a single edit. */
-export const DEFAULT_SILENCE_OPTIONS = Object.freeze({
-  silenceMs: SILENCE_MS,
-  calibrationMs: CALIBRATION_MS,
-  noiseMargin: NOISE_MARGIN,
-  minThreshold: MIN_THRESHOLD,
-  minSpeechMs: MIN_SPEECH_MS,
-  minRecordingMs: MIN_RECORDING_MS,
-  maxRecordingMs: MAX_RECORDING_MS,
+/**
+ * Silero VAD turn-taking parameters for `MicVAD`.
+ *
+ * Speech starts above `positiveSpeechThreshold` and is considered over once
+ * the probability has stayed under `negativeSpeechThreshold` for
+ * `redemptionMs`. `preSpeechPadMs` of audio before the start is kept so the
+ * first syllable survives, and a segment with less than `minSpeechMs` of
+ * speech is a misfire, never uploaded. The thresholds are Silero's own
+ * (0.5 / 0.15 lower, as LiveKit uses them); `redemptionMs` sits between
+ * OpenAI's 500 ms server VAD and the 2–8 s waits of semantic turn detection.
+ */
+export const TURN_OPTIONS = Object.freeze({
+  model: 'v5',
+  positiveSpeechThreshold: 0.5,
+  negativeSpeechThreshold: 0.35,
+  redemptionMs: 2_000,
+  preSpeechPadMs: 500,
+  minSpeechMs: 500,
 })
 
-/** Root mean square of one frame of samples. */
-export function rmsOf(samples) {
-  if (!samples || samples.length === 0) return 0
-  let sum = 0
-  for (let i = 0; i < samples.length; i += 1) sum += samples[i] * samples[i]
-  return Math.sqrt(sum / samples.length)
+/** The pause lengths the settings offer for "the turn is over". */
+export const REDEMPTION_CHOICES_MS = Object.freeze([1_000, 2_000, 3_000, 5_000, 8_000])
+
+/** Hard cap on one utterance: speech that never pauses is cut and sent here. */
+export const MAX_SPEECH_MS = 60_000
+
+/**
+ * The level an utterance must reach to count as said to the whale, in dBFS.
+ *
+ * With automatic gain control off, speech near the microphone sits around
+ * -35 to -15 dBFS while a conversation across the room stays well below this.
+ * It is an empirical floor, deliberately low: it drops distant talk, not a
+ * quiet speaker.
+ */
+export const MIN_SPEECH_LEVEL_DBFS = -45
+
+/** Listening this long without an accepted turn pauses the microphone. */
+export const AWAY_IDLE_MS = 120_000
+
+/** This many utterances in a row refused as background sound pause it too. */
+export const AWAY_MAX_REJECTIONS = 3
+
+/**
+ * How loud an utterance gets, in dBFS: the 90th-percentile level of its 30 ms
+ * frames, so the pre-speech pad and the trailing pause do not dilute it.
+ * @param samples mono samples in [-1, 1].
+ * @param sampleRate samples per second.
+ * @returns the level, or -Infinity for silence.
+ */
+export function speechLevelDbfs(samples, sampleRate = 16_000) {
+  const frame = Math.max(1, Math.round(sampleRate * 0.03))
+  const levels = []
+  for (let start = 0; start + frame <= samples.length; start += frame) {
+    let sum = 0
+    for (let i = start; i < start + frame; i += 1) sum += samples[i] * samples[i]
+    levels.push(Math.sqrt(sum / frame))
+  }
+  if (levels.length === 0) return -Infinity
+  levels.sort((a, b) => a - b)
+  const loud = levels[Math.min(levels.length - 1, Math.floor(levels.length * 0.9))]
+  return loud > 0 ? 20 * Math.log10(loud) : -Infinity
 }
 
 /**
- * Create one end-of-utterance detector.
+ * Create the guard that notices the person has walked away.
  *
- * Design notes:
- *  - The threshold is `max(minThreshold, floor * 2 + margin)`, where `floor` is
- *    the mean frame RMS measured during calibration. A noisy room raises both
- *    the floor and the threshold, so quiet speech above the room tone still
- *    registers; a silent room falls back to the absolute floor.
- *  - Speech is counted in whole frame durations, so `speechMs` is a lower bound
- *    on how long the user actually spoke.
- *  - The detector never stops on `minRecordingMs`; only silence, the maximum
- *    duration, or an explicit `stop()` can end an utterance.
- * @param options overrides for the named constants.
- * @returns a detector with `push`, `threshold`, `elapsedMs`, `canStop` and `stop`.
+ * Only listening time counts: `resume(now)` opens a stretch of listening and
+ * `suspend(now)` banks it (the whale replying, muted, microphone off), so a
+ * long reply never reads as absence. `accepted(now)` and `present(now)` clear
+ * the account, `rejected()` counts one utterance refused as background sound,
+ * and `reset()` forgets everything. `reason(now)` names why listening should
+ * pause, or answers null.
+ * @param options optional `idleMs` and `maxRejections` overrides.
+ * @returns the guard.
  */
-export function createSilenceDetector(options = {}) {
-  const config = { ...DEFAULT_SILENCE_OPTIONS, ...options }
-  let elapsedMs = 0
-  let calibrationFrames = 0
-  let calibrationSum = 0
-  let calibrated = false
-  let floor = 0
-  let threshold = config.minThreshold
-  let silenceMs = 0
-  let speechMs = 0
-
-  function calibrate(frameMs) {
-    floor = calibrationSum / Math.max(1, calibrationFrames)
-    // Relative, not capped: a loud room is loud, and speech must clear it.
-    // Capping the threshold would make the room tone itself read as speech.
-    threshold = Math.max(config.minThreshold, floor * 2 + config.noiseMargin)
-    calibrated = true
-    void frameMs
-  }
-
-  function decide(reason) {
-    const upload = reason === 'max-duration'
-      ? speechMs >= config.minSpeechMs
-      : speechMs >= config.minSpeechMs
-    return {
-      action: 'stop',
-      reason: upload ? reason : 'no-speech',
-      upload,
-      speechMs,
-      elapsedMs,
-      threshold,
-    }
-  }
-
+export function createAwayGuard(options = {}) {
+  const idleMs = options.idleMs ?? AWAY_IDLE_MS
+  const maxRejections = options.maxRejections ?? AWAY_MAX_REJECTIONS
+  let since = null
+  let banked = 0
+  let rejections = 0
   return {
-    /**
-     * Feed one analysis frame.
-     * @param samples mono float samples of this frame.
-     * @param frameMs the frame's duration in milliseconds.
-     * @returns a terminal decision, or undefined while the utterance continues.
-     */
-    push(samples, frameMs = (samples?.length ?? 0) * (1000 / 16000)) {
-      const duration = Math.max(0, Number(frameMs) || 0)
-      const level = rmsOf(samples)
-      if (!calibrated) {
-        calibrationFrames += 1
-        calibrationSum += level
-        elapsedMs += duration
-        if (elapsedMs >= config.calibrationMs) calibrate(duration)
-        // Calibration itself counts toward the recording, never toward speech:
-        // a cough during calibration is room tone, not an utterance.
-        return undefined
-      }
-      elapsedMs += duration
-      const voiced = level > threshold
-      if (voiced) {
-        speechMs += duration
-        silenceMs = 0
-      } else {
-        silenceMs += duration
-      }
-      if (elapsedMs >= config.maxRecordingMs) return decide('max-duration')
-      if (silenceMs >= config.silenceMs) {
-        return decide(speechMs >= config.minSpeechMs ? 'silence' : 'no-speech')
-      }
-      return undefined
+    /** Listening started or continued. */
+    resume(now) {
+      if (since === null) since = now
     },
-
-    /** The current speech threshold (absolute floor before calibration). */
-    threshold() {
-      return threshold
+    /** Listening stopped for a while; the time so far is kept. */
+    suspend(now) {
+      if (since !== null) banked += now - since
+      since = null
     },
-
-    /** The measured room floor, 0 before calibration. */
-    floor() {
-      return floor
+    /** A turn reached the whale: the person is here. */
+    accepted(now) {
+      banked = 0
+      rejections = 0
+      if (since !== null) since = now
     },
-
-    /** Total recorded duration. */
-    elapsedMs() {
-      return elapsedMs
+    /** The person used a control: they are here. */
+    present(now) {
+      banked = 0
+      rejections = 0
+      if (since !== null) since = now
     },
-
-    /** Total duration classified as speech. */
-    speechMs() {
-      return speechMs
+    /** One utterance was refused as background sound. */
+    rejected() {
+      rejections += 1
     },
-
-    /** Whether an explicit stop (the user's button) is allowed yet. */
-    canStop() {
-      return elapsedMs >= config.minRecordingMs
-    },
-
-    /** How long the signal has been quiet right now (0 after any speech). */
-    silenceMs() {
-      return silenceMs
-    },
-
-    /**
-     * Stop accounting: muted frames are not the room being quiet.
-     *
-     * A muted stretch must not count toward `silenceMs`, or a long mute would
-     * make the first frame after unmuting look like the end of a ten-second
-     * pause and end the utterance instantly. `elapsedMs` and `speechMs` are
-     * frozen too — the recording did not grow while nothing was processed.
-     */
-    pause() {
-      silenceMs = 0
-    },
-
-    /**
-     * Resume accounting after a mute.
-     *
-     * The silence run restarts from zero (there is no unbroken quiet to
-     * measure), while the calibration and the speech measured so far are kept:
-     * the room did not change and the user is in the same utterance.
-     */
-    resume() {
-      silenceMs = 0
-    },
-
-    /**
-     * End the utterance because the user asked to.
-     * @returns the same decision shape `push` returns.
-     */
-    stop() {
-      if (!this.canStop()) {
-        return { action: 'stop', reason: 'too-short', upload: false, speechMs, elapsedMs, threshold }
-      }
-      return decide(speechMs >= config.minSpeechMs ? 'manual' : 'no-speech')
-    },
-
-    /** Reset to a fresh utterance, keeping the parameters. */
+    /** Forget everything: a new call, or listening paused for absence. */
     reset() {
-      elapsedMs = 0
-      calibrationFrames = 0
-      calibrationSum = 0
-      calibrated = false
-      floor = 0
-      threshold = config.minThreshold
-      silenceMs = 0
-      speechMs = 0
+      since = null
+      banked = 0
+      rejections = 0
+    },
+    /**
+     * Why listening should pause now.
+     * @param now current time in ms.
+     * @returns "rejections", "idle", or null.
+     */
+    reason(now) {
+      if (rejections >= maxRejections) return 'rejections'
+      const listened = banked + (since === null ? 0 : now - since)
+      if (listened >= idleMs) return 'idle'
+      return null
     },
   }
 }

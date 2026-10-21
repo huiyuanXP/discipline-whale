@@ -1225,6 +1225,9 @@ const checkpointPath = (workerSessionId) =>
   // needs a second server to configure voice.
   assert.ok(paths.includes(VOICE_SETTINGS_ROUTE), 'the settings route is registered')
   assert.ok(paths.includes(VOICE_TEST_ROUTE), 'the connection-test route is registered')
+  // The page's speech detector rides the same connection: no CDN, no second server.
+  assert.ok(paths.includes('/api/discipline-whale/voice/vad/bundle.min.js'), 'the detector bundle route is registered')
+  assert.ok(paths.includes('/api/discipline-whale/voice/vad/silero_vad_v5.onnx'), 'the Silero model route is registered')
 
   const say = routes.find((route) => route.path === VOICE_SAY_ROUTE)
   assert.deepEqual(say.methods, ['POST'])

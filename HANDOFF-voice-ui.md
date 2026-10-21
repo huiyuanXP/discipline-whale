@@ -34,7 +34,7 @@
 
 ### 不做的
 
-- 不改 `voice.js` / `voice-silence.js`（服务端转写与静音判定，与外观无关）。
+- 外观改动不碰 `voice.js` / `voice-silence.js` / `voice-assets.js`（转写与过滤、起停参数与离开防护、检测组件文件路由），它们的契约见第 4 节。
 - 不改挂载点、slot 名、注册 id、`order`。
 - 不改任何状态语义、阈值、半双工规则、隐私提示的存在性。
 - 不引入构建步骤、npm 前端依赖、CDN 外链。
@@ -51,6 +51,8 @@
 | --- | --- |
 | `client.js` `function dockView(input)` | 打开态通话条（纯函数，只读 `input`）。**外观结构的主战场。** |
 | `client.js` `function settingsView(input)` | 设置面板；`input.page` 取 `main` / `service` / `tts`。 |
+| `client.js` `function dockedView(input)` | 贴边收起后的视图：在通话中是同一个话筒控件，没通话时点按开始通话。 |
+| `client.js` `dockRelease` / `dockResize` / `dockGeometryStyle` | 纯函数：松手落点（含贴边收起与展开）、缩放 clamp、几何转成 CSS 自定义属性。 |
 | `client.js` `function dockVisualState(input)` | 把 `status` 与话筒/静音合成一个视觉状态，挂成根节点的 `.dw-status-<state>`。 |
 | `client.js` `function dockStyles()` | 全部 `.dw-*` 规则。`installStyles()` 把它注入页面，`copyStylesInto()` 把它复制进独立小窗。**样式改动的唯一入口。** |
 | `client.js` `function makeVoiceDock(ctx, t)` | 组件本体（状态、副作用、折叠态「开始通话」）。 |
@@ -80,7 +82,9 @@ ctx.slots.inject("shell.overlay", () =>
 
 | 类 | 职责 |
 | --- | --- |
-| `.dw-dock-host` | 浮层宿主列（`pointer-events:none`，子元素接收点击）；主题 token 的 `--dw-*` 转接层也在这里 |
+| `.dw-dock-host` | 浮层宿主列（`pointer-events:none`，子元素接收点击）；主题 token 的 `--dw-*` 转接层也在这里；整块可拖动（`onDragStart` 挂在这里），几何由 `data-dw-anchor` / `data-dw-docked` / `data-dw-sized` + `--dw-dock-x/y/w`、`--dw-card-h` 表达 |
+| `.dw-dock-docked` | 贴边收起：只剩麦克风光球（`dockedView`） |
+| `.dw-resize` / `data-dw-resize` | 卡片顶角的缩放把手，只显示空出一侧的那个 |
 | `.dw-dock` / `.dw-dock-closed` | 打开态根节点（带 `.dw-status-<state>`）/ 折叠态 |
 | `.dw-call-button` / `.dw-orb-mini` / `.dw-call-settings` | 折叠态「开始通话」胶囊、其中的小光球、旁边的设置圆钮 |
 | `.dw-card` | 卡片平面 |
@@ -106,7 +110,8 @@ ctx.slots.inject("shell.overlay", () =>
 ### 不需要动的文件
 
 - `voice.js`：三条 HTTP 路由（status / transcribe / say）。
-- `voice-silence.js`：静音判定与迟到结果守卫。
+- `voice-silence.js`：起停参数（Silero VAD）、近场音量门、离开防护、迟到结果守卫。
+- `voice-assets.js`：从已安装的 `@ricky0123/vad-web` / `onnxruntime-web` 提供页面需要的 6 个检测组件文件。
 - `home.js`：挂载语音路由。外观改动不涉及。
 
 ---
@@ -128,27 +133,26 @@ ctx.slots.inject("shell.overlay", () =>
 
 ### 4.1 话筒 = 麦克风权限与设备
 
-- 申请设备：`getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }, video: false })`。
-- 释放：`stream.getTracks().forEach(track => track.stop())`，并关闭 `AudioContext`。
+- 申请设备：`getUserMedia({ audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: false }, video: false })`（经 `MicVAD` 的 `getStream`）。自动增益关闭：它会把房间另一头的说话声放大到近讲音量。
+- 释放：`stream.getTracks().forEach(track => track.stop())`，并 `MicVAD.destroy()`（关闭它的 `AudioContext`、释放模型）。
 - 权限被拒要显示明确原因（`errPermission`），不能静默变灰。
 
-### 4.2 静音 = 丢弃帧、不进 VAD、不计入断句时长
+### 4.2 静音 = 暂停检测、设备保持打开
 
-静音状态下**帧根本不进检测器**：不是「进了检测器但被忽略」，而是 `push()` 不被调用。因此静音期间 `elapsedMs` / `silenceMs` / `speechMs` 都不增长——静音时间不会把一句有效语音「撑」到 10 秒断句，也不会误触发 60 秒上限。
+静音时 `MicVAD` 在**同一条 live 的流上暂停**（`createTurnTaker().mute()`，自定义 `pauseStream` 不停 track）：不分析任何一帧、不上传、不发送；正在说的那段**丢弃**。解除静音 `start()` 续上，不重新申请麦克风。离开防护的计时在静音期间暂停。`test/dock.mjs` ok 2 钉住。
 
-> 这一条的实现在并行会话 `session-f2aa6d6b` 手里（话筒/静音拆分）。你重做外观时若它已落地，**不要改它的数据流**；若还没落地，按当前代码排版即可。
+### 4.3 起停：Silero VAD（vad-web），加三道过滤
 
-### 4.3 10 秒自动断句与阈值公式
-
-- `VOICE_CONSTANTS.silenceMs = 10000`：连续静音满 10 秒结束这句。
-- 阈值**不是魔法数**：开头 500ms 采底噪，`threshold = max(minThreshold, floor * 2 + noiseMargin)`，其中 `minThreshold = 0.012`、`noiseMargin = 0.02`。
-- 最短有效语音 `minSpeechMs = 500`；不足则**不上传、不发送**，回待命。
-- 最短录音 `minRecordingMs = 1000`；上限 `maxRecordingMs = 60000`。
-- `client.js` 里有一份 `voice-silence.js` 的**逐字镜像**（浏览器半是 plain JS，import 不了 ESM）。`test/client.mjs` 的 `ok 1` 用 900 帧合成信号逐帧比对两份实现——**改一处必须改另一处**，否则这条会红。
+- **起停判断**：`@ricky0123/vad-web` 的 `MicVAD`（Silero v5），参数 `TURN_OPTIONS`：开始阈值 0.5、结束阈值 0.35、停顿 `redemptionMs` 默认 2000（设置里可选 1/2/3/5/8 秒，存本浏览器）、开口前保留 500ms、不足 500ms 算误触不上传。一直不停顿的语音 `MAX_SPEECH_MS = 60000` 截断并发送。
+- **近场音量门**：一段语音的 90 分位帧电平低于 `MIN_SPEECH_LEVEL_DBFS = -45` 不上传（远处人声）。经验值。
+- **服务端过滤**（`voice.js`）：`verbose_json`，段的 `no_speech_prob ≥ 0.6`（单独判断）、`avg_logprob < -1`、`compression_ratio > 2.4` 丢弃；再过幻觉短语库（`HALLUCINATIONS.markers` 出现即丢，`whole` 整句才丢）。全丢 → `voice/rejected-transcript`，客户端只显示提示，不发送。
+- **离开防护**（`createAwayGuard`）：连续 3 段被拒，或累计收音 2 分钟没有发出消息（鲸鱼思考、静音、话筒关的时间不计），自动关闭话筒并提示「点话筒继续」。
+- 检测组件文件由插件路由 `/api/discipline-whale/voice/vad/<name>` 从已安装的包提供（`voice-assets.js`），不走 CDN；页面不是 cross-origin isolated，onnxruntime 单线程。
+- `client.js` 里有一份 `voice-silence.js` 规则的**逐字镜像**（浏览器半是 plain JS，import 不了 ESM）。`test/client.mjs` 的 `ok 1` 比对参数、音量电平与离开防护的逐步判定——**改一处必须改另一处**。
 
 ### 4.4 半双工
 
-麦克风只在状态为 `listening` 时开。鲸鱼思考时不开麦；朗读期间不开麦；回复显示完再回到待命并重开麦。
+麦克风只在状态为 `listening` 时开。一段语音结束即 `hold()`：暂停检测并停掉所有 track（指示灯灭）；鲸鱼思考、朗读期间不开麦；回复显示完再回到待命并重新申请麦克风。
 
 ### 4.5 朗读是 opt-in fallback，默认关闭，不是「已接入 TTS」
 
@@ -169,8 +173,8 @@ ctx.slots.inject("shell.overlay", () =>
 | 状态 | 含义 | 视觉上必须能区分 |
 | --- | --- | --- |
 | `ready` | 待命，可以说话 | 常态；与「正在听」明显不同 |
-| `calibrating` | 开头 500ms 采环境底噪 | 与 `listening` 区分（「正在听环境噪音」） |
-| `listening` | 正在听，静音满 10 秒自动发送 | **必须有进行感**（当前是红点脉冲） |
+| `calibrating` | 准备收音：首次加载检测组件，之后恢复检测 | 与 `listening` 区分（「正在准备收音」） |
+| `listening` | 正在听，说完停顿 2 秒（可调）就发送 | **必须有进行感**（当前是红点脉冲） |
 | `transcribing` | 音频上传、等待识别 | 处理中，非进行中 |
 | `thinking` | 已送进主会话，等鲸鱼回复 | 处理中 |
 | `speaking` | 正在朗读（仅朗读开启时出现） | 与 `thinking` 区分 |
@@ -199,7 +203,7 @@ ctx.slots.inject("shell.overlay", () =>
 | `speakNote` | `client.js` `DICTIONARIES` 的 zh 与 en | 「浏览器语音合成（fallback，非真实 TTS）」文案。`test/client.mjs` 的 `ok 3` 会校验它含 fallback 措辞、含「非真实 TTS」、说明默认关闭，且**不得**声称「已接入 TTS」。 |
 
 另外这些也通过 `module.exports` 暴露给测试，重写时不要丢：
-`DICTIONARIES`、`VOICE_CONSTANTS`、`createSilenceDetector`、`createCallGuard`、`baselineTurnOf`、`replyTextOf`、`speakable`、`speakReply`、`speechLanguage`、`makeVoiceDock`、`createSessionWatcher`、`resolveMainSession`、`isLive`。
+`DICTIONARIES`、`VOICE_CONSTANTS`、`createTurnTaker`、`createAwayGuard`、`speechLevelDbfs`、`createCallGuard`、`baselineTurnOf`、`replyTextOf`、`speakable`、`speakReply`、`speechLanguage`、`makeVoiceDock`、`createSessionWatcher`、`resolveMainSession`、`isLive`。
 
 > 依赖注入那一步是刻意的：它让「引擎永不触发 `onend` 时，超时兜底仍能 settle」变成可执行断言（`ok 3a`），而不是靠读代码相信。
 
@@ -215,7 +219,7 @@ ctx.slots.inject("shell.overlay", () =>
 
 | 会话 | 在做什么 | 影响 |
 | --- | --- | --- |
-| `session-f2aa6d6b` | **设置界面**（API Key / Base URL 可配置）、**通话窗独立化（PiP / 独立窗口）**、**话筒与静音拆成两个独立控件**、桌面宠物调研 | 已落地到 `client.js`（`createCallControls` / `createFrameGate` / `detachCapability` / `snapDockPosition` / 设置路由）；外观重做在其之上完成 |
+| `session-f2aa6d6b` | **设置界面**（API Key / Base URL 可配置）、**通话窗独立化（PiP / 独立窗口）**、**话筒与静音拆成两个独立控件**、桌面宠物调研 | 已落地到 `client.js`（`createCallControls` / `detachCapability` / `snapDockPosition` / 设置路由）；外观重做在其之上完成 |
 | 本会话（语音能力） | 转写、静音判定、朗读 fallback、交接文档 | 已把 `speakReply`/`speakable`/`speechLanguage` 提到模块作用域 |
 
 快照里有一个「并行会话指纹」：若检测到 `apiKey` / `baseUrl` / `pictureInPicture` / `settings` / `mute` 等关键字，说明对方已经开始落笔。**为「暂无」不代表安全，只代表还没写。**
@@ -264,7 +268,7 @@ npm run test:all      # contract + guard + adhd + voice + client + dock + settin
 | `client.mjs` **ok 6** | 改结构导致渲染树变了 | 它用受控 hook 值渲染并遍历文本节点，断言「状态 / 识别结果 / 回复 / 挂断 / 隐私 / 朗读开关可见」，并按 `data-dw-control` 名称取话筒与静音两个按钮。**保留这些可见性断言**，只调整取文本的方式。 |
 | `dock.mjs` **ok 10** | 改设置面板结构 | 用 `page: "tts"` 渲染二级页断言四个禁用占位；另断言总览里有「真实 TTS · 未接入」入口且点击导航到 `tts`。 |
 | `client.mjs` **ok 3** | 改字典文案 | 必须保留 fallback 口径的四条正则与「不得声称已接入 TTS」。 |
-| `client.mjs` **ok 1** | 改检测器 | **不该改**——两份实现必须逐帧一致。 |
+| `client.mjs` **ok 1** | 改起停参数、音量门或离开防护 | **不该放宽**——镜像与 `voice-silence.js` 必须一致；两边一起改。 |
 | `client.mjs` **ok 3a** | 改回复完成路径 | 必须保留两条：关闭不 await；开启有超时兜底（行为测试，用假引擎）。 |
 
 **不允许**为了让测试过而删掉语义断言。只允许调整「怎么取到那段文本/那个节点」。
@@ -280,7 +284,7 @@ npm run test:all      # contract + guard + adhd + voice + client + dock + settin
 | # | 事项 | 验证步骤 |
 | --- | --- | --- |
 | 1 | `getUserMedia` 授权与三个 audio 约束被接受 | 点开始通话，允许麦克风，console 无 `OverconstrainedError` |
-| 2 | 真实房间的 10 秒静音确实在 ~10s 结束 | 说一句后完全不出声，秒表确认 ~10s 进入「识别中」；再在开风扇的房间重复 |
+| 2 | 真人说话的起停手感 | 说一句后停顿，约 2 秒进入「识别中」；句中短暂思考不被切断；开风扇、旁边有人聊天时不被触发或被拦下。隔离实例里用合成语音已确认：正常音量的句子识别并发送，衰减 40 dB 的同一句被音量门拦下、连续 3 次后自动关话筒 |
 | 3 | 麦克风指示灯：思考/朗读时熄灭，回待命后重亮 | 看 macOS 菜单栏橙色指示点 |
 | 4 | 浮层布局在真实主题下不挡操作、不被裁切 | 会话页与插件页来回切，确认通话条一直可见可点。隔离实例（800×600）已确认：会话页底部输入框与发送按钮不被遮挡；新会话空白页居中的输入框会被**打开的**通话条压住右半部分，属已知取舍（README「已知限制」），拖开即可 |
 | 5 | 窄窗（≤768px）不遮住输入框 | 隔离实例 375×812 已确认：会话页不遮挡；新会话空白页同第 4 条的取舍。真机拉窄窗口再复验一次 |
@@ -349,8 +353,8 @@ grep -o 'setPhase("[a-z]*")' client.js | sort -u
 # 类名
 grep -o 'className: "[^"]*"' client.js | sort -u
 
-# 阈值常量（两份实现都要看）
-grep -n "silenceMs\|minThreshold\|noiseMargin" client.js voice-silence.js
+# 起停参数（两份都要看）
+grep -n "positiveSpeechThreshold\|redemptionMs\|minSpeechLevelDbfs\|MIN_SPEECH_LEVEL_DBFS" client.js voice-silence.js
 ```
 
 ---
@@ -359,39 +363,39 @@ grep -n "silenceMs\|minThreshold\|noiseMargin" client.js voice-silence.js
 
 ### 快照：仓库实际状态
 
-> 生成于 2026-10-21T10:29:48.913Z（本机时间 2026/10/21 18:29:48）。
+> 生成于 2026-10-21T15:58:44.803Z（本机时间 2026/10/21 23:58:44）。
 > 本节由 `node scripts/handoff-snapshot.mjs` 重新生成；标记区间之外的内容需人工维护。
 
 **关键文件**
 
 | 文件 | 修改时间 | 距今 |
 | --- | --- | --- |
-| `client.js` | 2026-10-21T10:20:25.176Z | 9 分钟前 |
-| `voice.js` | 2026-10-20T19:08:26.227Z | 15 小时前 |
-| `voice-silence.js` | 2026-10-20T19:10:00.285Z | 15 小时前 |
+| `client.js` | 2026-10-21T15:55:33.959Z | 3 分钟前 |
+| `voice.js` | 2026-10-21T15:55:33.960Z | 3 分钟前 |
+| `voice-silence.js` | 2026-10-21T15:35:06.346Z | 24 分钟前 |
 
 **测试基线**（必须是全绿；改外观后项数可能变，语义断言不应减少）
 
 | 套件 | 命令 | 用例数 | 状态 | 耗时 |
 | --- | --- | --- | --- | --- |
-| contract | `npm test` | 28 | ✅ 通过 | 567 ms |
-| guard | `npm run test:guard` | 10 | ✅ 通过 | 59 ms |
-| voice | `npm run test:voice` | 16 | ✅ 通过 | 124 ms |
-| client | `npm run test:client` | 9 | ✅ 通过 | 34 ms |
-| dock | `npm run test:dock` | 11 | ✅ 通过 | 30 ms |
-| settings | `npm run test:settings` | 10 | ✅ 通过 | 89 ms |
-| adhd | `npm run test:adhd` | 16 | ✅ 通过 | 49 ms |
-| smoke | `npm run test:smoke` | —（脚本式，无逐条用例） | ✅ 通过 | 33 ms |
+| contract | `npm test` | 28 | ✅ 通过 | 562 ms |
+| guard | `npm run test:guard` | 10 | ✅ 通过 | 58 ms |
+| voice | `npm run test:voice` | 13 | ✅ 通过 | 121 ms |
+| client | `npm run test:client` | 9 | ✅ 通过 | 46 ms |
+| dock | `npm run test:dock` | 13 | ✅ 通过 | 31 ms |
+| settings | `npm run test:settings` | 10 | ✅ 通过 | 86 ms |
+| adhd | `npm run test:adhd` | 25 | ✅ 通过 | 53 ms |
+| smoke | `npm run test:smoke` | —（脚本式，无逐条用例） | ✅ 通过 | 34 ms |
 
-合计 **100** 项用例（smoke 不计条数）。整体：**全绿**。
+合计 **108** 项用例（smoke 不计条数）。整体：**全绿**。
 
 **通话条样式类（`.dw-*`）清单**
 
 | 源码里定义的类 | 渲染时用到的类 |
 | --- | --- |
-| `.dw-page`、`.dw-retry`、`.dw-dock-host`、`.dw-drag-handle`、`.dw-dock-closed`、`.dw-sr`、`.dw-input`、`.dw-icon-button`、`.dw-dot`、`.dw-busy`、`.dw-chip`、`.dw-call-button`、`.dw-orb-mini`、`.dw-round`、`.dw-pill`、`.dw-ctl-mute`、`.dw-toggle`、`.dw-orb`、`.dw-orb-core`、`.dw-switch`、`.dw-switch-thumb`、`.dw-badge`、`.dw-primary`、`.dw-secondary`、`.dw-error`、`.dw-dock`、`.dw-call-settings`、`.dw-card`、`.dw-dock-head`、`.dw-status`、`.dw-status-text`、`.dw-status-ready`、`.dw-status-listening`、`.dw-status-calibrating`、`.dw-status-transcribing`、`.dw-status-thinking`、`.dw-status-speaking`、`.dw-status-muted`、`.dw-status-deviceoff`、`.dw-status-error`、`.dw-transcript`、`.dw-label`、`.dw-heard`、`.dw-bubble`、`.dw-reply`、`.dw-reply-text`、`.dw-foot`、`.dw-fine`、`.dw-tts-note`、`.dw-privacy`、`.dw-bar`、`.dw-ctl`、`.dw-hangup`、`.dw-sep`、`.dw-ctl-mic`、`.dw-settings`、`.dw-settings-head`、`.dw-settings-title`、`.dw-settings-body`、`.dw-section`、`.dw-section-title`、`.dw-group`、`.dw-row`、`.dw-row-plain`、`.dw-row-nav`、`.dw-row-text`、`.dw-row-title`、`.dw-row-sub`、`.dw-row-value`、`.dw-source`、`.dw-link`、`.dw-row-danger`、`.dw-field`、`.dw-field-label`、`.dw-field-hint`、`.dw-settings-actions`、`.dw-saved`、`.dw-test`、`.dw-settings-note`、`.dw-tts-block`、`.dw-detached` | `dw-retry`、`dw-page`、`dw-ctl`、`dw-ctl-mic`、`dw-orb`、`dw-orb-core`、`dw-sr`、`dw-ctl-mute`、`dw-card`、`dw-dock-head`、`dw-status`、`dw-dot`、`dw-status-text`、`dw-busy`、`dw-chip`、`dw-icon-button`、`dw-error`、`dw-transcript`、`dw-heard`、`dw-label`、`dw-bubble`、`dw-reply`、`dw-reply-text`、`dw-foot`、`dw-fine`、`dw-privacy`、`dw-tts-note`、`dw-bar`、`dw-round`、`dw-pill`、`dw-sep`、`dw-toggle`、`dw-hangup`、`dw-dock`、`dw-switch`、`dw-switch-thumb`、`dw-field`、`dw-field-label`、`dw-field-hint`、`dw-section`、`dw-section-title`、`dw-group`、`dw-row`、`dw-row-nav`、`dw-row-title`、`dw-test`、`dw-input`、`dw-row-plain`、`dw-row-danger`、`dw-row-text`、`dw-row-sub`、`dw-settings-actions`、`dw-primary`、`dw-saved`、`dw-settings-note`、`dw-tts-block`、`dw-source`、`dw-row-value`、`dw-badge`、`dw-settings`、`dw-settings-head`、`dw-settings-title`、`dw-settings-body`、`dw-dock-closed`、`dw-call-button`、`dw-orb-mini`、`dw-call-settings`、`dw-dock-host`、`dw-drag-handle` |
+| `.dw-page`、`.dw-retry`、`.dw-dock-host`、`.dw-card`、`.dw-dock-closed`、`.dw-settings-head`、`.dw-transcript`、`.dw-settings-body`、`.dw-input`、`.dw-sr`、`.dw-icon-button`、`.dw-dot`、`.dw-busy`、`.dw-chip`、`.dw-call-button`、`.dw-orb-mini`、`.dw-round`、`.dw-pill`、`.dw-ctl-mute`、`.dw-toggle`、`.dw-orb`、`.dw-orb-core`、`.dw-switch`、`.dw-switch-thumb`、`.dw-badge`、`.dw-primary`、`.dw-secondary`、`.dw-error`、`.dw-notice`、`.dw-dock`、`.dw-call-settings`、`.dw-resize`、`.dw-resize-left`、`.dw-resize-right`、`.dw-dock-head`、`.dw-status`、`.dw-status-text`、`.dw-status-ready`、`.dw-status-listening`、`.dw-status-calibrating`、`.dw-status-transcribing`、`.dw-status-thinking`、`.dw-status-speaking`、`.dw-status-muted`、`.dw-status-deviceoff`、`.dw-status-error`、`.dw-label`、`.dw-heard`、`.dw-bubble`、`.dw-reply`、`.dw-reply-text`、`.dw-foot`、`.dw-fine`、`.dw-tts-note`、`.dw-privacy`、`.dw-bar`、`.dw-ctl`、`.dw-hangup`、`.dw-sep`、`.dw-ctl-mic`、`.dw-dock-docked`、`.dw-orb-start`、`.dw-status-idle`、`.dw-settings`、`.dw-settings-title`、`.dw-section`、`.dw-section-title`、`.dw-group`、`.dw-row`、`.dw-row-plain`、`.dw-row-nav`、`.dw-row-text`、`.dw-row-title`、`.dw-row-sub`、`.dw-row-value`、`.dw-source`、`.dw-link`、`.dw-row-danger`、`.dw-field`、`.dw-field-label`、`.dw-field-hint`、`.dw-select`、`.dw-settings-actions`、`.dw-saved`、`.dw-test`、`.dw-settings-note`、`.dw-tts-block`、`.dw-detached` | `dw-retry`、`dw-page`、`dw-ctl`、`dw-ctl-mic`、`dw-orb`、`dw-orb-core`、`dw-sr`、`dw-ctl-mute`、`dw-card`、`dw-resize`、`dw-resize-left`、`dw-resize-right`、`dw-dock-head`、`dw-status`、`dw-dot`、`dw-status-text`、`dw-busy`、`dw-chip`、`dw-icon-button`、`dw-error`、`dw-notice`、`dw-transcript`、`dw-heard`、`dw-label`、`dw-bubble`、`dw-reply`、`dw-reply-text`、`dw-foot`、`dw-fine`、`dw-privacy`、`dw-tts-note`、`dw-bar`、`dw-round`、`dw-pill`、`dw-sep`、`dw-toggle`、`dw-hangup`、`dw-dock`、`dw-dock-docked`、`dw-status-idle`、`dw-orb-start`、`dw-switch`、`dw-switch-thumb`、`dw-field`、`dw-field-label`、`dw-field-hint`、`dw-section`、`dw-section-title`、`dw-group`、`dw-row`、`dw-row-nav`、`dw-row-title`、`dw-test`、`dw-input`、`dw-row-plain`、`dw-row-danger`、`dw-row-text`、`dw-row-sub`、`dw-settings-actions`、`dw-primary`、`dw-saved`、`dw-settings-note`、`dw-tts-block`、`dw-select`、`dw-source`、`dw-row-value`、`dw-badge`、`dw-settings`、`dw-settings-head`、`dw-settings-title`、`dw-settings-body`、`dw-dock-closed`、`dw-call-button`、`dw-orb-mini`、`dw-call-settings`、`dw-dock-host` |
 
-共定义 **81** 个、渲染使用 **69** 个。
+共定义 **88** 个、渲染使用 **76** 个。
 所有被渲染的类都有样式定义。
 
 **通话状态名**（来自真实的 `setPhase(...)` 调用）
@@ -413,18 +417,29 @@ grep -n "silenceMs\|minThreshold\|noiseMargin" client.js voice-silence.js
 
 **改动文件清单**
 
-已修改 8 个、未跟踪 17 个。
+已修改 20 个、未跟踪 6 个。
 
 ```
-README.md         |  385 +++++++-
- VERIFICATION.md   | 1273 ++++++++++++++++++++++++++-
- client.js         | 2514 ++++++++++++++++++++++++++++++++++++++++++++++++++++-
- cordis.patch.yml  |   78 +-
- home.js           |   24 +-
- main.js           |  291 ++++++-
- package.json      |   28 +-
- test/contract.mjs |  648 +++++++++++++-
- 8 files changed, 5177 insertions(+), 64 deletions(-)
+README.md                     |  162 +++--
+ VERIFICATION.md               |  534 +++++++++++++++-
+ adhd.js                       |  233 ++++++-
+ client.js                     | 1341 ++++++++++++++++++++++++++++-------------
+ cordis.patch.yml              |   10 +-
+ guard.js                      |   17 +
+ home.js                       |    6 +
+ main.js                       |   93 ++-
+ package.json                  |   13 +-
+ scripts/handoff-snapshot.mjs  |    7 +-
+ skills/whale-brevity/SKILL.md |   21 +-
+ store.js                      |  227 +++++++
+ test/adhd.mjs                 |  398 +++++++++++-
+ test/client.mjs               |   80 +--
+ test/contract.mjs             |    3 +
+ test/dock.mjs                 |  369 +++++++++---
+ test/voice.mjs                |  304 ++++++----
+ voice-silence.js              |  316 ++++------
+ voice.js                      |  102 +++-
+ 19 files changed, 3309 insertions(+), 927 deletions(-)
 ```
 
 <!-- SNAPSHOT:END -->

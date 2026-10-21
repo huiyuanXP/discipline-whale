@@ -5,8 +5,8 @@
  *
  *   1. the HTTP route — validation, missing key, upstream error mapping,
  *      size/duration caps, and the never-hang guarantee
- *   2. the silence detector — synthetic PCM frames prove the 10s rule, the
- *      minimum-speech filter, and the maximum-duration backstop
+ *   2. the turn rules — the Silero VAD parameters, the loudness floor that
+ *      keeps distant talk out, and the away guard that closes the microphone
  *   3. the call guard — a transcript that arrives after hangup or after a
  *      session switch must be dropped
  *
@@ -21,6 +21,8 @@ import {
   MAX_AUDIO_SECONDS,
   MODEL,
   VOICE_ERRORS,
+  SEGMENT_LIMITS,
+  acceptedTranscript,
   VOICE_ROUTE,
   VOICE_STATUS_ROUTE,
   audioSecondsOf,
@@ -31,9 +33,15 @@ import {
   voiceHandler,
 } from '../voice.js'
 import {
-  DEFAULT_SILENCE_OPTIONS,
+  AWAY_IDLE_MS,
+  AWAY_MAX_REJECTIONS,
+  MAX_SPEECH_MS,
+  MIN_SPEECH_LEVEL_DBFS,
+  REDEMPTION_CHOICES_MS,
+  TURN_OPTIONS,
+  createAwayGuard,
   createCallGuard,
-  createSilenceDetector,
+  speechLevelDbfs,
 } from '../voice-silence.js'
 
 // --- fixtures -------------------------------------------------------------
@@ -149,9 +157,60 @@ const post = (body, contentType = 'audio/wav', url = `http://dsh${VOICE_ROUTE}`)
   const form = seen[0].init.body
   assert.equal(form.get('model'), MODEL)
   assert.equal(form.get('language'), 'zh')
-  assert.equal(form.get('response_format'), 'json')
+  assert.equal(form.get('response_format'), 'verbose_json', 'segment confidence is requested so hallucinations can be dropped')
   assert.ok(form.get('file') instanceof Blob)
   console.log('ok 4 — one recording is forwarded once and its transcript returned')
+}
+
+{
+  // What Whisper invents from room tone is refused before it can be sent.
+  const answer = (body) => handlerWith(async () => jsonResponse(200, body))(post(wavBytes(2)))
+  const segment = (text, nsp, logprob = -0.2, ratio = 1.2) => ({ text, no_speech_prob: nsp, avg_logprob: logprob, compression_ratio: ratio })
+
+  // Measured on SoCLaaS: room tone → a subtitle credit with nsp 0.83 and a
+  // confident logprob. Whisper's own AND-rule would keep it; this route does not.
+  const roomTone = await answer({ text: '由 Amara.org 社群提供的字幕', segments: [segment('由 Amara.org 社群提供的字幕', 0.83, -0.27)] })
+  assert.equal(roomTone.status, 422)
+  const roomBody = await roomTone.json()
+  assert.equal(roomBody.error.code, VOICE_ERRORS.rejectedTranscript)
+  assert.deepEqual(roomBody.error.reasons, ['no-speech-prob'])
+
+  // A confident segment that is still a known credit is dropped by the list.
+  const credit = await (await answer({ text: '字幕志愿者 杨茜茜', segments: [segment('字幕志愿者 杨茜茜', 0.1)] })).json()
+  assert.deepEqual(credit.error.reasons, ['known-hallucination'])
+  const sign = await (await answer({ text: '谢谢观看！', segments: [segment('谢谢观看！', 0.2)] })).json()
+  assert.equal(sign.error.code, VOICE_ERRORS.rejectedTranscript, 'a whole-utterance sign-off is dropped')
+
+  // The same words inside real speech stay: only whole-utterance matches drop.
+  const real = await (await answer({ text: '帮我查一下，谢谢观看的那个视频', segments: [segment('帮我查一下，谢谢观看的那个视频', 0.02)] })).json()
+  assert.equal(real.text, '帮我查一下，谢谢观看的那个视频')
+
+  // Mixed: the unsure trailing segment and the repetitive one go, the clear one stays.
+  const mixed = await (await answer({
+    text: '派一个任务给写作区 嗯嗯嗯嗯嗯嗯嗯嗯 谢谢',
+    segments: [segment('派一个任务给写作区', 0.03), segment('嗯嗯嗯嗯嗯嗯嗯嗯', 0.1, -0.3, 3.1), segment('谢谢', 0.7, -0.9)],
+  })).json()
+  assert.equal(mixed.text, '派一个任务给写作区')
+
+  // Requests that merely mention subtitles are speech to the whale, not credits.
+  for (const request of ['帮我查一下这部电影有没有中文字幕', '让字幕组那个任务继续', 'add subtitles by tomorrow']) {
+    const kept = await (await answer({ text: request, segments: [segment(request, 0.02)] })).json()
+    assert.equal(kept.text, request, `a real request is kept: ${request}`)
+  }
+  // A credit line on its own is still dropped.
+  for (const credit of ['中文字幕', '字幕由某某社区提供', '由 Amara.org 社群提供的字幕']) {
+    const dropped = await (await answer({ text: credit, segments: [segment(credit, 0.1)] })).json()
+    assert.equal(dropped.error?.code, VOICE_ERRORS.rejectedTranscript, `a bare credit line is dropped: ${credit}`)
+  }
+
+  // A backend without segments is judged on its text alone.
+  assert.equal((await (await answer({ text: '你好鲸鱼' })).json()).text, '你好鲸鱼')
+  assert.equal((await (await answer({ text: 'Thank you for watching.' })).json()).error.code, VOICE_ERRORS.rejectedTranscript)
+
+  // The limits are named, not buried.
+  assert.deepEqual({ ...SEGMENT_LIMITS }, { noSpeechProbMax: 0.6, avgLogprobMin: -1.0, compressionRatioMax: 2.4 })
+  assert.equal(acceptedTranscript({ text: '  ' }).text, '')
+  console.log('ok 4b — room-tone hallucinations, credits and unsure segments are refused; real speech passes')
 }
 
 {
@@ -219,135 +278,99 @@ const post = (body, contentType = 'audio/wav', url = `http://dsh${VOICE_ROUTE}`)
   console.log('ok 6 — both voice routes register on connection.fetch')
 }
 
-// --- 2. the silence detector ---------------------------------------------
+// --- 2. the turn rules ----------------------------------------------------
 
 const RATE = 16000
-const FRAME_MS = 20
-const FRAME_SAMPLES = (RATE * FRAME_MS) / 1000
 
-/** One frame of a constant-amplitude tone; `amplitude` 0 is digital silence. */
-function frame(amplitude) {
-  const samples = new Float32Array(FRAME_SAMPLES)
+/** `seconds` of a constant-amplitude tone; amplitude 0 is digital silence. */
+function tone(amplitude, seconds) {
+  const samples = new Float32Array(Math.round(RATE * seconds))
   for (let i = 0; i < samples.length; i += 1) samples[i] = amplitude * Math.sin((2 * Math.PI * 220 * i) / RATE)
   return samples
 }
 
-/** Feed an amplitude for `ms` and return the detector's terminal decision. */
-function feed(detector, { amplitude, ms }) {
-  const frames = Math.round(ms / FRAME_MS)
-  let decision
-  for (let i = 0; i < frames; i += 1) {
-    decision = detector.push(frame(amplitude), FRAME_MS)
-    if (decision?.action === 'stop') return { decision, elapsedMs: detector.elapsedMs() }
-  }
-  return { decision, elapsedMs: detector.elapsedMs() }
+/** Concatenate sample runs. */
+function join(...parts) {
+  const out = new Float32Array(parts.reduce((total, part) => total + part.length, 0))
+  let at = 0
+  for (const part of parts) { out.set(part, at); at += part.length }
+  return out
 }
 
 {
-  // Parameters are named constants, so the 10s rule is one edit away.
-  assert.equal(DEFAULT_SILENCE_OPTIONS.silenceMs, 10_000)
-  assert.equal(DEFAULT_SILENCE_OPTIONS.minSpeechMs, 500)
-  assert.equal(DEFAULT_SILENCE_OPTIONS.maxRecordingMs, 60_000)
-  assert.equal(DEFAULT_SILENCE_OPTIONS.minRecordingMs, 1_000)
-  assert.equal(DEFAULT_SILENCE_OPTIONS.calibrationMs, 500)
-  console.log('ok 7 — 10s silence, 500ms minimum speech and 60s cap are named constants')
+  // Silero VAD through vad-web decides when a turn starts and ends. The
+  // parameters are named, in one place, and close to the mature defaults:
+  // Silero's 0.5 start threshold with the end threshold 0.15 lower (LiveKit),
+  // a 2s pause to end the turn (between OpenAI's 500ms server VAD and the
+  // 2–8s of semantic turn detection), a 500ms pad and a 500ms speech minimum.
+  assert.deepEqual({ ...TURN_OPTIONS }, {
+    model: 'v5',
+    positiveSpeechThreshold: 0.5,
+    negativeSpeechThreshold: 0.35,
+    redemptionMs: 2_000,
+    preSpeechPadMs: 500,
+    minSpeechMs: 500,
+  })
+  assert.ok(Object.isFrozen(TURN_OPTIONS))
+  assert.ok(REDEMPTION_CHOICES_MS.includes(TURN_OPTIONS.redemptionMs), 'the default pause is one of the offered choices')
+  assert.equal(MAX_SPEECH_MS, 60_000)
+  console.log('ok 7 — Silero turn-taking parameters are named constants with mature defaults; 60s caps one utterance')
 }
 
 {
-  // A silent room: 10s of quiet ends the utterance, and no speech means discard.
-  const detector = createSilenceDetector()
-  const { decision, elapsedMs } = feed(detector, { amplitude: 0.002, ms: 12_000 })
-  assert.equal(decision.action, 'stop')
-  assert.equal(decision.reason, 'no-speech')
-  assert.equal(decision.upload, false)
-  assert.ok(elapsedMs >= 10_000 && elapsedMs <= 12_000, `stopped at ${elapsedMs}ms`)
-
-  // The same run must NOT stop early: 9s of quiet is still listening.
-  const patient = createSilenceDetector()
-  const quiet = feed(patient, { amplitude: 0.002, ms: 9_000 })
-  assert.equal(quiet.decision, undefined, 'nothing to decide before the 10s threshold')
-  console.log('ok 8 — 10s of silence ends the utterance and a silent room uploads nothing')
+  // The loudness floor keeps talk across the room out. The level is the
+  // 90th-percentile frame, so the pad and the trailing pause do not dilute it.
+  assert.equal(speechLevelDbfs(tone(0, 1)), -Infinity, 'digital silence has no level')
+  assert.ok(Math.abs(speechLevelDbfs(tone(0.1, 1)) - -23) < 0.2, 'a 0.1 sine sits near -23 dBFS')
+  const near = join(tone(0.0005, 0.5), tone(0.1, 1), tone(0.0005, 2))
+  assert.ok(speechLevelDbfs(near) > MIN_SPEECH_LEVEL_DBFS, 'near speech padded with silence still passes')
+  const far = join(tone(0.0005, 0.5), tone(0.003, 1), tone(0.0005, 2))
+  assert.ok(speechLevelDbfs(far) < MIN_SPEECH_LEVEL_DBFS, 'distant talk stays under the floor')
+  assert.equal(MIN_SPEECH_LEVEL_DBFS, -45)
+  console.log('ok 8 — near speech passes the loudness floor, distant talk and silence do not')
 }
 
 {
-  // Speech, then quiet: the upload happens 10s after the voice stops.
-  // The first 500ms are the room-tone calibration window, as in a real call UI.
-  const detector = createSilenceDetector()
-  const calibration = feed(detector, { amplitude: 0.002, ms: 500 })
-  assert.equal(calibration.decision, undefined)
-  assert.ok(detector.threshold() >= DEFAULT_SILENCE_OPTIONS.minThreshold, 'never below the absolute floor')
-  assert.ok(detector.threshold() < 0.05, 'a quiet room does not raise the threshold into speech range')
-  const speech = feed(detector, { amplitude: 0.2, ms: 1_000 })
-  assert.equal(speech.decision, undefined)
-  const { decision, elapsedMs } = feed(detector, { amplitude: 0.002, ms: 11_000 })
-  assert.equal(decision.action, 'stop')
-  assert.equal(decision.reason, 'silence')
-  assert.equal(decision.upload, true)
-  assert.equal(decision.speechMs, 1_000)
-  assert.ok(elapsedMs >= 11_400 && elapsedMs < 12_600, `stopped at ${elapsedMs}ms`)
-  console.log('ok 9 — speech then 10s of quiet stops and marks the recording for upload')
-}
+  // Away: two minutes of LISTENING without an accepted turn closes the mic.
+  const guard = createAwayGuard()
+  assert.equal(AWAY_IDLE_MS, 120_000)
+  assert.equal(AWAY_MAX_REJECTIONS, 3)
+  guard.resume(0)
+  assert.equal(guard.reason(119_000), null)
+  assert.equal(guard.reason(120_000), 'idle')
 
-{
-  // A noisy room: the threshold follows the measured floor, so quiet speech
-  // above that floor still counts as speech.
-  const detector = createSilenceDetector()
-  const roomNoise = 0.06
-  feed(detector, { amplitude: roomNoise, ms: 500 })
-  assert.ok(detector.threshold() > roomNoise, 'the threshold sits above the measured floor')
-  assert.ok(detector.threshold() < 0.3, 'the threshold is not a fixed magic number above speech')
-  feed(detector, { amplitude: 0.35, ms: 800 })
-  const stopped = feed(detector, { amplitude: roomNoise, ms: 11_000 })
-  assert.equal(stopped.decision.reason, 'silence')
-  assert.equal(stopped.decision.upload, true)
-  console.log('ok 10 — the threshold adapts to the room instead of being one magic number')
-}
+  // Time the whale spends replying (or a mute) is banked, not counted.
+  const patient = createAwayGuard()
+  patient.resume(0)
+  patient.suspend(60_000)
+  assert.equal(patient.reason(10 * 60_000), null, 'a ten-minute reply never reads as absence')
+  patient.resume(10 * 60_000)
+  assert.equal(patient.reason(10 * 60_000 + 59_000), null)
+  assert.equal(patient.reason(10 * 60_000 + 60_000), 'idle', 'only the two listening minutes add up')
 
-{
-  // A 300ms blip is not a useful utterance.
-  const detector = createSilenceDetector()
-  feed(detector, { amplitude: 0.002, ms: 500 })
-  feed(detector, { amplitude: 0.2, ms: 300 })
-  const { decision } = feed(detector, { amplitude: 0.002, ms: 11_000 })
-  assert.equal(decision.reason, 'no-speech')
-  assert.equal(decision.upload, false)
-  console.log('ok 11 — an utterance shorter than the minimum speech threshold is not uploaded')
-}
+  // An accepted turn, or a touched control, proves presence and restarts the clock.
+  const talking = createAwayGuard()
+  talking.resume(0)
+  talking.accepted(100_000)
+  assert.equal(talking.reason(200_000), null)
+  talking.present(210_000)
+  assert.equal(talking.reason(320_000), null)
 
-{
-  // Maximum duration: continuous speech is cut at 60s.
-  const detector = createSilenceDetector()
-  feed(detector, { amplitude: 0.002, ms: 500 })
-  const { decision, elapsedMs } = feed(detector, { amplitude: 0.3, ms: 65_000 })
-  assert.equal(decision.reason, 'max-duration')
-  assert.equal(decision.upload, true)
-  assert.ok(elapsedMs >= 59_900 && elapsedMs < 60_200, `cut at ${elapsedMs}ms`)
-  console.log('ok 12 — the 60s backstop cuts a recording that never goes quiet')
-}
-
-{
-  // Minimum recording length: a stop request before 1s is refused, so a
-  // stray click cannot produce an empty upload.
-  const detector = createSilenceDetector()
-  feed(detector, { amplitude: 0.002, ms: 400 })
-  assert.equal(detector.canStop(), false)
-  feed(detector, { amplitude: 0.002, ms: 800 })
-  assert.equal(detector.canStop(), true)
-  console.log('ok 12b — the 1s minimum recording length is enforced')
-}
-
-{
-  // A loud room: the threshold tracks the floor proportionally, and returning
-  // to the room tone (not to digital silence) is what ends the utterance.
-  const detector = createSilenceDetector()
-  const loud = 0.25
-  feed(detector, { amplitude: loud, ms: 500 })
-  assert.ok(detector.threshold() > loud, 'in a loud room the threshold sits above the room tone')
-  feed(detector, { amplitude: 0.9, ms: 700 })
-  const stopped = feed(detector, { amplitude: loud, ms: 11_000 })
-  assert.equal(stopped.decision.reason, 'silence')
-  assert.equal(stopped.decision.upload, true)
-  console.log('ok 12c — a loud room raises the threshold, and room tone still counts as quiet')
+  // Three refusals in a row close it too; an accepted turn clears the count.
+  const noisy = createAwayGuard()
+  noisy.resume(0)
+  noisy.rejected()
+  noisy.rejected()
+  assert.equal(noisy.reason(1_000), null)
+  noisy.accepted(2_000)
+  noisy.rejected()
+  noisy.rejected()
+  assert.equal(noisy.reason(3_000), null, 'refusals count only in a row')
+  noisy.rejected()
+  assert.equal(noisy.reason(3_000), 'rejections')
+  noisy.reset()
+  assert.equal(noisy.reason(1_000_000), null, 'reset forgets the stretch and the refusals')
+  console.log('ok 9 — the away guard counts listening time and refusals in a row, never reply time')
 }
 
 // --- 2b. the say route ----------------------------------------------------
@@ -399,7 +422,7 @@ function feed(detector, { amplitude, ms }) {
   // A malformed body is a 400.
   const broken = await say('{not json')
   assert.equal(broken.status, 400)
-  console.log('ok 12d — one transcript is queued into the recorded main session only')
+  console.log('ok 10 — one transcript is queued into the recorded main session only')
 }
 
 // --- 3. the call guard ----------------------------------------------------
@@ -424,7 +447,48 @@ function feed(detector, { amplitude, ms }) {
   guard.setTarget('session-other')
   assert.equal(guard.accepts(second, 'session-main'), false)
   assert.equal(guard.accepts(second, 'session-other'), true)
-  console.log('ok 13 — a late transcript cannot land after hangup or a session switch')
+  console.log('ok 11 — a late transcript cannot land after hangup or a session switch')
+}
+
+// --- 4. the detector's files, served by the plugin -------------------------
+
+{
+  const { VOICE_ASSETS, VOICE_ASSET_ROUTE, registerVoiceAssetRoutes, voiceAssetHandler } = await import('../voice-assets.js')
+  // One exact route per file, on the same connection as the voice routes.
+  const routes = []
+  await registerVoiceAssetRoutes({ fetch: { register: async (route) => { routes.push(route); return async () => {} } } })
+  assert.deepEqual(routes.map((route) => route.path).sort(), Object.keys(VOICE_ASSETS).map((name) => `${VOICE_ASSET_ROUTE}/${name}`).sort())
+  assert.ok(routes.every((route) => route.methods.length === 1 && route.methods[0] === 'GET'))
+  assert.deepEqual(Object.keys(VOICE_ASSETS).sort(), [
+    'bundle.min.js', 'ort-wasm-simd-threaded.mjs', 'ort-wasm-simd-threaded.wasm', 'ort.wasm.min.js', 'silero_vad_v5.onnx', 'vad.worklet.bundle.min.js',
+  ])
+
+  const reads = []
+  const handle = voiceAssetHandler({
+    distDirOf: (pkg) => `/pkgs/${pkg}/dist`,
+    readFile: async (path) => { reads.push(path); return new Uint8Array([0, 97, 115, 109]) },
+  })
+  const wasm = await handle(new Request(`http://dsh${VOICE_ASSET_ROUTE}/ort-wasm-simd-threaded.wasm`))
+  assert.equal(wasm.status, 200)
+  assert.equal(wasm.headers.get('content-type'), 'application/wasm', 'wasm is served with the type streaming compilation needs')
+  assert.equal(reads.at(-1), '/pkgs/onnxruntime-web/dist/ort-wasm-simd-threaded.wasm')
+  const worklet = await handle(new Request(`http://dsh${VOICE_ASSET_ROUTE}/vad.worklet.bundle.min.js`))
+  assert.match(worklet.headers.get('content-type'), /^text\/javascript/)
+  assert.equal(reads.at(-1), '/pkgs/@ricky0123/vad-web/dist/vad.worklet.bundle.min.js')
+
+  // Only the named files: no path reaches the disk.
+  const before = reads.length
+  assert.equal((await handle(new Request(`http://dsh${VOICE_ASSET_ROUTE}/..%2F..%2Fetc%2Fpasswd`))).status, 404)
+  assert.equal((await handle(new Request(`http://dsh${VOICE_ASSET_ROUTE}/constructor`))).status, 404)
+  assert.equal(reads.length, before, 'an unknown name never reads a file')
+  assert.equal((await handle(new Request(`http://dsh${VOICE_ASSET_ROUTE}/bundle.min.js`, { method: 'POST' }))).status, 405)
+
+  // A missing package is reported, not thrown into the Host.
+  const missing = voiceAssetHandler({ distDirOf: () => '/nowhere', readFile: async () => { throw new Error('ENOENT') } })
+  const answer = await missing(new Request(`http://dsh${VOICE_ASSET_ROUTE}/bundle.min.js`))
+  assert.equal(answer.status, 503)
+  assert.equal((await answer.json()).error.code, 'voice/vad-asset-missing')
+  console.log('ok 12 — the detector files are served from the installed packages, by name only, with their types')
 }
 
 console.log('\nAll discipline-whale voice checks passed.')

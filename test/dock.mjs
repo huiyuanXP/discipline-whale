@@ -6,9 +6,9 @@
  *
  *   1. microphone (device) and mute (drop data) are two independent controls,
  *      and mute is unavailable while the device is off
- *   2. frames are dropped while muted — nothing reaches the detector
- *   3. a muted stretch is not counted as silence, so unmuting cannot end the
- *      utterance immediately
+ *   2. mute pauses vad-web's detector on the same open stream and drops the
+ *      segment in progress
+ *   3. holding for the reply releases the microphone; listening reopens it
  *   4. the window-detach capability is detected honestly: Document PiP, plain
  *      popup, or nothing
  *   5. edge snapping is pure arithmetic: clamp into the viewport, snap to the
@@ -86,51 +86,184 @@ const dock = module.exports
   console.log('ok 1 — microphone (device) and mute (drop data) are independent, and mute needs the device')
 }
 
-// --- 2. frames are dropped while muted ------------------------------------
+// --- 2–3. listening through vad-web's MicVAD -------------------------------
 
-{
-  const seen = []
-  const gate = dock.createFrameGate({ onFrame: (samples, frameMs) => seen.push(frameMs) })
-  gate.setProcessing(true)
-  gate.push([0.2], 20)
-  assert.equal(seen.length, 1, 'an unmuted frame reaches the detector')
-
-  gate.setProcessing(false)
-  for (let i = 0; i < 10; i += 1) gate.push([0.2], 20)
-  assert.equal(seen.length, 1, 'no muted frame may reach the detector')
-
-  gate.setProcessing(true)
-  gate.push([0.2], 20)
-  assert.equal(seen.length, 2, 'unmuting resumes processing at the next frame')
-  console.log('ok 2 — while muted every frame is discarded before the detector sees it')
+/** A microphone stream whose tracks can be stopped, like getUserMedia's. */
+function fakeStream() {
+  const track = { readyState: 'live', stop() { this.readyState = 'ended' } }
+  return { track, getTracks: () => [track] }
 }
 
-// --- 3. a muted stretch is not silence ------------------------------------
+/**
+ * A MicVAD stand-in with the real one's start/pause/stream contract
+ * (@ricky0123/vad-web 0.0.31, dist/real-time-vad.js): start() asks
+ * getStream() the first time and resumeStream() afterwards, pause() calls
+ * pauseStream() and then either submits the segment in progress
+ * (submitUserSpeechOnPause) or drops it. `speak` / `endSpeech` play the part
+ * of Silero deciding speech started and ended.
+ */
+function fakeMicVAD(options) {
+  const vad = {
+    options: { ...options },
+    state: 'uninitialized',
+    listening: false,
+    stream: null,
+    speaking: false,
+    segment: null,
+    destroyed: false,
+    async start() {
+      if (vad.state === 'uninitialized') {
+        vad.stream = await options.getStream()
+        vad.state = 'initialized'
+        vad.listening = true
+        return
+      }
+      if (vad.state !== 'initialized' || vad.listening) return
+      vad.listening = true
+      vad.stream = await options.resumeStream(vad.stream)
+    },
+    async pause() {
+      if (!vad.listening) return
+      vad.listening = false
+      await options.pauseStream(vad.stream)
+      const speaking = vad.speaking
+      vad.speaking = false
+      if (vad.options.submitUserSpeechOnPause && speaking) options.onSpeechEnd(vad.segment)
+    },
+    async destroy() {
+      vad.state = 'destroyed'
+      if (vad.listening) await vad.pause()
+      vad.destroyed = true
+    },
+    setOptions(update) { vad.options = { ...vad.options, ...update } },
+    speak(seconds) {
+      if (!vad.listening) return
+      vad.speaking = true
+      vad.segment = new Float32Array(Math.round(16000 * seconds)).fill(0.1)
+      options.onSpeechRealStart()
+    },
+    endSpeech() {
+      if (!vad.listening || !vad.speaking) return
+      vad.speaking = false
+      options.onSpeechEnd(vad.segment)
+    },
+  }
+  return vad
+}
+
+/** A promise the test resolves by hand, to hold an await open. */
+function deferred() {
+  let resolve
+  const promise = new Promise((done) => { resolve = done })
+  return { promise, resolve }
+}
+
+/**
+ * One listener over the fake, with its microphone requests and timers on
+ * record. `gates.model` / `gates.permission` hold the detector load and the
+ * permission prompt open until the test releases them.
+ */
+function listenerHarness(gates = {}) {
+  const record = { streams: [], utterances: [], timers: [], vad: null, created: null }
+  const taker = dock.createTurnTaker({
+    createVad: async (options) => {
+      if (gates.model !== undefined) await gates.model.promise
+      record.created = options
+      record.vad = fakeMicVAD(options)
+      return record.vad
+    },
+    getStream: async () => {
+      if (gates.permission !== undefined) await gates.permission.promise
+      const stream = fakeStream()
+      record.streams.push(stream)
+      return stream
+    },
+    options: { ...dock.VOICE_CONSTANTS.turn, redemptionMs: 2000 },
+    maxSpeechMs: 60000,
+    onUtterance: (audio) => record.utterances.push(audio),
+    setTimeout: (fn, ms) => { record.timers.push({ fn, ms, cancelled: false }); return record.timers.length - 1 },
+    clearTimeout: (id) => { if (record.timers[id]) record.timers[id].cancelled = true },
+  })
+  return { taker, record }
+}
 
 {
-  const detector = dock.createSilenceDetector()
-  // Calibrate in a quiet room, then say something.
-  for (let i = 0; i < 30; i += 1) detector.push(dock.testFrame(0.002), 20)
-  for (let i = 0; i < 50; i += 1) detector.push(dock.testFrame(0.2), 20)
-  assert.equal(detector.speechMs(), 1000, 'one second of speech is recorded')
+  // Mute = processing off, device on. The detector pauses on the SAME live
+  // stream, a segment in progress is dropped, and unmuting resumes without
+  // asking for the microphone again.
+  const { taker, record } = listenerHarness()
+  await taker.listen(false)
+  assert.equal(record.created.startOnLoad, false, 'the call decides when listening starts')
+  assert.equal(record.created.positiveSpeechThreshold, 0.5)
+  assert.equal(record.streams.length, 1)
+  record.vad.speak(1)
+  await taker.mute()
+  assert.equal(record.utterances.length, 0, 'a segment cut by mute is dropped, never sent')
+  assert.equal(record.streams[0].track.readyState, 'live', 'mute keeps the device open')
+  record.vad.speak(1)
+  record.vad.endSpeech()
+  assert.equal(record.utterances.length, 0, 'nothing is analysed while muted')
+  await taker.unmute()
+  assert.equal(record.streams.length, 1, 'unmuting reuses the open stream')
+  record.vad.speak(1)
+  record.vad.endSpeech()
+  assert.equal(record.utterances.length, 1, 'after unmute a finished segment is handed over')
 
-  // Muted for well over the 10s window: frames are not pushed at all, and the
-  // detector is told the stretch was not listening.
-  detector.pause()
-  assert.equal(detector.silenceMs(), 0, 'pausing clears the silence accounting')
+  // Muted from the start: the device opens, detection does not run.
+  const quiet = listenerHarness()
+  await quiet.taker.listen(true)
+  assert.equal(quiet.record.streams[0].track.readyState, 'live')
+  assert.equal(quiet.record.vad.listening, false)
+  console.log('ok 2 — mute pauses detection on the same open stream and drops the segment in progress')
+}
 
-  // Unmute, then speak again briefly. This must NOT stop as if 10s had passed.
-  detector.resume()
-  for (let i = 0; i < 20; i += 1) detector.push(dock.testFrame(0.2), 20)
-  let decision
-  for (let i = 0; i < 100; i += 1) decision = detector.push(dock.testFrame(0.002), 20)
-  assert.equal(decision, undefined, '2s of quiet after unmute must not end the utterance')
+{
+  // Half-duplex: while the whale works, the microphone is released (the OS
+  // indicator goes off) and a segment in progress is dropped; listening again
+  // asks for the microphone afresh.
+  const { taker, record } = listenerHarness()
+  await taker.listen(false)
+  record.vad.speak(1)
+  await taker.hold()
+  assert.equal(record.streams[0].track.readyState, 'ended', 'hold releases the device')
+  assert.equal(record.utterances.length, 0, 'the cut segment is dropped')
+  await taker.listen(false)
+  assert.equal(record.streams.length, 2, 'listening again reopens the microphone')
+  assert.equal(record.streams[1].track.readyState, 'live')
 
-  // A full 10s of quiet after unmute still ends it, so the rule itself is intact.
-  for (let i = 0; i < 450; i += 1) decision = detector.push(dock.testFrame(0.002), 20)
-  assert.equal(decision?.action, 'stop', 'a real 10s of quiet still ends it')
-  assert.equal(decision.reason, 'silence')
-  console.log('ok 3 — a muted stretch does not count as silence, and unmute cannot end the utterance early')
+  // Muted first, then held (microphone off, page hidden, or the whale
+  // replying): the device must still be released. MicVAD's own pause() does
+  // nothing once detection is already paused, so hold() cannot rely on it.
+  await taker.mute()
+  await taker.hold()
+  assert.equal(record.streams[1].track.readyState, 'ended', 'mute then hold releases the device')
+  const mutedAtStart = listenerHarness()
+  await mutedAtStart.taker.listen(true)
+  await mutedAtStart.taker.hold()
+  assert.equal(mutedAtStart.record.streams[0].track.readyState, 'ended', 'listen(muted) then hold releases the device')
+
+  // Hanging up while the detector is still loading: nothing may start later.
+  const loading = deferred()
+  const early = listenerHarness({ model: loading })
+  const pending = early.taker.listen(false).catch(() => {})
+  await early.taker.close()
+  loading.resolve()
+  await pending
+  assert.ok(early.record.streams.every((stream) => stream.track.readyState === 'ended'), 'a hang-up during loading leaves no live track')
+  assert.equal(early.record.vad?.listening ?? false, false, 'and no detector running')
+
+  // Hanging up while the permission prompt is open: the stream it grants
+  // afterwards is stopped at once.
+  const prompt = deferred()
+  const asking = listenerHarness({ permission: prompt })
+  const waiting = asking.taker.listen(false).catch(() => {})
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  await asking.taker.close()
+  prompt.resolve()
+  await waiting
+  assert.ok(asking.record.streams.length <= 1)
+  assert.ok(asking.record.streams.every((stream) => stream.track.readyState === 'ended'), 'a hang-up during the permission prompt leaves no live track')
+  console.log('ok 3 — holding releases the microphone (muted or not), and a hang-up mid-start leaves nothing running')
 }
 
 // --- 4. window-detach capability -----------------------------------------
@@ -289,8 +422,8 @@ const dock = module.exports
   assert.equal(mute.props.disabled, true, 'mute is disabled while the microphone is off')
   assert.equal(mute.props.title, 'muteNeedsMic', 'the disabled mute explains why rather than just greying out')
 
-  // "Done talking" is offered only while an utterance can be recording: on
-  // while listening (muted included), gone once the microphone is closed.
+  // "Done talking" is offered only while a segment can be recording: on while
+  // listening, gone while muted (mute drops the segment) or with the mic closed.
   const hasStop = (state) => {
     const found = []
     const visit = (node) => {
@@ -308,7 +441,7 @@ const dock = module.exports
     return found.some((node) => node.props?.className === 'dw-chip')
   }
   assert.equal(hasStop({ device: true }), true, 'listening offers "done talking"')
-  assert.equal(hasStop({ device: true, muted: true }), true, 'a muted utterance can still be ended and sent')
+  assert.equal(hasStop({ device: true, muted: true }), false, 'muting drops the segment, so there is nothing to end')
   assert.equal(hasStop({ device: false }), false, 'a closed microphone has no utterance to end')
 
   assert.ok(typeof Dock === 'function')
@@ -333,30 +466,43 @@ const dock = module.exports
   console.log('ok 8 — every detach path degrades honestly, and snapping stays finite at zero size')
 }
 
-// --- 9. muting mid-utterance does not corrupt the detector ----------------
+// --- 9. finishing, the 60s cap, and closing --------------------------------
 
 {
-  // The full sequence a user performs: start talking, mute, talk to someone
-  // else for a while, unmute, keep talking. The utterance must not end at the
-  // moment of unmuting, and the muted stretch must not count as speech either.
-  const detector = dock.createSilenceDetector()
-  for (let i = 0; i < 30; i += 1) detector.push(dock.testFrame(0.002), 20)
-  for (let i = 0; i < 50; i += 1) detector.push(dock.testFrame(0.2), 20)
-  const speechBeforeMute = detector.speechMs()
-  const elapsedBeforeMute = detector.elapsedMs()
+  // "Done talking" hands over the segment in progress, then puts the
+  // detector's own setting back.
+  const { taker, record } = listenerHarness()
+  await taker.listen(false)
+  record.vad.speak(2)
+  assert.equal(await taker.finish(), true, 'a segment in progress is handed over')
+  assert.equal(record.utterances.length, 1)
+  assert.equal(record.vad.options.submitUserSpeechOnPause, false, 'pausing stops submitting again afterwards')
+  assert.equal(record.streams[0].track.readyState, 'ended', 'the microphone is released for the reply')
 
-  detector.pause()
-  // 30 seconds of frames that never arrive: no push() at all while muted.
-  detector.resume()
+  // With nothing said, finishing hands nothing over and says so.
+  await taker.listen(false)
+  assert.equal(await taker.finish(), false)
+  assert.equal(record.utterances.length, 1)
 
-  assert.equal(detector.speechMs(), speechBeforeMute, 'muted time adds no speech')
-  assert.equal(detector.elapsedMs(), elapsedBeforeMute, 'muted time adds no recording length')
-  assert.equal(detector.silenceMs(), 0, 'unmuting starts from zero quiet, not from the mute length')
+  // Speech that never pauses is cut and sent at 60s.
+  await taker.listen(false)
+  record.vad.speak(70)
+  const cap = record.timers.at(-1)
+  assert.equal(cap.ms, 60000)
+  await cap.fn()
+  assert.equal(record.utterances.length, 2, 'the capped segment is sent')
 
-  // Continuing to speak extends the SAME utterance.
-  for (let i = 0; i < 50; i += 1) detector.push(dock.testFrame(0.2), 20)
-  assert.equal(detector.speechMs(), speechBeforeMute + 1000, 'speech after unmute adds to the same utterance')
-  console.log('ok 9 — a mid-utterance mute neither adds speech nor records length nor pre-ends the utterance')
+  // The pause that ends a turn can change mid-call.
+  taker.setRedemptionMs(5000)
+  assert.equal(record.vad.options.redemptionMs, 5000)
+
+  // Closing destroys the detector and releases every track, even from mute.
+  await taker.listen(false)
+  await taker.mute()
+  await taker.close()
+  assert.equal(record.vad.destroyed, true)
+  assert.ok(record.streams.every((stream) => stream.track.readyState === 'ended'), 'no track stays live after close')
+  console.log('ok 9 — done-talking submits, 60s caps a segment, and close releases every track')
 }
 
 // --- 10. the settings panel's TTS wording --------------------------------
@@ -541,6 +687,93 @@ const dock = module.exports
     'dragging must not hard-code box offsets; it sets geometry variables instead')
   assert.match(drag, /setProperty\(|--dw-dock-/, 'dragging publishes geometry through custom properties')
   console.log('ok 11 — the logic/visual seam holds: one stylesheet, no inline visual values, geometry via variables')
+}
+
+// --- 12. moving, stashing and resizing ------------------------------------
+
+{
+  const viewport = { width: 1200, height: 800 }
+  const panel = { width: 380, height: 260 }
+
+  // Dropped in the open: stays open, anchored to the nearer side and the bottom.
+  const middle = dock.dockRelease({ left: 300, top: 300, ...panel, viewport, docked: false })
+  assert.deepEqual(middle, { docked: null, anchor: 'left', x: 300, y: 800 - 300 - 260 })
+
+  // Dropped flush against the right edge but not pushed past it: snapped, still open.
+  const flush = dock.dockRelease({ left: 1200 - 380 - 30, top: 300, ...panel, viewport, docked: false })
+  assert.equal(flush.docked, null, 'a panel placed near an edge stays open')
+  assert.deepEqual([flush.anchor, flush.x], ['right', 16], 'and snaps to the margin')
+
+  // Pushed 150px past the right edge: stashed there as the microphone button.
+  const pushed = dock.dockRelease({ left: 1200 - 380 + 150, top: 300, ...panel, viewport, docked: false })
+  assert.deepEqual([pushed.docked, pushed.anchor, pushed.x], ['right', 'right', 8])
+  const pushedLeft = dock.dockRelease({ left: -200, top: 300, ...panel, viewport, docked: false })
+  assert.equal(pushedLeft.docked, 'left')
+
+  // The stashed button slides along its edge and stays stashed.
+  const orb = { width: 60, height: 60 }
+  const slid = dock.dockRelease({ left: 1200 - 60 - 20, top: 100, ...orb, viewport, docked: true, expanded: panel })
+  assert.deepEqual([slid.docked, slid.y], ['right', 800 - 100 - 60], 'sliding along the edge keeps it stashed')
+
+  // Dragged into the page: opens at the panel's size, kept inside the viewport.
+  const opened = dock.dockRelease({ left: 600, top: 700, ...orb, viewport, docked: true, expanded: panel })
+  assert.equal(opened.docked, null, 'a stashed button dragged inward opens again')
+  assert.ok(opened.y >= 16, 'the reopened panel fits above the bottom margin')
+  assert.ok(opened.x >= 16, 'and inside the side margin')
+
+  // Off-screen drops are clamped back in.
+  const high = dock.dockRelease({ left: 300, top: -500, ...panel, viewport, docked: false })
+  assert.equal(high.y, 800 - 16 - 260, 'a drop above the viewport is pulled back under the top margin')
+
+  // Resizing grows away from the anchored side, within the room left, above the minimums.
+  const room = { left: 400, right: 20, top: 300 }
+  assert.deepEqual(dock.dockResize({ width: 380, cardHeight: 200, dx: -100, dy: -80, corner: 'left', room }), { width: 480, cardHeight: 280 })
+  assert.deepEqual(dock.dockResize({ width: 380, cardHeight: 200, dx: -900, dy: -900, corner: 'left', room }), { width: 780, cardHeight: 500 },
+    'growth stops at the viewport margin')
+  assert.deepEqual(dock.dockResize({ width: 380, cardHeight: 200, dx: 900, dy: 900, corner: 'left', room }), { width: 300, cardHeight: 120 },
+    'shrinking stops at the minimums')
+  assert.equal(dock.dockResize({ width: 380, cardHeight: 200, dx: 60, dy: 0, corner: 'right', room }).width, 400,
+    'the right grip grows to the right, limited by the room on that side')
+
+  // Geometry reaches the host only as custom-property numbers.
+  assert.equal(dock.dockGeometryStyle(null, null), undefined)
+  assert.deepEqual(dock.dockGeometryStyle({ anchor: 'right', x: 16.4, y: 144 }, { width: 420.6, cardHeight: 260 }),
+    { '--dw-dock-x': '16', '--dw-dock-y': '144', '--dw-dock-w': '421', '--dw-card-h': '260' })
+  console.log('ok 12 — a drop stays open, snaps, or stashes on an edge; the stashed button reopens; resizing is clamped')
+}
+
+// --- 13. the stashed dock is the microphone button --------------------------
+
+{
+  const nodesOf = (tree) => {
+    const found = []
+    const visit = (node) => {
+      if (node === null || node === undefined || typeof node === 'string') return
+      if (Array.isArray(node)) { node.forEach(visit); return }
+      if (typeof node === 'object') { found.push(node); visit(node.children) }
+    }
+    visit(tree)
+    return found
+  }
+  const calls = []
+  const actions = { startCall: () => calls.push('start'), toggleMic: () => calls.push('mic') }
+  const controls = dock.createCallControls()
+  controls.setDevice(true)
+  const inCall = dock.dockedView({ t: (key) => key, open: true, side: 'right', status: 'listening', error: null, controls, actions })
+  const buttons = nodesOf(inCall).filter((node) => node.type === 'button')
+  assert.equal(buttons.length, 1, 'stashed, the dock shows exactly one button')
+  assert.equal(buttons[0].props['data-dw-control'], 'mic', 'and it is the microphone control')
+  assert.equal(buttons[0].props['aria-pressed'], true)
+  assert.match(inCall.props.className, /dw-status-listening/, 'the orb keeps animating the call status')
+  buttons[0].props.onClick()
+  assert.deepEqual(calls, ['mic'], 'tapping it switches the microphone')
+
+  const idle = dock.dockedView({ t: (key) => key, open: false, side: 'left', status: 'ready', error: null, controls: dock.createCallControls(), actions })
+  const idleButtons = nodesOf(idle).filter((node) => node.type === 'button')
+  assert.equal(idleButtons.length, 1)
+  idleButtons[0].props.onClick()
+  assert.deepEqual(calls, ['mic', 'start'], 'without a call, tapping it starts one')
+  console.log('ok 13 — stashed against an edge, the dock is the microphone button alone')
 }
 
 console.log('\nAll discipline-whale dock checks passed.')

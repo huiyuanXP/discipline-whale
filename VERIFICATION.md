@@ -1105,7 +1105,7 @@ AssertionError [ERR_ASSERTION]: zh.settingsTtsNote must say the fallback is off 
 挪的是这两处：
 
 1. `copyStylesInto()` 之前直接写 `body.style.margin` / `body.style.background`。这违反「逻辑分支不得 setStyle」；现在只加一个 `body.dw-detached` class，具体长什么样由 `dockStyles()` 里已有的 `body.dw-detached …` 规则决定。
-2. `onDragMove()` 之前直接写 `node.style.left/top/right/bottom`。现在只写 `--dw-dock-x` / `--dw-dock-y`（两个数字）并置 `data-dw-dragged="true"`；由 CSS 的 `.dw-dock-host[data-dw-dragged='true']` 决定锚哪条边、用什么单位。
+2. `onDragMove()` 之前直接写 `node.style.left/top/right/bottom`。现在只写一个边（`data-dw-anchor`）和两个数字 `--dw-dock-x` / `--dw-dock-y`（距该边、距底）；由 CSS 的 `.dw-dock-host[data-dw-anchor]` 决定它们移动哪些盒子。
 
 **外观没有变化**：默认仍是右下角锚定、360px 宽、同样的圆角与配色；拖拽行为等价（同一套 `snapDockPosition` 数值）。改的只是「这个值由谁表达」。
 
@@ -1549,3 +1549,50 @@ worker preset adhd hits: 0
 ```
 
 本轮仍未做真机重启，所以 §15k 的 7 条未验证项清单不变。
+
+## 19. 语音通话：起停改用 Silero VAD、防幻觉、离开防护；通话条整块拖动与贴边（2026-10-21 深夜）
+
+起因：用户开着通话离开去聊天，回来发现插件自己发了很多条消息。调研成熟语音 Agent 的做法（OpenAI Realtime、LiveKit、Pipecat、vad-web、Whisper 自身规则）后，起停改用现成的 Silero VAD，并加三道过滤和离开防护；同一轮还按用户要求重做了通话条的拖动、贴边收起、缩放，以及「主界面同时显示」。
+
+### 19a. 改了什么
+
+| 面 | 做法 |
+| --- | --- |
+| 起停 | `@ricky0123/vad-web` 0.0.31 的 `MicVAD`（Silero v5）：阈值 0.5/0.35，停顿 2 秒结束（设置可选 1/2/3/5/8 秒），开口前保留 0.5 秒，不足 0.5 秒算误触；60 秒截断。`createTurnTaker` 负责把静音、半双工、「说完了」、挂断映射到 `start`/`pause`/`destroy` |
+| 检测组件文件 | `voice-assets.js` 从已安装的包提供 6 个文件，一条精确路由一个文件；`package.json` 新增 `dependencies`（`@ricky0123/vad-web@0.0.31`、`onnxruntime-web@1.22.0`） |
+| 收音约束 | `autoGainControl: false`，回声消除与降噪保留 |
+| 近场音量门 | 90 分位帧电平 < -45 dBFS 不上传（经验值） |
+| 服务端过滤 | `verbose_json`；段级 `no_speech_prob ≥ 0.6`（单独判断）/ `avg_logprob < -1` / `compression_ratio > 2.4` 丢弃；中英幻觉短语库；全丢 → `voice/rejected-transcript`，不发送 |
+| 离开防护 | 连续 3 段被拒，或累计收音 2 分钟没发出消息 → 自动关话筒并提示 |
+| 主界面同显 | 通话开始与每句发出时 `uiWorkspace.openSession(主会话)` |
+| 通话条 | 整块可拖（移动 5px 以上算拖动，拖完的点击被吞掉）；推出左右边缘贴边收起成麦克风光球；拖离边缘展开；空出一侧顶角拖动缩放；几何存在组件 state，收回独立窗口后保留 |
+
+### 19b. 测试（全部 exit 0）
+
+`npm run test:all`（contract / guard / adhd / voice / client / dock / settings）与 `npm run test:smoke` 全绿。本轮新增或改写：
+
+- `test/voice.mjs` ok 4b（实测幻觉与真实语音的分流）、ok 7（起停参数）、ok 8（音量门）、ok 9（离开防护只计收音时间、连续拒绝）、ok 12（检测组件路由：按名字、带类型、未知名字 404、缺包 503）。
+- `test/client.mjs` ok 1（浏览器镜像与 `voice-silence.js` 的参数、电平、离开防护逐步一致）、ok 2（检测组件从插件路由加载，源码里没有 CDN 地址）。
+- `test/dock.mjs` ok 2、3、9（按 vad-web 0.0.31 `real-time-vad.js` 行为写的假 `MicVAD`：静音保留设备并丢弃半段、半双工释放设备、「说完了」提交、60 秒截断、关闭释放全部 track）、ok 7（话筒关时不显示「说完了」，先红后绿）、ok 10（清除 key 开关关回去恢复「保持不变」，先红后绿）、ok 12（落点：停留 / 吸边 / 贴边收起 / 展开 / 缩放 clamp）、ok 13（贴边后只剩麦克风控件）。
+- `test/contract.mjs` 第 20 条追加：检测组件路由由主页行挂载。
+
+### 19c. 真实应用验证（隔离实例）
+
+做法：临时 `DSH_HOME` + 3091 端口另起 `dsh web`，安装本次打包的插件（安装后 `cmp` 确认 `client.js` 与工作区一致），用户在 3080 的实例未触碰。麦克风用页面内注入的合成流代替。
+
+| 项 | 结果 |
+| --- | --- |
+| 检测组件加载 | 6 个文件 200，`wasm` 为 `application/wasm`；页面出现 `window.ort` / `window.vad`，`MicVAD` 启动，`getUserMedia` 约束含 `autoGainControl:false` |
+| 真实语音端到端 | `say -v Tingting` 合成的一句中文（约 5 秒）：Silero 判起停 → 上传 7.456 秒（0.5 秒前置 + 语音 + 2 秒停顿）→ 真实 SoCLaaS `verbose_json` 返回正确文本并通过过滤 → `/voice/say` 200 → 主界面会话里出现这条用户消息，浮层同时显示识别气泡 |
+| 远处人声 | 同一句衰减 40 dB：Silero 判为语音，音量门拦下（「声音离麦克风太远，没有发送」），**零次转写请求**；连续 3 次后自动关话筒（「连续几段都像背景声……」） |
+| 静音 / 解除 | 静音后流仍 `live`、只有一条流；解除后回到「正在听」且未重新申请麦克风 |
+| 挂断 | 全部 track 变 `ended` |
+| 拖动 / 贴边 / 展开 / 缩放 | 按住「开始通话」拖到页面中间（未误触发通话）；推出右边缘收起成光球；点光球开始通话；拖离边缘展开为完整面板且通话不断；拐角缩放 380→459 宽、卡片向上长、控制条不动 |
+
+### 19d. 尚未验证（需要真人、真麦克风）
+
+- 真人说话时 2 秒停顿的手感，以及句中思考停顿是否被切断（可在设置里调长）。
+- 真实环境里 -45 dBFS 音量门对不同麦克风是否合适。
+- 旁边有人**凑近麦克风**说话：音量门与过滤都分不出来，会被当成本人说话（README「已知限制」已写明）。
+- Document PiP 真窗口里的收音（检测组件在主页面运行，理论上不受影响）。
+

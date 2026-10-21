@@ -91,6 +91,7 @@ export const VOICE_ERRORS = {
   timeout: 'voice/backend-timeout',
   upstream: 'voice/upstream-error',
   emptyTranscript: 'voice/empty-transcript',
+  rejectedTranscript: 'voice/rejected-transcript',
   emptyText: 'voice/empty-text',
   noMainSession: 'voice/no-main-session',
 }
@@ -179,6 +180,91 @@ export function transcriptOf(payload) {
 }
 
 /**
+ * Whisper's per-segment confidence limits.
+ *
+ * `no_speech_prob` is checked on its own. Whisper's built-in skip rule needs
+ * `no_speech_prob > 0.6` AND `avg_logprob < -1.0`, and that combination lets
+ * the classic room-tone hallucinations through: measured on SoCLaaS
+ * whisper-large-v3, four seconds of room tone came back as 「由 Amara.org 社群提
+ * 供的字幕」 with no_speech_prob 0.83 and avg_logprob -0.27, while clear near
+ * speech scored no_speech_prob 0.02.
+ */
+export const SEGMENT_LIMITS = Object.freeze({
+  noSpeechProbMax: 0.6,
+  avgLogprobMin: -1.0,
+  compressionRatioMax: 2.4,
+})
+
+/**
+ * Text Whisper is known to produce from silence or noise (subtitle credits
+ * from its training data).
+ *
+ * `markers` are strings that only ever come from those credits (a channel
+ * name, a credits site), so an utterance containing one is dropped whole.
+ * `whole` and `credits` describe lines a person could also say inside a real
+ * request ("有没有中文字幕", "字幕组那个任务"), so they drop an utterance only
+ * when it is nothing but that line: `whole` by exact match, `credits` by
+ * pattern. Everything is compared after `normalizeForMatch`. Sources: the "Bag
+ * of Hallucinations" list (arXiv:2501.11378), WhisprRT `app/config.py`,
+ * TypeLate `hallucinationDetector.ts`, and the SoCLaaS outputs measured above.
+ */
+export const HALLUCINATIONS = Object.freeze({
+  markers: Object.freeze(['amara.org', '明镜与点点', '请不吝点赞', '优优独播剧场', 'yoyotelevision']),
+  whole: Object.freeze([
+    '谢谢观看', '感谢观看', '谢谢收看', '感谢收看', '谢谢大家观看', '谢谢大家', '谢谢观赏', '请订阅',
+    '下期再见', '我们下期再见', '本期视频就到这里', '中文字幕', '字幕', '字幕组', '字幕提供',
+    'thankyouforwatching', 'thanksforwatching', 'pleasesubscribe', 'likeandsubscribe', 'seeyounexttime',
+  ]),
+  credits: Object.freeze([/^字幕由.{0,20}提供$/u, /^由.{0,20}提供的字幕$/u, /^字幕志愿者.{0,8}$/u]),
+})
+
+/** Lower-case and strip whitespace and punctuation, so 「谢谢观看！」 and 「谢谢 观看」 match. */
+export function normalizeForMatch(text) {
+  return String(text ?? '').toLowerCase().replace(/[\s\p{P}\p{S}]+/gu, '')
+}
+
+/**
+ * The transcript worth sending, or the reasons nothing is.
+ *
+ * With a `verbose_json` answer, segments over the confidence limits are
+ * dropped first; an answer without segments is judged on its text alone.
+ * What remains is then checked against the hallucination lists.
+ * @param payload the parsed upstream answer.
+ * @returns `{ text, reasons }`: `text` is '' when nothing should be sent, and
+ *   `reasons` names every rule that dropped something.
+ */
+export function acceptedTranscript(payload) {
+  const reasons = []
+  let text = transcriptOf(payload)
+  const segments = Array.isArray(payload?.segments) ? payload.segments : null
+  if (segments !== null && segments.length > 0) {
+    const kept = []
+    for (const segment of segments) {
+      const nsp = Number(segment?.no_speech_prob)
+      const logprob = Number(segment?.avg_logprob)
+      const ratio = Number(segment?.compression_ratio)
+      if (Number.isFinite(nsp) && nsp >= SEGMENT_LIMITS.noSpeechProbMax) { reasons.push('no-speech-prob'); continue }
+      if (Number.isFinite(logprob) && logprob < SEGMENT_LIMITS.avgLogprobMin) { reasons.push('low-logprob'); continue }
+      if (Number.isFinite(ratio) && ratio > SEGMENT_LIMITS.compressionRatioMax) { reasons.push('repetitive'); continue }
+      if (typeof segment?.text === 'string') kept.push(segment.text.trim())
+    }
+    text = kept.filter((part) => part !== '').join(' ').trim()
+  }
+  const normalized = normalizeForMatch(text)
+  if (normalized !== '') {
+    if (HALLUCINATIONS.markers.some((marker) => normalized.includes(normalizeForMatch(marker)))) {
+      reasons.push('known-hallucination')
+      text = ''
+    } else if (HALLUCINATIONS.whole.some((phrase) => normalized === normalizeForMatch(phrase))
+      || HALLUCINATIONS.credits.some((pattern) => pattern.test(normalized))) {
+      reasons.push('known-hallucination')
+      text = ''
+    }
+  }
+  return { text: normalizeForMatch(text) === '' ? '' : text, reasons: [...new Set(reasons)] }
+}
+
+/**
  * Forward one recording upstream.
  * @param input audio bytes, filename, content type and language hint.
  * @param deps environment, fetch and the effective voice config, injected so
@@ -213,7 +299,9 @@ export async function transcribeAudio(input, deps = {}) {
   form.append('model', model)
   const language = typeof input.language === 'string' && input.language !== '' ? input.language : config.language
   if (typeof language === 'string' && language !== '') form.append('language', language)
-  form.append('response_format', 'json')
+  // verbose_json carries per-segment confidence, which is what lets the
+  // route drop what Whisper invented from room tone (see `acceptedTranscript`).
+  form.append('response_format', 'verbose_json')
 
   // A real timer, cleared in `finally`: one recording can never hold the
   // request open past the deadline.
@@ -261,10 +349,18 @@ export async function transcribeAudio(input, deps = {}) {
       upstreamStatus: response.status,
     })
   }
-  const text = transcriptOf(payload)
-  if (text === '') {
+  if (transcriptOf(payload) === '' && !Array.isArray(payload?.segments)) {
     return failure(VOICE_ERRORS.emptyTranscript, 'the recording held no recognizable speech', 422)
   }
+  const accepted = acceptedTranscript(payload)
+  if (accepted.text === '') {
+    // Nothing the person said to the whale: room tone, background talk the
+    // model was unsure of, or a known hallucination. Refused, never sent.
+    return failure(VOICE_ERRORS.rejectedTranscript, 'the recording looked like background sound, not speech to the whale', 422, {
+      reasons: accepted.reasons,
+    })
+  }
+  const text = accepted.text
   return Response.json(
     { text, model, audioSeconds: audioSecondsOf(input.bytes) },
     { headers: { 'cache-control': 'no-store' } },

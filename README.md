@@ -230,12 +230,22 @@ worker 每次即将结束回合时，插件会检查本轮是否调用过 `repor
 
 侧边栏「自律鲸鱼」页之外，界面上还有一个浮动的「开始通话」按钮（挂在 `shell.overlay`，所以切到会话页也不会消失）。点它之后：
 
-1. **收环境噪音**（500ms），用测得的底噪算出这次通话的静音阈值，不写死魔法数；
-2. **开始听**，状态条显示「正在听 · 停口 10 秒自动发送」；
-3. **停口满 10 秒**（`SILENCE_MS`，`client.js` 与 `voice-silence.js` 各有一份同名常量，测试逐帧比对两份实现）自动结束这句，上传识别；
-4. 识别文本通过 **`POST /api/discipline-whale/voice/say`** 排队进当前主会话（服务端用 `sessionController.prompt`，和派工走同一条路，不另造消息通道）；
-5. 鲸鱼回复后，**回复正文以文字显示在浮层里，然后回到待命、重新开麦**；
-6. **挂断**随时可点；挂断、切会话、页面隐藏或插件卸载都会停录音、释放麦克风，并作废迟到的识别结果。
+1. **开始听**：页面里的 **Silero VAD**（`@ricky0123/vad-web` 的 `MicVAD`）逐帧判断有没有人在说话，状态条显示「正在听 · 说完停顿一下就发送」；
+2. **说完停顿 2 秒**（可在设置里改成 1 / 2 / 3 / 5 / 8 秒）这句就结束，只把这段语音（含开头 0.5 秒）编码成 WAV 上传识别；不足 0.5 秒的短促声音算误触，不上传；
+3. 上传前先过**近场音量门**：这段语音的响度低于 -45 dBFS（离麦克风太远的人声）就不上传；
+4. 服务端用 `verbose_json` 转写，**逐段丢掉 Whisper 拿不准的内容**（`no_speech_prob ≥ 0.6`、`avg_logprob < -1`、`compression_ratio > 2.4`），再对一份中英「幻觉短语库」做匹配（「字幕由 Amara.org 社区提供」「谢谢观看」这类）；全被丢掉就**不发送**，浮层只显示一行「这段听起来是背景声，没有发送」；
+5. 留下的识别文本通过 **`POST /api/discipline-whale/voice/say`** 排队进主会话（服务端用 `sessionController.prompt`，和派工走同一条路，不另造消息通道）；
+6. **主界面同时显示这段对话**：通话开始时、以及每一句发出时，主界面都会打开自律鲸鱼主会话，你说的话和鲸鱼的回复出现在会话里，浮层上同时显示最近一来一回——两处是同一份会话记录；
+7. 鲸鱼回复后回到待命、重新开麦；
+8. **挂断**随时可点；挂断、切会话、页面隐藏或插件卸载都会停止收音、释放麦克风，并作废迟到的识别结果。
+
+**人走开了也不会自己发消息**（离开防护，`createAwayGuard`）：
+
+- 连续 **3 段**都被判成背景声（音量门或服务端过滤），自动关闭话筒，浮层提示「连续几段都像背景声，已关闭话筒。点话筒继续。」；
+- 累计**收音 2 分钟**都没有发出一条消息，同样自动关闭话筒。只计「正在听」的时间：鲸鱼思考、静音、话筒关着的时间不算；你点过任何控件也会重新计时；
+- 页面切到后台时关闭话筒（通话在独立窗口里进行时例外，因为独立窗口仍在屏幕上）。
+
+收音时关闭浏览器的**自动增益**（`autoGainControl: false`），回声消除和降噪保留：自动增益会把房间另一头的说话声放大到近讲的音量。
 
 > **朗读 = 浏览器语音合成（fallback，非真实 TTS），默认关闭。** 通话条右侧的喇叭按钮与设置页「通话 → 朗读回复」开关是同一个状态；打开后用 `speechSynthesis` 念出回复。它没有独立凭据、音色与配额管理，声音取决于设备，和「接入一个真实 TTS 通道」（云端 key 或本地模型）不是一回事。
 >
@@ -247,17 +257,17 @@ worker 每次即将结束回合时，插件会检查本轮是否调用过 `repor
 
 | 控件 | 管什么 | 开 | 关 |
 | --- | --- | --- | --- |
-| **话筒**（`data-dw-control="mic"`） | **麦克风设备/权限** | `getUserMedia` 拿到流，系统指示灯亮 | 停掉所有 track、关闭 AudioContext，**设备真正释放**，指示灯灭 |
-| **静音**（`data-dw-control="mute"`） | **是否处理数据** | （静音态）**音频帧直接丢弃**：不进 VAD、不上传、不发送 | 从下一帧起立刻恢复处理 |
+| **话筒**（`data-dw-control="mic"`） | **麦克风设备/权限** | `getUserMedia` 拿到流，系统指示灯亮 | 暂停检测并停掉所有 track（静音中也一样），**设备真正释放**，指示灯灭；挂断时再销毁检测器、关闭它的 AudioContext |
+| **静音**（`data-dw-control="mute"`） | **是否处理数据** | （静音态）**语音检测暂停**：流仍然 live，但不分析任何一帧、不上传、不发送；正在说的那段直接丢弃 | 在同一条流上恢复检测，不再重新申请麦克风 |
 
 状态机的四条规则（`client.js` 的 `createCallControls`，`test/dock.mjs` ok 1 逐条钉住）：
 
 - 话筒关着时**不能静音**：静音按钮 `disabled`，`title` 写明「话筒关闭时不需要静音」，而不是灰着不解释；
-- 静音**不碰设备**：track 仍然 live，只是帧不进处理路径（`createFrameGate` 是唯一的闸口，`listen()` 里所有帧都走它）；
+- 静音**不碰设备**：track 仍然 live，`MicVAD` 暂停在这条流上（`createTurnTaker` 的 `mute()` 用自定义 `pauseStream` 保留流），解除静音直接 `start()` 续上；
 - 话筒关闭时会**清掉已按下的静音**，不会留一个悬空状态；
 - 两个按钮各有自己的 `aria-pressed`；「话筒开 + 静音开」与「话筒开 + 静音关」在 DOM 上是两种明确不同的状态。
 
-**静音解除后 VAD 是干净的**（`test/dock.mjs` ok 3、ok 9）：静音期间 `detector.pause()` 把静音计时清零，解除时 `resume()` 重新起算；静音时长既不进 `silenceMs`、也不进 `speechMs`/`elapsedMs`。所以**不会出现「一解除静音就立刻断句」**，同时真正的 10 秒安静仍然照常结束这句。
+**半双工**（`test/dock.mjs` ok 3）：一段语音结束后立刻 `hold()`——暂停检测并**停掉所有 track**（系统指示灯灭），鲸鱼回完再重新申请麦克风继续听。静音、半双工、「说完了」、60 秒上限、挂断释放，都由 `createTurnTaker` 映射到 `MicVAD` 的 `start` / `pause` / `destroy`，`test/dock.mjs` ok 2、3、9 用一个按 vad-web 0.0.31 源码行为写的假 `MicVAD` 逐条钉住。
 
 ### 设置界面（API Key / Base URL / 模型 / 语言）
 
@@ -316,11 +326,16 @@ worker 每次即将结束回合时，插件会检查本轮是否调用过 `repor
 
 > **要让通话条在浏览器最小化 / 关闭浏览器后依然常驻，只有原生壳能做到**：Electron/Tauri 的 `alwaysOnTop` 原生窗口，或 macOS 菜单栏 App（`NSStatusItem`）。那是另一个工程（打包、签名、自动更新、与 `dsh web` 的 IPC），本插件是 DSH 的 Web 插件，没有这条通道。本插件提供的是「浏览器内的置顶小窗」，不是桌面常驻。
 
-### 拖动与吸附边缘
+### 拖动、贴边收起与调整大小
 
-通话条顶部有一条拖拽把手（`data-dw-control` 之外的独立 strip；未通话时是「开始通话」左侧的竖向把手），用**原生 Pointer Events + `setPointerCapture`** 实现，不引任何依赖：拖动时跟手，松手按 72px 内的最近边吸附，并 clamp 进视口（宽于视口的窗口钉在边距上，不会得到负坐标）。吸附逻辑是纯函数 `snapDockPosition`，`test/dock.mjs` ok 5 直接验算。
+**整块通话条都能拖**：按住卡片、控制条、任一按钮拖动即可移动；按下后移动不到 5px 仍是普通点击，拖完松手的那次点击会被吞掉，不会误触按钮。输入框保留自己的指针行为。用**原生 Pointer Events + `setPointerCapture`** 实现，不引任何依赖。
 
-**为什么不引库**：`client.js` 是 `window.__ModuleLoader__` 里的 plain JS，**没有构建步骤**，插件也**不允许外链 CDN**。`react-rnd` 会带入 `react-draggable` → `clsx` + `prop-types`，`@dnd-kit/core` 会带入 `@dnd-kit/utilities` + `accessibility`；任何一个都得手工 vendoring 进仓库，而它们的收益（拖动+缩放）在这里只用得到「拖动 + 吸附」这一小块。原生实现约 30 行，含触摸/笔，且不动打包结构。
+- **松手落点**（纯函数 `dockRelease`，`test/dock.mjs` ok 12 验算）：放在页面中间就停在那里；靠近左右边 72px 内贴齐边距；**把打开的面板推出左右边缘**（超出自身宽度 30%，最多 120px）就**贴边收起，只剩麦克风按钮**。
+- **收起后**：只显示麦克风光球，光球仍按通话状态动；点按 = 开关话筒（没在通话时 = 开始通话）；沿边拖动可上下挪位置；**拖离边缘**就重新展开成面板。
+- **调整大小**：鼠标移到卡片上，空出的那一侧顶角出现拐角把手，拖动调宽度和卡片高度（纯函数 `dockResize` 负责 clamp，最小 300×140、不超出视口边距）。控制条锚在底部，卡片向上长。
+- 位置与大小存在组件 state 里：切到独立窗口再收回也保留。独立窗口里由系统窗口负责移动和缩放。
+
+**为什么不引库**：`client.js` 是 `window.__ModuleLoader__` 里的 plain JS，**没有构建步骤**，插件也**不允许外链 CDN**。`react-rnd` 会带入 `react-draggable` → `clsx` + `prop-types`，`@dnd-kit/core` 会带入 `@dnd-kit/utilities` + `accessibility`；任何一个都得手工 vendoring 进仓库，而它们的收益（拖动+缩放）在这里只用得到「拖动 + 吸附」这一小块。原生实现几十行，含触摸/笔，且不动打包结构。
 
 ### 换外观：给接手视觉的人
 
@@ -346,8 +361,8 @@ worker 每次即将结束回合时，插件会检查本轮是否调用过 `repor
 | 状态 | 含义 | 麦克风 |
 | --- | --- | --- |
 | `ready` | 待命，可以说下一句 | 视话筒开关 |
-| `calibrating` | 开头 500ms 采环境底噪 | 开 |
-| `listening` | 正在听；停口 10s 自动结束 | 开 |
+| `calibrating` | 准备收音：第一次加载语音检测组件，之后是恢复检测 | 开 |
+| `listening` | 正在听；说完停顿 2 秒（可调）就发送 | 开 |
 | `transcribing` | 录音已上传，等转写返回 | 关（半双工） |
 | `thinking` | 转写文本已排进主会话，等鲸鱼回复 | 关 |
 | `speaking` | **仅当朗读开关打开时存在**：浏览器语音合成正在念 | 关（半双工） |
@@ -366,15 +381,17 @@ worker 每次即将结束回合时，插件会检查本轮是否调用过 `repor
 
 | 控件 | `data-dw-control` / class | 语义 | 视觉 |
 | --- | --- | --- | --- |
-| 话筒 | `mic` / `.dw-ctl.dw-ctl-mic.dw-orb`，开时加 `.is-on` | **麦克风权限与设备**：开 = `getUserMedia` 拿流；关 = 停所有 track、关 AudioContext，系统指示灯灭 | 胶囊正中的光球；动效即通话状态（待命慢呼吸、正在听快呼吸 + 外扩波纹、处理中旋转光晕、朗读紫色律动、静音褪色、话筒关灰色 + 斜杠话筒、出错红色） |
+| 话筒 | `mic` / `.dw-ctl.dw-ctl-mic.dw-orb`，开时加 `.is-on` | **麦克风权限与设备**：开 = `getUserMedia` 拿流；关 = 暂停检测并停所有 track（静音中也一样），系统指示灯灭；AudioContext 只在挂断时随 `destroy()` 关闭 | 胶囊正中的光球；动效即通话状态（待命慢呼吸、正在听快呼吸 + 外扩波纹、处理中旋转光晕、朗读紫色律动、静音褪色、话筒关灰色 + 斜杠话筒、出错红色） |
 | 静音 | `mute` / `.dw-ctl.dw-ctl-mute`，静音时加 `.is-on` | **不处理数据**：设备仍在，但每帧直接丢弃，不进 VAD、不上传、不发送。话筒关着时 `disabled`，`title` 说明原因 | 光球左侧的话筒图标；静音时斜杠话筒 + 琥珀底 |
 | 朗读回复 | `.dw-toggle`，`aria-pressed` | 浏览器语音合成 **fallback**，**默认关**；不是真实 TTS | 光球右侧的喇叭图标；开时强调色底 |
 | 挂断 | `.dw-round.dw-hangup` | 释放设备、作废迟到的转写、收回独立窗口、结束通话 | 控制条右端的红色圆钮 |
 | 设置 | `.dw-round`（`GearGlyph`） | 打开 `settingsView` | 控制条左端的圆钮 |
-| 说完了 | `.dw-chip`（仅 `listening`/`calibrating` 出现） | 手动结束这句（仍受 1s / 500ms 最小值约束） | 状态行右侧的反色小胶囊 |
+| 说完了 | `.dw-chip`（仅 `listening`/`calibrating` 且未静音、话筒开着时出现） | 立刻结束正在说的这段并发送（`MicVAD` 暂停时提交）；没在说话就提示「没听到有效语音」 | 状态行右侧的反色小胶囊 |
 | 处理中 | `.dw-busy`（`transcribing`/`thinking`/`speaking`） | 派生指示 | 状态行里三个跳动小点 |
 | 独立窗口 | `.dw-icon-button`（`DetachGlyph`） | 把通话条搬进 Document PiP / 弹窗；在小窗里同一个按钮是「收回窗口」 | 卡片右上角图标 |
-| 拖动 | `.dw-drag-handle`（**只有这一条是可拖区域**） | 拖拽把手，避免抢走控件的点击 | 卡片上方细条；悬停时变清晰 |
+| 拖动 | 整个 `.dw-dock-host`（输入框除外） | 移动 5px 以上算拖动，否则是点击；推出左右边缘即贴边收起 | 卡片上光标为抓手 |
+| 贴边收起 | `.dw-dock-docked`，宿主带 `data-dw-docked="left|right"` | 只剩麦克风控件（同一个 `data-dw-control="mic"`）；拖离边缘展开 | 边缘的圆形光球 |
+| 调整大小 | `.dw-resize[data-dw-resize="left|right"]` | 空出一侧的顶角把手，改宽度与卡片高度 | 悬停卡片时出现的拐角 |
 
 图标按钮的可读名称放在 `aria-label` 和视觉隐藏的 `.dw-sr` 文本里，屏幕阅读器与测试都能读到当前状态。
 
@@ -386,37 +403,53 @@ worker 每次即将结束回合时，插件会检查本轮是否调用过 `repor
 | --- | --- | --- |
 | 通话条宽度 | `380px`（`max-width: calc(100vw - 32px)`）；宿主列本身 `pointer-events:none`，只有子元素接收点击 | `.dw-dock-host` |
 | 卡片高度 | 最高 `min(52vh, 440px)`，识别结果/回复区内部滚动 | `.dw-card` / `.dw-transcript` |
-| 默认位置 | 右下角，距右 20px、距底 `--dw-dock-bottom`（144px）：在会话页（含自律鲸鱼主会话）浮在底部输入框之上，发送按钮可点；新会话空白页的输入框居中，矮窗口下打开的通话条会压住它的右半部分（见「已知限制」）；拖动后改由 `--dw-dock-x/y` 定位 | `.dw-dock-host` |
+| 默认位置 | 右下角，距右 20px、距底 `--dw-dock-bottom`（144px）：在会话页（含自律鲸鱼主会话）浮在底部输入框之上，发送按钮可点；新会话空白页的输入框居中，矮窗口下打开的通话条会压住它的右半部分（见「已知限制」）；拖动后改由 `data-dw-anchor` + `--dw-dock-x/y` 定位 | `.dw-dock-host` |
 | 窄窗断点 | **≤768px**：左右边距收到 8px，宽度占满，卡片最高 42vh | `@media (max-width:768px)` |
 | 设置面板 | 与通话条同宽，最高 `min(600px, calc(100vh - var(--dw-dock-bottom) - 40px))`，内部滚动 | `.dw-settings` |
 | 配色 | 全部读宿主主题 token（`--dsw-alias-label-*`、`bg-layer-2`、`border-l2`、`interactive-bg-*`、`state-*`），经 `.dw-dock-host` 上的 `--dw-*` 一层转接，自动跟随明暗主题 | `dockStyles()` |
 | 拖动边距 / 吸附距离 | `margin: 16`、`snapDistance: 72`（逻辑参数，非样式） | `snapDockPosition` 调用处 |
-| 拖动位置表达 | 逻辑只写 `--dw-dock-x` / `--dw-dock-y` 两个**数字**，并置 `data-dw-dragged="true"`；由 CSS 决定锚哪条边、什么单位 | `onDragMove` + `.dw-dock-host[data-dw-dragged='true']` |
+| 拖动位置表达 | 逻辑写一个边（`data-dw-anchor="left|right"`）和两个**数字**：`--dw-dock-x` = 距该边、`--dw-dock-y` = 距底；尺寸写 `--dw-dock-w` / `--dw-card-h` 并置 `data-dw-sized`。由 CSS 决定它们移动哪些盒子 | `onDragMove` + `dockGeometryStyle` + `.dw-dock-host[data-dw-anchor]` |
 | 独立窗口初始尺寸 | `400 × 340`（PiP）/ `400 × 360`（弹窗） | `detachDock()` |
-| 独立窗口内的外观 | 由 `body.dw-detached` 这一条 class 决定（隐藏把手、去固定定位、卡片撑满）；小窗没有宿主样式表，`dockStyles()` 在这里自带一份明/暗 token，`copyStylesInto` 照抄宿主 `<body>` 的 `data-ds-dark-theme` | `dockStyles()` |
+| 独立窗口内的外观 | 由 `body.dw-detached` 这一条 class 决定（隐藏缩放把手、去固定定位、卡片撑满）；小窗没有宿主样式表，`dockStyles()` 在这里自带一份明/暗 token，`copyStylesInto` 照抄宿主 `<body>` 的 `data-ds-dark-theme` | `dockStyles()` |
 
 #### 5. 换外观只需改这几处
 
-**改 `dockStyles()` 一个函数（配色/圆角/阴影/间距/动效/布局）+ 需要改结构时改 `dockView()` / `settingsView()` 两个函数**——其余（状态机 `createCallControls`、帧闸口 `createFrameGate`、窗口能力 `detachCapability`、吸附 `snapDockPosition`、录音、转写、设置路由）都不用碰。
+**改 `dockStyles()` 一个函数（配色/圆角/阴影/间距/动效/布局）+ 需要改结构时改 `dockView()` / `settingsView()` 两个函数**——其余（状态机 `createCallControls`、收音 `createTurnTaker`、离开防护 `createAwayGuard`、窗口能力 `detachCapability`、落点 `dockRelease`、转写与过滤、设置路由）都不用碰。
 
 两条硬约束，`test/dock.mjs` ok 11 会守住：
 
 1. **所有视觉规则只能在 `dockStyles()` 里**，逻辑分支不得写 `element.style.*` 的视觉属性；
-2. **几何通过 CSS 自定义属性传到样式层**（`--dw-dock-x/y` + `data-dw-dragged`），逻辑不直接写 `left/top/right/bottom`——所以换一套布局不会改坏拖动。
+2. **几何通过 CSS 自定义属性传到样式层**（`data-dw-anchor` + `--dw-dock-x/y`，尺寸 `data-dw-sized` + `--dw-dock-w` / `--dw-card-h`），逻辑不直接写 `left/top/right/bottom`——所以换一套布局不会改坏拖动。
 
-`data-dw-control`、`data-dw-tts`、`data-dw-test`、`data-dw-source`、`data-dw-page`、`data-dw-dragged` 这些 data 属性是**行为接口**，换外观时保留它们，测试和控件语义都依赖它们；`.dw-*` class 属于外观层，可随皮肤调整（`dockStyles()` 里 ok 11 点名的几个除外）。
+`data-dw-control`、`data-dw-tts`、`data-dw-test`、`data-dw-source`、`data-dw-page`、`data-dw-anchor`、`data-dw-docked`、`data-dw-sized`、`data-dw-resize` 这些 data 属性是**行为接口**，换外观时保留它们，测试和控件语义都依赖它们；`.dw-*` class 属于外观层，可随皮肤调整（`dockStyles()` 里 ok 11 点名的几个除外）。
 
-### 静音判定参数（都在 `voice-silence.js`，`client.js` 镜像一份）
+### 收音与过滤参数
+
+起停判断用成熟实现而不是自制规则：**Silero VAD**（LiveKit、Pipecat 等语音 Agent 框架用的同一个模型），浏览器里通过 `@ricky0123/vad-web` 运行。它依赖的 6 个文件（`ort.wasm.min.js`、`ort-wasm-simd-threaded.mjs` / `.wasm`、`bundle.min.js`、`vad.worklet.bundle.min.js`、`silero_vad_v5.onnx`）由插件自己的路由 `/api/discipline-whale/voice/vad/<name>` 从已安装的包里提供（`voice-assets.js`），**不走 CDN**。两个包写在 `package.json` 的 `dependencies` 里，安装插件时由 pnpm 拉取（onnxruntime-web 约 94 MB 解包，只用到其中 11 MB 的 wasm）。页面不是 cross-origin isolated，所以 onnxruntime 单线程运行。
+
+浏览器端（`voice-silence.js`，`client.js` 镜像一份，`test/client.mjs` ok 1 比对两份）：
 
 | 常量 | 值 | 含义 |
 | --- | --- | --- |
-| `SILENCE_MS` | 10000 | 连续静音多久结束这句 |
-| `CALIBRATION_MS` | 500 | 开头采底噪的窗口 |
-| `NOISE_MARGIN` | 0.02 | 阈值 = 底噪 × 2 + 余量 |
-| `MIN_THRESHOLD` | 0.012 | 绝对下限，静音房间不会把阈值算成 0 |
-| `MIN_SPEECH_MS` | 500 | 有效语音不足这么多 → 不上传、不发送 |
-| `MIN_RECORDING_MS` | 1000 | 短于这个时长的手动结束直接丢弃 |
-| `MAX_RECORDING_MS` | 60000 | 上限兜底（服务端还有 120s / 25MB 的硬上限） |
+| `TURN_OPTIONS.model` | `v5` | Silero VAD v5 |
+| `positiveSpeechThreshold` / `negativeSpeechThreshold` | 0.5 / 0.35 | 语音概率高于 0.5 开始、低于 0.35 并持续一段时间才算结束（Silero 自己的取值） |
+| `redemptionMs` | 2000 | 停顿多久算说完；设置里可选 1 / 2 / 3 / 5 / 8 秒（`REDEMPTION_CHOICES_MS`，存在本浏览器） |
+| `preSpeechPadMs` | 500 | 保留开口前的 0.5 秒，第一个字不丢 |
+| `minSpeechMs` | 500 | 不足 0.5 秒的语音算误触，不上传 |
+| `MAX_SPEECH_MS` | 60000 | 一直不停顿的语音在 60 秒处截断并发送（服务端还有 120s / 25MB 的硬上限） |
+| `MIN_SPEECH_LEVEL_DBFS` | -45 | 近场音量门：低于它视为远处人声，不上传。**经验值**，按设备可能需要调 |
+| `AWAY_MAX_REJECTIONS` | 3 | 连续这么多段被判为背景声就关话筒 |
+| `AWAY_IDLE_MS` | 120000 | 累计收音这么久没发出消息就关话筒 |
+
+服务端（`voice.js`）：
+
+| 常量 | 值 | 含义 |
+| --- | --- | --- |
+| `SEGMENT_LIMITS.noSpeechProbMax` | 0.6 | 段的 `no_speech_prob` 达到它就丢。**单独判断**：Whisper 自带的跳过规则要求「`no_speech_prob > 0.6` 且 `avg_logprob < -1`」，拦不住实测的底噪幻觉（SoCLaaS 上 4 秒底噪识别成「由 Amara.org 社群提供的字幕」，`no_speech_prob` 0.83、`avg_logprob` -0.27） |
+| `SEGMENT_LIMITS.avgLogprobMin` | -1.0 | 低于它的段丢弃 |
+| `SEGMENT_LIMITS.compressionRatioMax` | 2.4 | 高于它（大量重复）的段丢弃 |
+| `HALLUCINATIONS.markers` | 字幕致谢等 | 出现就整句丢弃（这些在对助手说的话里不会出现） |
+| `HALLUCINATIONS.whole` | 「谢谢观看」等 | 只有整句完全是它才丢弃，句子里提到不受影响 |
 
 ### 隐私（必须看得见）
 
@@ -432,7 +465,9 @@ worker 每次即将结束回合时，插件会检查本轮是否调用过 `repor
 - **浏览器最小化后小窗不可见**：这是 Web 平台边界，不是实现缺陷；见上面「两层」表格。
 - **设置界面的 key 不显示、不回填**：这是有意的（服务端从不返回它）。要确认「存进去的是哪把」，只能靠「测试连接」的结果。
 - **通话条的默认位置为会话页让路**：会话页输入框贴底，通话条默认浮在它上方（距底 144px）；新会话空白页的输入框在屏幕中部，窗口较矮时（例如 800×600、手机竖屏）**打开的**通话条会盖住它的右半部分和发送按钮。把通话条拖开即可，拖动后的位置在本次页面生命周期内保持（拆成独立窗口再收回后回到默认位置）。一个固定位置无法同时避开这两种输入框；通话条锚在底部是为了卡片变高时控制条不跳动。
-- 麦克风权限、真实 10 秒静音、PiP 真窗口、拖动手感都只能在真浏览器里确认，见 `VERIFICATION.md` 的未验证清单（本轮新增的 12 条在 §14f）。
+- **离开防护挡不住「近处有人对着麦克风说话」**：音量门和过滤只能分出「远处的声音」和「Whisper 编出来的字」；如果旁边有人凑近麦克风正常说话，它会被当成你说的话发送。环境吵或旁边有人时，用静音按钮或直接关话筒最可靠。
+- **近场音量门 -45 dBFS 是经验值**：不同麦克风的电平差异较大，声音很轻或离麦克风较远时可能被拦；如果常出现「声音离麦克风太远」，需要调低这个值。
+- 麦克风权限、真人说话时的起停手感、PiP 真窗口、拖动手感都只能在真浏览器里确认，见 `VERIFICATION.md` 的未验证清单。
 
 ## 安装
 
@@ -483,7 +518,7 @@ node test/guard.mjs
 node test/adhd.mjs
 ```
 
-28 项契约测试（编号 1–27，另加 15b），用假 Host 分别挂载两半；另有 `node test/voice.mjs` 16 项语音/端点测试、`node test/client.mjs` 9 项浏览器半边测试、`node test/dock.mjs` 11 项通话条控件/窗口/拖动/文案/接缝测试、`node test/settings.mjs` 10 项设置与密钥测试、`node test/guard.mjs` 10 项主会话刹车测试、`node test/adhd.mjs` 13 项输出纪律测试：
+28 项契约测试（编号 1–27，另加 15b），用假 Host 分别挂载两半；另有 `node test/voice.mjs` 13 项语音端点、幻觉过滤、起停参数、离开防护与检测文件路由测试、`node test/client.mjs` 9 项浏览器半边测试、`node test/dock.mjs` 13 项通话条控件/收音/窗口/拖动/贴边/缩放/文案/接缝测试、`node test/settings.mjs` 10 项设置与密钥测试、`node test/guard.mjs` 10 项主会话刹车测试、`node test/adhd.mjs` 13 项输出纪律测试：
 
 1. 存储往返、长度截断、路径穿越防护
 2. 主会话行注册 7 个工具，schema 在受支持子集内（遍历注册表，未列入清单的工具会直接失败）

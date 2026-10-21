@@ -37,6 +37,7 @@ import { listDispatchCheckpoints } from './checkpoint.js'
 import { dataDir, storeRoot, whaleHomeDir } from './store.js'
 import { registerVoiceRoutes } from './voice.js'
 import { registerVoiceSettingsRoutes } from './voice-settings.js'
+import { registerVoiceAssetRoutes } from './voice-assets.js'
 
 /** Route the Web sidebar entry reads and writes. */
 export const HOME_ROUTE = '/api/discipline-whale/home'
@@ -201,6 +202,11 @@ export function apply(ctx) {
     })
     registerVoiceSettingsRoutes(c.connection, { logger: ctx.logger, credentials }).catch((error) => {
       ctx.logger?.warn?.(`discipline-whale: could not register the voice settings routes: ${error?.message ?? error}`)
+    })
+    // The page's speech detector (Silero VAD via vad-web) is served from the
+    // installed packages on this same connection, never from a CDN.
+    registerVoiceAssetRoutes(c.connection, { logger: ctx.logger }).catch((error) => {
+      ctx.logger?.warn?.(`discipline-whale: could not register the voice detector routes: ${error?.message ?? error}`)
     })
     return c.connection.fetch.register({
       path: HOME_ROUTE,

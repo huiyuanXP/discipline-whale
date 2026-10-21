@@ -3,12 +3,12 @@
  *
  * `client.js` is plain JS in the shell's module wrapper, so this harness gives
  * it the two globals it expects (`window.__ModuleLoader__` and `require`) and
- * then drives the exported logic directly. The microphone, MediaRecorder and
+ * then drives the exported logic directly. The microphone, the Silero model and
  * speechSynthesis themselves cannot run here; what is checked is everything
  * that must not drift:
  *
- *   1. the mirrored silence detector produces byte-identical decisions to the
- *      shared module the server tests exercise
+ *   1. the mirrored turn rules (Silero parameters, loudness floor, away
+ *      guard) decide identically to the shared module the server tests use
  *   2. both dictionaries carry every voice key (no missing-copy regression)
  *   3. the dock registers into `shell.overlay`, so it survives navigation to
  *      the conversation
@@ -22,8 +22,15 @@ import assert from 'node:assert/strict'
 import { readFile } from 'node:fs/promises'
 
 import {
+  AWAY_IDLE_MS,
+  AWAY_MAX_REJECTIONS,
+  MAX_SPEECH_MS,
+  MIN_SPEECH_LEVEL_DBFS,
+  REDEMPTION_CHOICES_MS,
+  TURN_OPTIONS,
+  createAwayGuard,
   createCallGuard,
-  createSilenceDetector,
+  speechLevelDbfs,
 } from '../voice-silence.js'
 
 // --- load the browser half ------------------------------------------------
@@ -55,55 +62,60 @@ const module = { exports: definition.factory((id) => {
 }) }
 delete globalThis.window
 
-// --- 1. the mirrored detector --------------------------------------------
+// --- 1. the mirrored turn rules -------------------------------------------
 
 {
-  const frames = []
+  // The browser half cannot import the shared ESM module, so it carries a
+  // verbatim copy of the turn rules. A drift here would silently change when
+  // a turn ends or when the microphone closes, so the copies are compared.
+  const mirrored = module.exports.VOICE_CONSTANTS
+  assert.deepEqual(mirrored.turn, { ...TURN_OPTIONS }, 'Silero parameters match the shared module')
+  assert.deepEqual(mirrored.redemptionChoicesMs, [...REDEMPTION_CHOICES_MS])
+  assert.equal(mirrored.maxSpeechMs, MAX_SPEECH_MS)
+  assert.equal(mirrored.minSpeechLevelDbfs, MIN_SPEECH_LEVEL_DBFS)
+  assert.equal(mirrored.awayIdleMs, AWAY_IDLE_MS)
+  assert.equal(mirrored.awayMaxRejections, AWAY_MAX_REJECTIONS)
+
+  // The loudness level agrees sample for sample on a mixed signal.
   let seed = 12345
   const random = () => {
     seed = (seed * 1103515245 + 12345) % 2147483648
     return seed / 2147483648
   }
-  for (let i = 0; i < 900; i += 1) {
-    // Three regimes: room tone, speech, room tone again, every 300 frames.
-    const phase = Math.floor(i / 300)
-    const amplitude = phase === 0 ? 0.004 + random() * 0.002
-      : phase === 1 ? 0.25 + random() * 0.05
-        : 0.004 + random() * 0.002
-    frames.push({ amplitude, samples: 320 })
+  for (const amplitude of [0, 0.0005, 0.003, 0.02, 0.2]) {
+    const samples = new Float32Array(16000 * 3)
+    for (let i = 0; i < samples.length; i += 1) samples[i] = (random() * 2 - 1) * amplitude * (i > 8000 && i < 24000 ? 1 : 0.1)
+    assert.equal(module.exports.speechLevelDbfs(samples, 16000), speechLevelDbfs(samples, 16000), `level at amplitude ${amplitude}`)
   }
 
-  const shared = createSilenceDetector()
-  const mirrored = module.exports.createSilenceDetector()
-  for (const [index, frame] of frames.entries()) {
-    const samplesOf = (amplitude) => {
-      const samples = new Float32Array(frame.samples)
-      for (let i = 0; i < samples.length; i += 1) samples[i] = amplitude * Math.sin((2 * Math.PI * 220 * i) / 16000)
-      return samples
-    }
-    const left = shared.push(samplesOf(frame.amplitude), 20)
-    const right = mirrored.push(samplesOf(frame.amplitude), 20)
-    assert.deepEqual(right, left, `frame ${index} must decide identically`)
+  // The away guard decides identically on one scripted afternoon.
+  const shared = createAwayGuard()
+  const copy = module.exports.createAwayGuard()
+  const script = [
+    ['resume', 0], ['reason', 60_000], ['suspend', 90_000], ['reason', 600_000], ['resume', 600_000],
+    ['rejected'], ['rejected'], ['reason', 610_000], ['accepted', 620_000], ['rejected'], ['rejected'], ['rejected'],
+    ['reason', 621_000], ['reset'], ['resume', 700_000], ['present', 750_000], ['reason', 869_000], ['reason', 870_000],
+  ]
+  for (const [step, at] of script) {
+    const left = shared[step](at)
+    const right = copy[step](at)
+    assert.equal(right, left, `${step}(${at ?? ''}) must decide identically`)
   }
-  assert.equal(shared.elapsedMs(), mirrored.elapsedMs())
-  console.log('ok 1 — the browser detector mirrors the shared algorithm frame for frame')
+  console.log('ok 1 — the browser half mirrors the shared turn rules: parameters, loudness floor and away guard')
 }
 
 {
-  // Named constants are exported so a future change to 10s is one edit.
-  assert.equal(module.exports.VOICE_CONSTANTS.silenceMs, 10_000)
-  assert.equal(module.exports.VOICE_CONSTANTS.minSpeechMs, 500)
-  assert.equal(module.exports.VOICE_CONSTANTS.maxRecordingMs, 60_000)
-  assert.equal(module.exports.VOICE_CONSTANTS.minRecordingMs, 1_000)
-  assert.equal(module.exports.VOICE_CONSTANTS.calibrationMs, 500)
-
   const guard = module.exports.createCallGuard()
   guard.setTarget('s1')
   const call = guard.begin('c1')
   assert.equal(guard.accepts(call, 's1'), true)
   guard.end('c1')
   assert.equal(guard.accepts(call, 's1'), false)
-  console.log('ok 2 — the constants and the call guard ship with the browser half')
+  // The detector is served by the plugin itself, never a CDN.
+  const source = await readFile(new URL('../client.js', import.meta.url), 'utf8')
+  assert.match(source, /const VOICE_ASSET_ROUTE = "\/api\/discipline-whale\/voice\/vad"/)
+  assert.equal(/https?:\/\/(cdn|unpkg|jsdelivr)/i.test(source), false, 'no CDN URL in the browser half')
+  console.log('ok 2 — the call guard ships with the browser half, and the detector loads from the plugin route')
 }
 
 // --- 2. dictionaries ------------------------------------------------------

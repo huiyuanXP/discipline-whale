@@ -23,7 +23,8 @@
     "./voice": "./voice.js",
     "./voice-silence": "./voice-silence.js",
     "./prompt-probe": "./prompt-probe.mjs",
-    "./voice-settings": "./voice-settings.js"
+    "./voice-settings": "./voice-settings.js",
+    "./voice-assets": "./voice-assets.js"
   },
   "files": [
     "main.js",
@@ -32,6 +33,7 @@
     "client.js",
     "voice.js",
     "voice-settings.js",
+    "voice-assets.js",
     "voice-silence.js",
     "store.js",
     "checkpoint.js",
@@ -86,5 +88,9 @@
     "client": {
       "platform": "web"
     }
+  },
+  "dependencies": {
+    "@ricky0123/vad-web": "0.0.31",
+    "onnxruntime-web": "1.22.0"
   }
 }
