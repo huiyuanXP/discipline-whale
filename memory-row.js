@@ -535,7 +535,9 @@ export function installMemory(ctx, config = {}, deps = {}) {
     state.nudging = true
     try {
       const cursor = await readCursor(root())
-      const last = Number.isInteger(cursor.nudgeTurn?.[sessionId]) ? cursor.nudgeTurn[sessionId] : 0
+      const stored = Number.isInteger(cursor.nudgeTurn?.[sessionId]) ? cursor.nudgeTurn[sessionId] : 0
+      // A turn number below the stored one means the numbering restarted: count from zero.
+      const last = stored > turn ? 0 : stored
       if (!shouldNudge({ turnsSinceLast: turn - last, interval: resolved.nudgeInterval })) return
       await writeCursor(root(), { nudgeTurn: { ...(cursor.nudgeTurn ?? {}), [sessionId]: turn } })
       startFlush(agent, 'nudge')

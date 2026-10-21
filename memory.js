@@ -136,13 +136,6 @@ export async function readLayer(homeDir, target) {
 }
 
 /**
- * Replace one layer's file.
- *
- * @param options.expectHash  hash from {@link readLayer}; a different on-disk
- *   hash throws {@link MemoryConflictError}. Omit to skip the check.
- * @throws {MemoryBudgetError} when `text` is over the layer budget.
- */
-/**
  * Create every layer file that is missing (from its template) and the daily
  * directory, so the whole structure is on disk and readable before the first
  * write. Existing files are left untouched.
@@ -165,6 +158,13 @@ export async function ensureLayers(homeDir) {
   return created
 }
 
+/**
+ * Replace one layer's file.
+ *
+ * @param options.expectHash  hash from {@link readLayer}; a different on-disk
+ *   hash throws {@link MemoryConflictError}. Omit to skip the check.
+ * @throws {MemoryBudgetError} when `text` is over the layer budget.
+ */
 export async function writeLayer(homeDir, target, text, { expectHash } = {}) {
   return withLock(layerPath(homeDir, target), () => writeLayerLocked(homeDir, target, text, { expectHash }))
 }
