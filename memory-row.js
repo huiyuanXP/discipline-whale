@@ -548,7 +548,8 @@ export function installMemory(ctx, config = {}, deps = {}) {
     startDream(agent)
   })
 
-  ctx.on('tools/post-execute', (exec) => {
+  // `tools/result` is the observe-only feed; the result itself passes through untouched.
+  ctx.on('tools/result', (exec) => {
     if (exec?.agent !== undefined && isMainAgent(exec.agent) && ACTIVITY_TOOLS.has(String(exec.name ?? ''))) {
       cache.activityDirty = true
     }

@@ -113,7 +113,7 @@ function host() {
       await handler(payload, async () => ({ kind: 'continue', messages: [] }))
     }
   }
-  return { ctx, tools, sections, contexts, llmCalls, tokens, emit }
+  return { ctx, tools, sections, contexts, llmCalls, tokens, emit, listeners }
 }
 
 const events = []
@@ -157,7 +157,13 @@ try {
   assert.equal(h.sections[0].order, 102)
   assert.equal(h.contexts[0].name, ACTIVITY_CONTEXT_NAME)
   assert.equal(h.contexts[0].required, true)
-  console.log('ok 1 — four tools with supported schemas, one section, one required context')
+  // Waterfall events must call next(); the row observes tool outcomes only through the emit feed.
+  assert.deepEqual(
+    [...h.listeners.keys()].filter((event) => ['tools/pre-execute', 'tools/post-execute', 'tools/execute'].includes(event)),
+    [],
+  )
+  assert.ok(h.listeners.has('tools/result'))
+  console.log('ok 1 — four tools with supported schemas, one section, one required context, no tool waterfalls')
 
   // 2
   assert.match((await readLayer(root, 'user')).text, /回复先给结论 \[source: dsh-auto-memory:reply-audience/)
