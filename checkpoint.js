@@ -19,7 +19,8 @@
  */
 
 import { randomUUID } from 'node:crypto'
-import { mkdir, rename, rm, writeFile } from 'node:fs/promises'
+import { existsSync } from 'node:fs'
+import { mkdir, readdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { hostname } from 'node:os'
 import { dirname, join } from 'node:path'
 
@@ -83,4 +84,68 @@ export async function writeDispatchCheckpoint(homeDir, workerSessionId, dispatch
  */
 export function dropDispatchCheckpoint(homeDir, workerSessionId) {
   return rm(dispatchCheckpointPath(homeDir, workerSessionId), { force: true }).catch(() => {})
+}
+
+/** Read one checkpoint, or undefined when there is none. */
+export async function readDispatchCheckpoint(homeDir, workerSessionId) {
+  try {
+    return JSON.parse(await readFile(dispatchCheckpointPath(homeDir, workerSessionId), 'utf8'))
+  } catch (error) {
+    if (error?.code === 'ENOENT') return undefined
+    throw error
+  }
+}
+
+/**
+ * Every checkpoint on disk, oldest dispatch first.
+ *
+ * A checkpoint is dropped once its report reaches the main session, so after a
+ * restart each remaining file is a dispatch the restart interrupted. A
+ * half-written or hand-edited file is skipped rather than failing the listing.
+ */
+export async function listDispatchCheckpoints(homeDir) {
+  const dir = join(dataDir(homeDir), DISPATCH_DIRNAME)
+  let entries
+  try {
+    entries = await readdir(dir)
+  } catch (error) {
+    if (error?.code === 'ENOENT') return []
+    throw error
+  }
+  const records = []
+  for (const entry of entries) {
+    if (!entry.endsWith('.json')) continue
+    try {
+      const record = JSON.parse(await readFile(join(dir, entry), 'utf8'))
+      if (typeof record?.workerSessionId === 'string') records.push(record)
+    } catch {
+      continue
+    }
+  }
+  records.sort((left, right) => String(left.startedAt ?? '').localeCompare(String(right.startedAt ?? '')))
+  return records
+}
+
+/**
+ * The marker the user's "abandon" leaves behind.
+ *
+ * The main session and the workers run separate registries, so abandoning in
+ * the main session cannot reach a worker's in-memory record. The marker is the
+ * shared fact: a worker checks it before steering for a report or re-writing a
+ * checkpoint. It is not a `.json` file, so the checkpoint listing ignores it.
+ */
+export function abandonedMarkerPath(homeDir, workerSessionId) {
+  return join(dataDir(homeDir), DISPATCH_DIRNAME, `${workspaceKey(workerSessionId)}.abandoned`)
+}
+
+/** Record that the user abandoned this worker's dispatch. */
+export async function markDispatchAbandoned(homeDir, workerSessionId, dispatchId) {
+  const target = abandonedMarkerPath(homeDir, workerSessionId)
+  await mkdir(dirname(target), { recursive: true })
+  await writeFile(target, `${JSON.stringify({ dispatchId, abandonedAt: new Date().toISOString() })}\n`, 'utf8')
+}
+
+/** True when the user abandoned this worker's dispatch; synchronous for turn-end checks. */
+export function isDispatchAbandoned(homeDir, workerSessionId) {
+  return existsSync(abandonedMarkerPath(homeDir, workerSessionId))
 }

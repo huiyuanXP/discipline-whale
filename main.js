@@ -14,8 +14,13 @@
 
 import { randomUUID } from 'node:crypto'
 
-import { writeDispatchCheckpoint } from './checkpoint.js'
-import { listDispatches, recordDispatch } from './registry.js'
+import {
+  dropDispatchCheckpoint,
+  markDispatchAbandoned,
+  readDispatchCheckpoint,
+  writeDispatchCheckpoint,
+} from './checkpoint.js'
+import { dispatchForWorker, listDispatches, recordDispatch } from './registry.js'
 import { isReportId, listReports, readReport, storeRoot } from './store.js'
 
 /**
@@ -697,6 +702,121 @@ function listDispatchesTool(ctx) {
 }
 
 /* ------------------------------------------------------------------ *
+ * interrupted dispatches
+ * ------------------------------------------------------------------ */
+
+/** The brief a resumed worker receives. */
+export const RESUME_BRIEF = [
+  '[Resume] A DeepSeek Harness restart interrupted the task you were dispatched in this session.',
+  'Re-read this session to recover the task and what you already finished, then continue from where you stopped.',
+  'When the work is done, call `report_to_main` exactly as the original brief asked.',
+].join('\n')
+
+const workerSessionParameter = {
+  type: 'string',
+  description: 'Worker session id of the interrupted dispatch, as listed in the startup check.',
+}
+
+const interruptedOutput = {
+  schema: {
+    type: 'object',
+    additionalProperties: false,
+    required: ['dispatchId', 'workerSessionId', 'status'],
+    properties: {
+      dispatchId: { type: 'string' },
+      workerSessionId: { type: 'string' },
+      status: { type: 'string' },
+    },
+  },
+  render: (_args, value) => [{ type: 'text', text: JSON.stringify(value, null, 2) }],
+}
+
+async function interruptedCheckpoint(args) {
+  if (typeof args.worker_session_id !== 'string' || args.worker_session_id === '') {
+    throw new Error('`worker_session_id` is required')
+  }
+  const checkpoint = await readDispatchCheckpoint(storeRoot(), args.worker_session_id)
+  if (checkpoint === undefined) {
+    throw new Error(`no interrupted dispatch for worker ${args.worker_session_id}; it may have reported or been abandoned already`)
+  }
+  return checkpoint
+}
+
+function resumeDispatchTool(ctx) {
+  return {
+    name: 'resume_dispatch',
+    description:
+      'Resume a dispatch that a DeepSeek Harness restart interrupted: wake its worker session so it continues the task and reports back here. Call it only for dispatches the user chose to resume.',
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      required: ['worker_session_id'],
+      properties: {
+        worker_session_id: workerSessionParameter,
+        note: { type: 'string', description: 'Optional extra instruction for the worker, such as a changed decision.' },
+      },
+    },
+    output: interruptedOutput,
+    presentCall: (args) => ({ card: 'generic', title: 'Resume dispatch', kind: 'other', rawInput: args.worker_session_id }),
+    async execute(args, exec) {
+      const checkpoint = await interruptedCheckpoint(args)
+      const mainSessionId = exec?.agent?.session?.id ?? checkpoint.mainSessionId
+      const dispatch = recordDispatch({
+        dispatchId: checkpoint.dispatchId,
+        mainSessionId,
+        workerSessionId: checkpoint.workerSessionId,
+        workspaceId: checkpoint.workspaceId,
+        workspaceTitle: checkpoint.workspaceTitle,
+        task: '(resumed after a restart)',
+        startedAt: checkpoint.startedAt,
+      })
+      // Route the report to the session resuming it, in case the main session changed.
+      await writeDispatchCheckpoint(storeRoot(), checkpoint.workerSessionId, dispatch)
+      const note = typeof args.note === 'string' ? args.note.trim() : ''
+      const brief = note === '' ? RESUME_BRIEF : `${RESUME_BRIEF}\n\nNote from the main session: ${note}`
+      await ctx.sessionController.prompt(
+        {
+          requestId: randomUUID(),
+          sessionId: checkpoint.workerSessionId,
+          mode: 'queue',
+          content: [{ type: 'text', text: brief }],
+        },
+        signalOf(exec),
+      )
+      return { dispatchId: checkpoint.dispatchId, workerSessionId: checkpoint.workerSessionId, status: 'resumed' }
+    },
+  }
+}
+
+function abandonDispatchTool() {
+  return {
+    name: 'abandon_dispatch',
+    description:
+      'Abandon a dispatch that a DeepSeek Harness restart interrupted: forget it so it is no longer reported as interrupted, and stop asking its worker for a report. The worker session itself is left as it is. Call it only for dispatches the user chose to abandon.',
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      required: ['worker_session_id'],
+      properties: { worker_session_id: workerSessionParameter },
+    },
+    output: interruptedOutput,
+    presentCall: (args) => ({ card: 'generic', title: 'Abandon dispatch', kind: 'other', rawInput: args.worker_session_id }),
+    async execute(args) {
+      const checkpoint = await interruptedCheckpoint(args)
+      // The marker reaches the worker preset's own registry; the checkpoint goes.
+      await markDispatchAbandoned(storeRoot(), checkpoint.workerSessionId, checkpoint.dispatchId)
+      await dropDispatchCheckpoint(storeRoot(), checkpoint.workerSessionId)
+      const record = dispatchForWorker(checkpoint.workerSessionId)
+      if (record !== undefined) {
+        record.status = 'abandoned'
+        record.reportedAt = new Date().toISOString()
+      }
+      return { dispatchId: checkpoint.dispatchId, workerSessionId: checkpoint.workerSessionId, status: 'abandoned' }
+    },
+  }
+}
+
+/* ------------------------------------------------------------------ *
  * activation
  * ------------------------------------------------------------------ */
 
@@ -739,4 +859,6 @@ export function apply(ctx, config = {}) {
   ctx.effect(() => ctx.tools.register(readReportTool(ctx)))
   ctx.effect(() => ctx.tools.register(sendToSessionTool(ctx)))
   ctx.effect(() => ctx.tools.register(listDispatchesTool(ctx)))
+  ctx.effect(() => ctx.tools.register(resumeDispatchTool(ctx)))
+  ctx.effect(() => ctx.tools.register(abandonDispatchTool()))
 }

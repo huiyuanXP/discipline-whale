@@ -35,7 +35,7 @@ DSH 里已经有 `subagent`（同一会话内的子代理）和 `dsh-webhook`（
 
 主会话不注册 `report_to_main`：它只会被回报，不会自己造一个。
 
-## 五个工具
+## 工具
 
 ### `list_workspaces`（主会话）
 列出所有已注册工作区：id、标题、路径、会话数。派工前用它决定归属。
@@ -69,6 +69,18 @@ DSH 里已经有 `subagent`（同一会话内的子代理）和 `dsh-webhook`（
   `lastPromptAt` 单独给出，它是该 worker 会话最后一条**用户/调度方** prompt 的时间，同样不反映 worker 进度。
 
 看板只读**进程内注册表**：重启后它是空的（这正是 `list_dispatches` 与检查点文件的分工）。
+
+### `resume_dispatch` / `abandon_dispatch`（主会话）
+```json
+{ "worker_session_id": "session-…", "note": "可选，给 worker 的补充指令（仅 resume）" }
+```
+处理被 DeepSeek Harness 重启打断的派工，只在用户做出选择后调用：
+- `resume_dispatch`：唤醒 worker，让它回顾本会话、从中断处继续，完成后照常 `report_to_main`；回报改投给发起恢复的主会话，派工重新出现在看板上
+- `abandon_dispatch`：删除这条派工的检查点，并留下放弃标记 `dispatches/<workerSessionId>.abandoned`，不再提醒；worker 会话本身保持原样，但不会再被催着回报（主会话和 worker 的注册表互不共享，标记是两边都能看到的事实）
+
+## 启动检查：被打断的派工
+
+鲸鱼和 DeepSeek Harness 同生共死：进程退出时正在跑的 worker 不会在重启后自己继续。每次启动，Host 端扫描 `dispatches/` 里没有交付的检查点；如果有，并且已经有主会话，就给主会话发一条「启动检查」消息，列出每条中断的派工。主会话说明每条原本在做什么，用 `ask_user` 让用户逐条选择 **恢复 / 放弃 / 稍后再说**，再按选择调用 `resume_dispatch` 或 `abandon_dispatch`。「稍后再说」的派工保持原样，下次启动会再次提醒。
 
 ## 强制回报：不报告就别收工
 
@@ -104,6 +116,7 @@ $DSH_HOME/discipline-whale/state.json                               ← 插件�
 $DSH_HOME/discipline-whale/home/                                    ← 主会话的工作目录
 $DSH_HOME/discipline-whale/reports/<workspaceId>/<reportId>.json    ← 报告
 $DSH_HOME/discipline-whale/dispatches/<workerSessionId>.json        ← 派工检查点
+$DSH_HOME/discipline-whale/dispatches/<workerSessionId>.abandoned   ← 用户放弃的派工
 ```
 以后新增的状态（自动记忆、唤醒计划等）各占一个子目录。
 
@@ -111,7 +124,7 @@ $DSH_HOME/discipline-whale/dispatches/<workerSessionId>.json        ← 派工�
 
 检查点是**路由事实**（dispatchId / 主会话 id / 工作区 / 派工时间），不含任务正文——正文在 worker 会话日志里。
 `dispatch_task` 在返回前写一次，worker 首次生命周期事件再写一次同一路径（两边共用 `checkpoint.js` 的同一套路径与记录格式，所以不会各写各的）。
-报告投递成功后删除；**放弃（abandoned）时不删**，因为那个 worker 之后仍可能真的报告，删了它就会退化成 orphan。
+报告投递成功后删除。worker **超过催报次数**被标记 abandoned 时不删，因为那个 worker 之后仍可能真的报告，删了它就会退化成 orphan；只有用户通过 `abandon_dispatch` 主动放弃时才删除并留下放弃标记。
 
 ## 测试
 
@@ -119,10 +132,10 @@ $DSH_HOME/discipline-whale/dispatches/<workerSessionId>.json        ← 派工�
 node test/contract.mjs
 ```
 
-18 项契约测试，用假 Host 分别挂载两半：
+19 项契约测试，用假 Host 分别挂载两半：
 
 1. 存储往返、长度截断、路径穿越防护
-2. 主会话行注册 5 个工具，schema 在受支持子集内（遍历注册表，未列入清单的工具会直接失败）
+2. 主会话行注册 7 个工具，schema 在受支持子集内（遍历注册表，未列入清单的工具会直接失败）
 3. **worker 行只注册 1 个工具**，且没有 dispatch / list / read / send / `list_dispatches`
 4. `list_workspaces` 投影正确
 5. `dispatch_task` 用 worker preset、下任务、拒绝歧义/未知工作区
@@ -140,6 +153,7 @@ node test/contract.mjs
 16. 看板能吃下 worker 侧写入的 `recoveredFrom` / `orphaned` / 脏时间戳
 17. 已投递的派工不会被后续生命周期事件「复活」成第二个检查点
 18. home 目录被创建；连点两次也只新建、唤醒、记录一个主会话（`state.json`）
+19. 启动检查把中断的派工推给主会话；`resume_dispatch` 唤醒 worker 并改投回报，`abandon_dispatch` 清掉检查点并留下放弃标记，worker 看到标记后不再被催报
 
 假 `prompt` **故意模仿真实实现**，会解引用 `signal` —— 这条强化曾抓出三个真实缺陷（信号未传、`exec` 参数缺失、dispatch 未标记已报）。
 

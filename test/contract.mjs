@@ -27,8 +27,16 @@ import {
   validateJsonSchemaValue,
 } from '/Users/huiyuan/.npm/_npx/b86ed90107c62dab/node_modules/@deepseek-ai/dsh-tools/lib/index.js'
 
-import { HOME_ROUTE, MAIN_PRESET, MAIN_TITLE, WAKE_PROMPT, ensureHome, homeHandler, readState } from '../home.js'
+import {
+  isDispatchAbandoned,
+  listDispatchCheckpoints,
+  markDispatchAbandoned,
+  readDispatchCheckpoint,
+  writeDispatchCheckpoint,
+} from '../checkpoint.js'
+import { HOME_ROUTE, MAIN_PRESET, MAIN_TITLE, WAKE_PROMPT, ensureHome, homeHandler, interruptedNotice, readState, startupCheck } from '../home.js'
 import * as mainRow from '../main.js'
+import { RESUME_BRIEF } from '../main.js'
 import * as workerRow from '../worker.js'
 import { resetRegistry } from '../registry.js'
 import {
@@ -165,6 +173,8 @@ const execAs = (sessionId) => ({ agent: { session: { id: sessionId } } })
     'read_report',
     'send_to_session',
     'list_dispatches',
+    'resume_dispatch',
+    'abandon_dispatch',
   ]
   assert.deepEqual([...tools.keys()].sort(), [...expected].sort())
   // Every registered tool must be covered by this check, not just the ones this
@@ -175,7 +185,7 @@ const execAs = (sessionId) => ({ agent: { session: { id: sessionId } } })
     assertSupportedJsonSchema(tool.output.schema)
     assert.equal(typeof tool.output.render, 'function')
   }
-  console.log('ok 2 — main row registers five tools with supported schemas')
+  console.log('ok 2 — main row registers seven tools with supported schemas')
 }
 
 // --- 3. worker row surface: no upward powers ------------------------------
@@ -997,6 +1007,8 @@ const checkpointPath = (workerSessionId) =>
 // --- 18. the whale's home ------------------------------------------------
 
 {
+  // Earlier blocks leave dispatch checkpoints behind; a fresh home has none.
+  await rm(join(home, 'discipline-whale', 'dispatches'), { recursive: true, force: true })
   const homePath = await ensureHome()
   assert.equal(homePath, join(home, 'discipline-whale', 'home'))
   assert.equal((await stat(homePath)).isDirectory(), true)
@@ -1043,6 +1055,86 @@ const checkpointPath = (workerSessionId) =>
   assert.equal((await request('GET')).headers.get('cache-control'), 'no-store')
   assert.deepEqual(await readState(), { mainSessionId: 'session-main-1' })
   console.log('ok 18 — the home exists and one main session is created, woken and recorded')
+}
+
+// --- 19. interrupted dispatches after a restart -----------------------------
+
+{
+  resetRegistry()
+  await rm(join(home, 'discipline-whale', 'dispatches'), { recursive: true, force: true })
+
+  const interrupted = (worker, startedAt) => ({
+    dispatchId: `dispatch-${worker}`,
+    mainSessionId: 'session-main-1',
+    workspaceId: 'ws-soc',
+    workspaceTitle: 'soc-api-test',
+    startedAt,
+  })
+  await writeDispatchCheckpoint(home, 'worker-late', interrupted('worker-late', '2026-10-20T17:13:00.000Z'))
+  await writeDispatchCheckpoint(home, 'worker-early', interrupted('worker-early', '2026-10-20T17:08:00.000Z'))
+  await writeFile(join(home, 'discipline-whale', 'dispatches', 'broken.json'), '{not json', 'utf8')
+
+  const listed = await listDispatchCheckpoints(home)
+  assert.deepEqual(listed.map((record) => record.workerSessionId), ['worker-early', 'worker-late'])
+
+  // The startup check tells the recorded main session, listing every dispatch.
+  const prompts = []
+  const controller = {
+    prompt: async (request, signal) => {
+      signal.throwIfAborted()
+      prompts.push(request)
+    },
+  }
+  assert.equal(await startupCheck(controller), 2)
+  assert.equal(prompts.length, 1)
+  assert.equal(prompts[0].sessionId, 'session-main-1')
+  const notice = prompts[0].content[0].text
+  for (const needle of ['worker-early', 'worker-late', 'soc-api-test', 'ask_user', 'resume_dispatch', 'abandon_dispatch']) {
+    assert.ok(notice.includes(needle), `the startup notice must mention ${needle}`)
+  }
+  assert.equal(interruptedNotice([]), undefined)
+
+  // Resume wakes the worker, reroutes its report to the resuming session and
+  // puts the dispatch back on the board.
+  const { tools, calls } = mount(mainRow)
+  const resumed = await run(tools, 'resume_dispatch', { worker_session_id: 'worker-early', note: 'skip the docs' }, execAs('session-main-2'))
+  assert.deepEqual(resumed, { dispatchId: 'dispatch-worker-early', workerSessionId: 'worker-early', status: 'resumed' })
+  assert.equal(calls.prompt.length, 1)
+  assert.equal(calls.prompt[0].sessionId, 'worker-early')
+  assert.ok(calls.prompt[0].content[0].text.startsWith(RESUME_BRIEF))
+  assert.ok(calls.prompt[0].content[0].text.includes('skip the docs'))
+  assert.equal((await readDispatchCheckpoint(home, 'worker-early')).mainSessionId, 'session-main-2')
+  const board = await run(tools, 'list_dispatches', {}, execAs('session-main-2'))
+  assert.equal(board.dispatches.some((row) => row.workerSessionId === 'worker-early' && row.status === 'running'), true)
+
+  // Abandon forgets the checkpoint; a second call finds nothing to act on.
+  const abandoned = await run(tools, 'abandon_dispatch', { worker_session_id: 'worker-late' }, execAs('session-main-2'))
+  assert.equal(abandoned.status, 'abandoned')
+  assert.equal(await readDispatchCheckpoint(home, 'worker-late'), undefined)
+  await assert.rejects(() => run(tools, 'abandon_dispatch', { worker_session_id: 'worker-late' }), /no interrupted dispatch/)
+  assert.equal(isDispatchAbandoned(home, 'worker-late'), true)
+
+  // The worker preset keeps its own registry, so the abandon must reach it
+  // through disk. Simulate that realm: a fresh registry recovers the resumed
+  // dispatch from its checkpoint and steers once; after the main session
+  // abandons it (marker written, checkpoint gone) the worker is left alone and
+  // the checkpoint is not written back.
+  resetRegistry()
+  const workerMount = mount(workerRow, { maxReportRetries: 3 })
+  const steered = []
+  const agent = { session: { id: 'worker-early' }, steer: (message) => steered.push(message) }
+  const stopping = workerMount.listeners.get('agent/turn-stopping')[0]
+  await stopping({ agent, turn: 1, signal: new AbortController().signal })
+  assert.equal(steered.length, 1, 'a resumed worker is asked for its report')
+
+  await markDispatchAbandoned(home, 'worker-early', 'dispatch-worker-early')
+  await rm(join(home, 'discipline-whale', 'dispatches', 'worker-early.json'), { force: true })
+  await stopping({ agent, turn: 2, signal: new AbortController().signal })
+  await new Promise((resolve) => setTimeout(resolve, 20))
+  assert.equal(steered.length, 1, 'an abandoned dispatch is no longer enforced')
+  assert.equal(workerMount.calls.prompt.length, 0, 'abandoning never escalates to the main session')
+  assert.equal(await readDispatchCheckpoint(home, 'worker-early'), undefined, 'the checkpoint stays gone')
+  console.log('ok 19 — interrupted dispatches are reported at startup and can be resumed or abandoned')
 }
 
 await rm(home, { recursive: true, force: true })

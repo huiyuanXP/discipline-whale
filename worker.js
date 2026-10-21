@@ -19,6 +19,7 @@ import { hostname } from 'node:os'
 import {
   dropDispatchCheckpoint,
   dispatchCheckpointPath,
+  isDispatchAbandoned,
   writeDispatchCheckpoint,
 } from './checkpoint.js'
 import {
@@ -72,6 +73,7 @@ const checkpointed = new Set()
 function checkpointOnce(ctx, workerSessionId, dispatch) {
   if (dispatch?.dispatchId === undefined) return Promise.resolve(undefined)
   if (dispatch.status === 'reported' || dispatch.status === 'abandoned') return Promise.resolve(undefined)
+  if (isDispatchAbandoned(storeRoot(), workerSessionId)) return Promise.resolve(undefined)
   const key = `${workerSessionId}\u0000${dispatch.dispatchId}`
   if (checkpointed.has(key)) return Promise.resolve(undefined)
   checkpointed.add(key)
@@ -483,6 +485,13 @@ export function registerEnforcement(ctx, config) {
     const dispatch = dispatchForWorker(sessionId)
     if (dispatch === undefined) return
     if (dispatch.reportedAt !== undefined) return
+    // The user abandoned this dispatch from the main session: stop asking.
+    if (isDispatchAbandoned(storeRoot(), sessionId)) {
+      clearRetries(dispatch.dispatchId)
+      dispatch.reportedAt = new Date().toISOString()
+      dispatch.status = 'abandoned'
+      return
+    }
 
     const attempts = retriesFor(dispatch.dispatchId) + 1
     if (attempts > config.maxReportRetries) {

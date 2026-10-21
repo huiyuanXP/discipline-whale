@@ -10,7 +10,7 @@
 
 ```
 node test/contract.mjs
-→ 18 项全过（含 15b）
+→ 19 项全过（含 15b）
 ```
 
 覆盖两半的挂载隔离、schema 合法性、派工、回报投递、强制回报重试与升级、重启后的检查点恢复、看板三态与脏数据。
@@ -246,7 +246,7 @@ SMOKE PASS
 ## 10. 交付状态
 
 - 主包 `discipline-whale` 以打包副本安装到 web profile（`file:$DSH_HOME/plugins/packages/discipline-whale-<version>.tgz`，由 `scripts/install-local.sh` 生成）
-- `node test/contract.mjs` **18 项全过**（含 15b）
+- `node test/contract.mjs` **19 项全过**（含 15b）
 - **需要重启 DSH 一次**：`cordis.patch.yml` 的权限收紧和 preset 内的模块代码都要重启才在已加载的插件行上生效。**本次没有重启验证**。
 
 ## 11. 侧边栏入口与 home（0.2.0）
@@ -261,11 +261,19 @@ SMOKE PASS
 
 客户端模块只对**名字等于包名**的 loader 行注入，所以 home 行用 `name: 'discipline-whale'`，包根入口 `.` 指向 `home.js`。
 
+## 12. 启动检查：被打断的派工（0.3.0）
+
+在隔离的 `DSH_HOME` 上实测，复制了真实的主会话、3 条未交付的派工检查点和对应会话记录：
+
+- 启动后主会话自动收到「启动检查」消息，列出 3 条中断的派工
+- 主会话用一句话说明每条原本在做什么，再用 `ask_user` 逐条给出「恢复 / 放弃 / 稍后再说」，侧边栏会话显示「等待回答」
+- 回答「稍后再说 / 稍后再说 / 放弃」后，主会话只对第 3 条调用了 `abandon_dispatch`，该检查点被删除，其余两条保留；全程没有调用 `resume_dispatch`
+
 ## 复验命令
 
 ```bash
 cd discipline-whale
-node test/contract.mjs        # 18 项契约测试
+node test/contract.mjs        # 19 项契约测试
 node test/smoke-restart.mjs  # 模拟重启冒烟（非单测）
 ```
 

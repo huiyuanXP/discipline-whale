@@ -42,7 +42,8 @@
 # Consequence: create_session is gone process-wide — for workers AND for the
 # main conversation (and for their sub-agents, which share this tree). The main
 # conversation keeps its own dispatch path (dispatch_task / send_to_session /
-# read_report / list_workspaces / list_dispatches), so it loses nothing it
+# read_report / list_workspaces / list_dispatches / resume_dispatch /
+# abandon_dispatch), so it loses nothing it
 # needs. Delete this row to restore the tool everywhere.
 #
 # VERIFIED HOW FAR: `dsh --profile web --dump-config` shows this row composed as
@@ -106,6 +107,9 @@
                 - 你不写实现：文件系统只读、没有 shell。实现归 worker。
                 - 用户的新决策用 send_to_session 追给对应 worker。
                 - worker 的回报以推送消息到达，不用轮询。
+
+                ## 7. 被重启打断的派工
+                DeepSeek Harness 重启后，没完成回报的派工会以「启动检查」消息出现。先说明每条原本在做什么，再用 ask_user 让用户逐条选择：恢复 / 放弃 / 稍后再说。恢复用 resume_dispatch，放弃用 abandon_dispatch；没有用户的选择，不自行恢复或放弃。
               includeRuntimeContext: true
           - id: agent-instructions
             name: '@deepseek-ai/dsh-agent-instructions'

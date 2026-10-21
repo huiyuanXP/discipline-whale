@@ -18,6 +18,11 @@
  * the user, that turn is what makes the session usable in the Web composer: a
  * session outside every workspace only accepts input once it has a turn.
  *
+ * At boot the row also checks for dispatches a restart interrupted (dispatch
+ * checkpoints that were never delivered). When there are any and a main session
+ * exists, the main session is told about them and asks the user, per dispatch,
+ * whether to resume or abandon it.
+ *
  * The row also names the package itself, which is what makes the client-modules
  * scan serve the sidebar entry (`./client`).
  *
@@ -28,6 +33,7 @@ import { randomUUID } from 'node:crypto'
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 
+import { listDispatchCheckpoints } from './checkpoint.js'
 import { dataDir, storeRoot, whaleHomeDir } from './store.js'
 
 /** Route the Web sidebar entry reads and writes. */
@@ -47,6 +53,25 @@ export const WAKE_PROMPT = [
   '【唤醒】自律鲸鱼主会话已建立，工作目录是你自己的 home。',
   '请用两三句话告诉我你能做什么，然后调用 list_dispatches 汇报当前派工状态。',
 ].join('\n')
+
+/**
+ * The startup-check turn for the main session, or undefined when nothing was
+ * interrupted.
+ */
+export function interruptedNotice(checkpoints) {
+  if (checkpoints.length === 0) return undefined
+  const lines = checkpoints.map(
+    (checkpoint, index) =>
+      `${index + 1}. 工作区「${checkpoint.workspaceTitle ?? checkpoint.workspaceId}」，worker ${checkpoint.workerSessionId}，派工时间 ${checkpoint.startedAt ?? '未知'}`,
+  )
+  return [
+    `【启动检查】DeepSeek Harness 重启前有 ${checkpoints.length} 条派工没有完成回报：`,
+    ...lines,
+    '',
+    '请结合你的会话记录，用一句话说明每条派工原本在做什么，然后用 ask_user 让用户为每条派工选择：恢复 / 放弃 / 稍后再说。',
+    '按用户的选择调用 resume_dispatch（恢复）或 abandon_dispatch（放弃）；选「稍后再说」的保持原样，下次启动会再次提醒。',
+  ].join('\n')
+}
 
 export const name = 'discipline-whale-home'
 
@@ -95,15 +120,8 @@ export async function createMainSession(sessionController) {
   } catch {
     // A missing title only changes how the session is listed.
   }
-  await sessionController.prompt(
-    {
-      requestId: randomUUID(),
-      sessionId,
-      mode: 'queue',
-      content: [{ type: 'text', text: WAKE_PROMPT }],
-    },
-    new AbortController().signal,
-  )
+  const notice = interruptedNotice(await listDispatchCheckpoints(storeRoot()))
+  await promptMain(sessionController, sessionId, notice === undefined ? WAKE_PROMPT : `${WAKE_PROMPT}\n\n${notice}`)
   return sessionId
 }
 
@@ -132,17 +150,41 @@ export function homeHandler(sessionController) {
   }
 }
 
+async function promptMain(sessionController, sessionId, text) {
+  await sessionController.prompt(
+    { requestId: randomUUID(), sessionId, mode: 'queue', content: [{ type: 'text', text }] },
+    new AbortController().signal,
+  )
+}
+
+/**
+ * Tell the recorded main session about interrupted dispatches, once per boot.
+ * Returns the number of interrupted dispatches it reported.
+ */
+export async function startupCheck(sessionController) {
+  const { mainSessionId } = await readState()
+  if (!isSessionId(mainSessionId)) return 0
+  const checkpoints = await listDispatchCheckpoints(storeRoot())
+  const notice = interruptedNotice(checkpoints)
+  if (notice === undefined) return 0
+  await promptMain(sessionController, mainSessionId, notice)
+  return checkpoints.length
+}
+
 export function apply(ctx) {
   ensureHome().catch((error) => {
     ctx.logger?.warn?.(`discipline-whale: could not create the whale home: ${error?.message ?? error}`)
   })
   // Only the Web server carries the route; headless and SDK profiles skip it.
-  ctx.inject(['sessionController', 'connection', 'webServer'], (c) =>
-    c.connection.fetch.register({
+  ctx.inject(['sessionController', 'connection', 'webServer'], (c) => {
+    startupCheck(c.sessionController).catch((error) => {
+      ctx.logger?.warn?.(`discipline-whale: startup check failed: ${error?.message ?? error}`)
+    })
+    return c.connection.fetch.register({
       path: HOME_ROUTE,
       methods: ['GET', 'POST'],
       requestBody: 'buffered',
       fetch: homeHandler(c.sessionController),
-    }),
-  )
+    })
+  })
 }
