@@ -212,7 +212,14 @@ const execAs = (sessionId) => ({ agent: { session: { id: sessionId } } })
 
 {
   const { tools } = mount(workerRow)
-  assert.deepEqual([...tools.keys()], ['report_to_main'], 'the worker gets exactly one tool')
+  // Two tools, and the pair is the point: report (finish upward) and ask (file a
+  // question upward). `ask_main` is NOT a power — it writes a question file and
+  // returns; it cannot dispatch, enumerate workspaces, or read a report.
+  assert.deepEqual(
+    [...tools.keys()].sort(),
+    ['ask_main', 'report_to_main'],
+    'the worker gets exactly the two upward tools: report and ask',
+  )
   // `list_dispatches` is a main-session board: a worker that could read the
   // dispatch board would learn about other workers' tasks. It must stay absent.
   for (const forbidden of [

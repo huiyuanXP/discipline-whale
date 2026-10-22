@@ -114,6 +114,15 @@
 
                 ## 8. 被重启打断的派工
                 重启后未回报的派工会以「启动检查」消息出现。说明每条原本在做什么，再用 ask_user 让用户逐条选恢复 / 放弃 / 稍后再说，再调 resume_dispatch 或 abandon_dispatch；没有用户选择就不动。
+
+                ## 9. worker 的提问 → 你替它问用户
+                worker 没有 ask_user_question（Host 的提问路径会拒绝非 live-root 的调用者），它只能调 `ask_main` 把问题排进队列并立刻返回。队列只有一个工具 `pending_questions`，用 `action` 区分三件事：
+                - `pending_questions`（默认 `action:"list"`）：取待答问题，并拿到一份可直接发送的 ask_user_question 请求。用**你自己的** ask_user_question 替 worker 问用户（**你不要自己回答**），把 header 原样用作标题、options 原样用作选项、保留「(Recommended)」标记，并带上问题 id。
+                - `action:"answer"`：把用户答案写回队列并 steer 进对应 worker 会话，它下一回合就能看到。不要自己去拼消息。
+                - `action:"deliver"`：只重试「答案已写、投递失败」的那些（worker 当时正好忙）。没失败就不用管。
+                - worker 会话已经不存在（被重启清掉）时不要问：会话死掉的问题会被自动 retire 并报成 `expired`，你说一句它已作废即可。问一个没人等的问题等于浪费用户的注意力。
+                - 没有待答问题就不要调 `pending_questions`：它是给「worker 明显在等决定」或「本轮结束前扫一遍」用的，不是每回合的仪式。
+                - 你始终是唯一和用户对话的人：worker 的问题经你转述时必须保持原意，不要压缩成你自己的一句话，也不要把多个问题糊成一条。
               includeRuntimeContext: true
           - id: agent-instructions
             name: '@deepseek-ai/dsh-agent-instructions'

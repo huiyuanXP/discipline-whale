@@ -36,6 +36,7 @@ import {
   storeRoot,
   writeReport,
 } from './store.js'
+import { newQuestion, writeQuestion } from './questions.js'
 
 /* ------------------------------------------------------------------ *
  * dispatch checkpoints: surviving a Host restart
@@ -219,6 +220,123 @@ const NOTICE_SOURCE = Object.freeze({
   form: 'notice',
   summary: 'Discipline Whale report enforcement',
 })
+
+/* ------------------------------------------------------------------ *
+ * asking upward: the question queue, from the worker's side
+ * ------------------------------------------------------------------ */
+
+/**
+ * File a question for the main session and return at once.
+ *
+ * NOT `ask_user_question`, and that is the whole point. The Host's asking path
+ * is `ctx.userQuestions.ask()`, which calls `assertLiveRoot` first and throws
+ * `DELEGATED_CALLER` for any agent owned by another live agent
+ * (`@deepseek-ai/dsh-user-questions` lib/index.js:534). A worker is exactly
+ * that case, so a child that called the real asking tool would get an error
+ * instead of an answer — and would burn a turn discovering it.
+ *
+ * So the worker writes the question down and returns. The main session reads
+ * the queue, asks the user with its own live-root call, and steers the answer
+ * back into this Session as an ordinary user message. From the worker's side
+ * the answer simply arrives.
+ *
+ * The question is NOT durable across a Host restart in the sense that the worker
+ * gets resumed for it: the file survives, so the answer still routes, but a
+ * worker that has been disposed cannot be woken by a file. That failure is why
+ * the main side retires a question whose Session is gone instead of asking it.
+ */
+function askMainTool(ctx, config) {
+  const root = () => config.questionsRoot ?? storeRoot()
+  return {
+    name: 'ask_main',
+    description:
+      'Ask the main session a question and get an answer on a later turn. Use this when you genuinely cannot proceed without a decision or missing fact from the user: a choice between approaches, a value only they know, permission for something irreversible. Do NOT use it for a status update, for something you can verify yourself, or to acknowledge an answer you already received. The call returns immediately with a question id; the question goes on a queue the main session reads, and the user\'s answer is delivered back into this session as a user message. Because it returns at once, continue with any work that does not depend on the answer, then call `report_to_main` with what you have if no answer has arrived — the main session can resume you with it.',
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      required: ['question'],
+      properties: {
+        question: {
+          type: 'string',
+          description: 'The specific question, in the user\'s terms — no internal jargon, no background they have to reconstruct.',
+        },
+        header: { type: 'string', description: 'Optional short heading, such as "Confirm" or "Choose approach".' },
+        options: {
+          type: 'array',
+          description: 'Optional choices. Put the recommended one first and append " (Recommended)" to its label. Omit to ask an open question.',
+          items: {
+            type: 'object',
+            additionalProperties: true,
+            properties: {
+              label: { type: 'string', description: 'Short user-facing option label.' },
+              description: { type: 'string', description: 'One sentence explaining the tradeoff.' },
+            },
+          },
+        },
+        multi_select: { type: 'boolean', description: 'Whether the user may pick more than one option.' },
+        expires_in_minutes: {
+          type: 'number',
+          description: 'How long the question stays answerable. Default 360 minutes (6 hours). After that it is expired rather than asked.',
+        },
+      },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['id', 'status', 'workerSessionId'],
+        properties: {
+          id: { type: 'string', description: 'Queue id. The answer that comes back names this id.' },
+          status: { type: 'string', enum: ['pending'] },
+          workerSessionId: { type: 'string' },
+          expiresAt: { type: 'number', description: 'Epoch ms; past this the question is expired, not asked.' },
+        },
+      },
+      render: (_args, value) => [{ type: 'text', text: JSON.stringify(value, null, 2) }],
+    },
+    presentCall: (args) => ({
+      card: 'generic',
+      title: 'Ask the main session',
+      kind: 'other',
+      rawInput: args.header ?? args.question,
+    }),
+    async execute(args, exec) {
+      const workerSessionId = String(exec?.agent?.session?.id ?? '').trim()
+      if (workerSessionId === '') {
+        throw new Error('this Session has no id, so a question could not be routed back to it')
+      }
+      const minutes = Number(args.expires_in_minutes)
+      const ttl =
+        Number.isFinite(minutes) && minutes > 0 ? Math.min(minutes, 60 * 24 * 30) * 60 * 1000 : undefined
+
+      // Route by the dispatch when one is known: the workspace title is what
+      // lets the main session tell the user WHICH task is blocked, and the
+      // dispatch record is where that fact lives. Both lookups are optional.
+      let dispatch = dispatchForWorker(workerSessionId)
+      if (dispatch === undefined) dispatch = await recoverDispatch(workerSessionId)
+
+      const record = newQuestion({
+        workerSessionId,
+        ...(dispatch?.mainSessionId === undefined ? {} : { mainSessionId: dispatch.mainSessionId }),
+        ...(dispatch?.workspaceId === undefined ? {} : { workspaceId: dispatch.workspaceId }),
+        ...(dispatch?.workspaceTitle === undefined ? {} : { workspaceTitle: dispatch.workspaceTitle }),
+        ...(dispatch?.dispatchId === undefined ? {} : { dispatchId: dispatch.dispatchId }),
+        ...(args.header === undefined ? {} : { header: args.header }),
+        question: args.question,
+        options: args.options,
+        multiSelect: args.multi_select === true,
+        ...(ttl === undefined ? {} : { expiresAt: Date.now() + ttl }),
+      })
+      await writeQuestion(root(), record)
+      return {
+        id: record.id,
+        status: 'pending',
+        workerSessionId: record.workerSessionId,
+        expiresAt: record.expiresAt,
+      }
+    },
+  }
+}
 
 function reportToMainTool(ctx, config) {
   return {
@@ -679,7 +797,15 @@ export const Config = {
       if (!Number.isInteger(raw) || raw < 0) {
         return { issues: [{ message: 'maxReportRetries must be a non-negative integer', path: ['maxReportRetries'] }] }
       }
-      return { value: { maxReportRetries: raw } }
+      // `questionsRoot` is a test/hand-written-invocation hook: it pins where the
+      // question queue lives so a test does not have to write into $DSH_HOME. It
+      // is carried through rather than dropped, or a caller that set it would be
+      // silently writing somewhere else.
+      const root = input.questionsRoot
+      if (root !== undefined && (typeof root !== 'string' || root === '')) {
+        return { issues: [{ message: 'questionsRoot must be a non-empty string', path: ['questionsRoot'] }] }
+      }
+      return { value: { maxReportRetries: raw, ...(root === undefined ? {} : { questionsRoot: root }) } }
     },
   },
 }
@@ -690,8 +816,12 @@ export function apply(ctx, config = {}) {
       Number.isInteger(config.maxReportRetries) && config.maxReportRetries >= 0
         ? config.maxReportRetries
         : DEFAULT_MAX_REPORT_RETRIES,
+    ...(typeof config.questionsRoot === 'string' && config.questionsRoot !== ''
+      ? { questionsRoot: config.questionsRoot }
+      : {}),
   }
 
+  ctx.effect(() => ctx.tools.register(askMainTool(ctx, resolved)))
   ctx.effect(() => ctx.tools.register(reportToMainTool(ctx, resolved)))
   registerEnforcement(ctx, resolved)
 }

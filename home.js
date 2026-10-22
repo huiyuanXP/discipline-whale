@@ -34,6 +34,7 @@ import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 
 import { listDispatchCheckpoints } from './checkpoint.js'
+import { installQuestionTool } from './question-host.js'
 import { registerMemoryRoutes } from './memory-routes.js'
 import { dataDir, storeRoot, whaleHomeDir } from './store.js'
 import { registerVoiceRoutes } from './voice.js'
@@ -178,6 +179,15 @@ export async function startupCheck(sessionController) {
 export function apply(ctx) {
   ensureHome().catch((error) => {
     ctx.logger?.warn?.(`discipline-whale: could not create the whale home: ${error?.message ?? error}`)
+  })
+  // The question queue's main-session half. Installed here, not in `main.js`,
+  // for two reasons: this row is already the profile-level one that owns the
+  // main session's plumbing (`state.json`, the startup check, voice), and the
+  // tool is registered on the MAIN AGENT'S scope rather than globally, so it
+  // needs the agent lifecycle, which this row can observe. See
+  // `question-host.js` for the two Host facts it rests on.
+  ctx.inject(['tools', 'sessionController'], (c) => {
+    installQuestionTool(c)
   })
   // Only the Web server carries the routes; headless and SDK profiles skip them.
   ctx.inject(['sessionController', 'connection', 'webServer'], (c) => {
