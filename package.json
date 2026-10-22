@@ -1,6 +1,6 @@
 {
   "name": "discipline-whale",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "Discipline Whale for DeepSeek Harness: one main conversation routes work into workspaces, workers report back as pushed messages, and a turn-end check makes the report contract real.",
   "license": "MIT",
   "author": "huiyuanXP",
@@ -56,6 +56,7 @@
     "README.md",
     "LICENSE",
     "prompt-probe.mjs",
+    "scripts/*.mjs",
     "test/*.mjs",
     "skills/**/*.md"
   ],
@@ -84,13 +85,19 @@
     "test:voice": "node test/voice.mjs",
     "test:client": "node test/client.mjs",
     "test:guard": "node test/guard.mjs",
-    "test:all": "node test/contract.mjs && node test/guard.mjs && node test/adhd.mjs && node test/voice.mjs && node test/client.mjs && node test/dock.mjs && node test/settings.mjs && node test/report-head.mjs && npm run test:memory",
+    "test:all": "node test/contract.mjs && node test/guard.mjs && node test/adhd.mjs && node test/voice.mjs && node test/client.mjs && node test/dock.mjs && node test/settings.mjs && node test/report-head.mjs && npm run test:memory && node test/report-origin.mjs && node test/report-origin-client.mjs && node test/context-audit.mjs && node test/tool-whitelist.mjs",
     "test:smoke": "node test/smoke-restart.mjs",
     "test:dock": "node test/dock.mjs",
     "test:settings": "node test/settings.mjs",
     "test:adhd": "node test/adhd.mjs",
     "test:report-head": "node test/report-head.mjs",
-    "test:memory": "node test/memory.mjs && node test/activity.mjs && node test/memory-flush.mjs && node test/dream.mjs && node test/pruner.mjs && node test/memory-integration.mjs && node test/memory-wiring.mjs && node test/client-memory.mjs"
+    "test:memory": "node test/memory.mjs && node test/activity.mjs && node test/memory-flush.mjs && node test/dream.mjs && node test/pruner.mjs && node test/memory-integration.mjs && node test/memory-wiring.mjs && node test/client-memory.mjs",
+    "test:report-origin": "node test/report-origin.mjs && node test/report-origin-client.mjs",
+    "test:context-audit": "node test/context-audit.mjs",
+    "audit:context": "node scripts/context-audit.mjs",
+    "audit:restrict": "node scripts/tools-restrict-probe.mjs",
+    "test:tool-whitelist": "node test/tool-whitelist.mjs",
+    "audit:whitelist": "node scripts/whitelist-effect.mjs"
   },
   "dsh": {
     "bundle": {

@@ -1120,6 +1120,188 @@ function abandonDispatchTool() {
 }
 
 /* ------------------------------------------------------------------ *
+ * tool whitelist
+ * ------------------------------------------------------------------ */
+
+/**
+ * Host-inherited tools the main session must NOT see.
+ *
+ * The main session dispatches work and draws its own UI; it does not author
+ * office documents or produce media. Every name here is a tool that produces a
+ * file or a media artefact, so keeping it only widens the surface the model has
+ * to read on every request — the main session's tool schemas were the single
+ * largest block of its resident context (51% of 34.2k tokens, measured).
+ *
+ * NOT in this list, on purpose:
+ *   * the `render_*` / `*_ui` family — the user requires the main session to
+ *     keep its own drawing board (`docs/context-audit.md`);
+ *   * the dispatch tools — this plugin registers them in the preset's OWN
+ *     scope, so `tools.restrict()` cannot filter them even if named here
+ *     (`dsh-tools`: a restriction filters what a scope INHERITS, never what its
+ *     own layer registers);
+ *   * developer tooling (LSP, session recall, team tasks). Removing those is a
+ *     separate decision the user has not made, and this row must not make it
+ *     silently.
+ *
+ * A name absent from a given profile is skipped at install time rather than
+ * failing the mount — see {@link installToolWhitelist}.
+ */
+export const HOST_TOOL_DENY = Object.freeze([
+  // PowerPoint
+  'ppt_create',
+  'ppt_read',
+  // Word
+  'word_create',
+  'word_read',
+  'word_update',
+  // Excel
+  'excel_create',
+  'excel_read',
+  'excel_update',
+  // Video and speech — production and inspection alike
+  'render_video',
+  'preview_video',
+  'process_video',
+  'inspect_video',
+  'synthesize_voice',
+])
+
+/**
+ * Row-config keys this module's whitelist reads.
+ *
+ * Exported and imported by the config schema for the same reason the guard and
+ * brevity key lists are: a hand-copied list silently drops a key the resolver
+ * honours, and no test notices when every test calls the resolver directly.
+ */
+export const TOOL_WHITELIST_CONFIG_KEYS = Object.freeze(['toolWhitelist', 'toolDeny'])
+
+/**
+ * Names the main session keeps even when a host tool would otherwise be denied.
+ *
+ * Kept as an explicit list rather than "everything not denied" so the intent is
+ * readable: a future deny entry that collides with one of these is a mistake the
+ * test suite catches (`test/tool-whitelist.mjs`: the deny list has no overlap
+ * with this one).
+ */
+export const MAIN_TOOL_ALLOW_EXTRA = Object.freeze([
+  // Dynamic UI — the drawing board this preset must keep.
+  'render_ui',
+  'render_canvas',
+  'render_scene',
+  'render_text',
+  'render_mechanism',
+  'inspect_ui',
+  'patch_ui',
+  'update_ui',
+  'validate_ui',
+  'ui_catalog',
+  // The main session's own work.
+  'ask_user_question',
+  'read',
+  'read_image',
+  'grep',
+  'glob',
+  'web_search',
+  'web_fetch',
+  'todo_write',
+  'skill',
+  'present',
+  'remember',
+  'update_instructions',
+  'working_directory',
+])
+
+/**
+ * Resolve the whitelist config for one row.
+ *
+ * `deny` is additive to {@link HOST_TOOL_DENY}: a deployment can cut more, and
+ * must not be able to quietly re-enable a document producer by supplying its own
+ * list. Passing `enabled: false` turns the whole restriction off and is the
+ * documented rollback.
+ *
+ * @param {object} config - the row config.
+ * @returns {{enabled: boolean, deny: string[]}}
+ */
+export function resolveToolWhitelist(config = {}) {
+  const enabled = config.toolWhitelist !== false
+  const extra = Array.isArray(config.toolDeny) ? config.toolDeny : []
+  const deny = [...new Set([...HOST_TOOL_DENY, ...extra.filter((name) => typeof name === 'string')])]
+  const allowExtra = [...MAIN_TOOL_ALLOW_EXTRA]
+  // An allow-extra name must never also be denied; the deny list wins nothing
+  // here, it is simply removed so the two lists cannot contradict each other.
+  const allowed = new Set(allowExtra)
+  return { enabled, deny: deny.filter((name) => !allowed.has(name)) }
+}
+
+/**
+ * Install the main session's tool restriction.
+ *
+ * SCOPE-ONLY BY CONSTRUCTION: `tools.restrict()` throws on an unscoped context
+ * ("a context-global restriction would mask every agent"), and this function is
+ * only ever called from inside the preset row's `apply`, so the restriction
+ * lands in the preset's own layer. Sibling presets, plain coding sessions, the
+ * worker preset and the global view keep their full surface — proved by
+ * `test/tool-whitelist.mjs`.
+ *
+ * UNKNOWN NAMES ARE SKIPPED, NOT FATAL. `restrict()` rejects a name it cannot
+ * find among the inherited tools, and a profile need not install every bundle
+ * this list mentions. Intersecting with the live `restrictableNames` first keeps
+ * a thin profile mountable; the alternative is a preset that fails to mount
+ * because an office plugin is missing.
+ *
+ * @param {object} ctx - the preset row's context (must be scoped).
+ * @param {{enabled: boolean, deny: string[]}} resolved - from {@link resolveToolWhitelist}.
+ * @returns {void}
+ */
+export function installToolWhitelist(ctx, resolved) {
+  // `enabled` is the resolver's rollback switch; a bare `{deny}` is treated as
+  // enabled so this stays usable from a test or a hand-written call site.
+  if (resolved?.enabled === false) return
+  if (!Array.isArray(resolved?.deny) || resolved.deny.length === 0) return
+  const scope = ctx.tools?.view === undefined ? undefined : ctx
+  // The scope tag lives on the context; `view()` takes the tag, not the context.
+  const key = typeof scopeOfContext === 'function' ? scopeOfContext(scope) : undefined
+  if (key === undefined) {
+    // No scope: refuse rather than throw, because a preset mounted without one
+    // is a composition problem the caller should see as a warning, and a global
+    // restriction would mask every agent.
+    ctx.logger?.warn?.('discipline-whale: tool whitelist needs a scoped context; skipped')
+    return
+  }
+  const known = ctx.tools.view(key).restrictableNames
+  const deny = resolved.deny.filter((name) => known.has(name))
+  if (deny.length === 0) return
+  ctx.effect(() => ctx.tools.restrict({ deny }), 'discipline-whale.toolWhitelist()')
+}
+
+/**
+ * Read a scope tag off a context without importing `dsh-scope`.
+ *
+ * This package installs with no dependencies, so `@deepseek-ai/dsh-scope` is not
+ * resolvable from here. The tag is a symbol the service itself reads through
+ * `scopeOf`; the public, dependency-free equivalent is to ask the tools service,
+ * whose `view(ctx)` is documented to take a scope — but it accepts the KEY. The
+ * key is reachable as the symbol-tagged property the scope module brands onto
+ * the context, so this walks the context's own symbols for rather than guessing
+ * a name.
+ *
+ * @param {object} ctx - a possibly scoped context.
+ * @returns {object|undefined} the scope key, or undefined when unscoped.
+ */
+function scopeOfContext(ctx) {
+  if (ctx === undefined || ctx === null) return undefined
+  for (const symbol of Object.getOwnPropertySymbols(ctx)) {
+    if (symbol.description === 'dsh.scope') return ctx[symbol]
+  }
+  // `extend()` copies the tag onto a fresh context object; inherited symbols are
+  // still reachable through the prototype chain.
+  for (const symbol of Object.getOwnPropertySymbols(Object.getPrototypeOf(ctx) ?? {})) {
+    if (symbol.description === 'dsh.scope') return ctx[symbol]
+  }
+  return undefined
+}
+
+/* ------------------------------------------------------------------ *
  * activation
  * ------------------------------------------------------------------ */
 
@@ -1156,7 +1338,7 @@ export const Config = {
       // list makes that class of omission impossible for a key the resolver
       // reads, and `test/adhd.mjs` ok 13 fails if the two ever diverge.
       const carried = {}
-      for (const key of [...GUARD_CONFIG_KEYS, ...BREVITY_CONFIG_KEYS]) {
+      for (const key of [...GUARD_CONFIG_KEYS, ...BREVITY_CONFIG_KEYS, ...TOOL_WHITELIST_CONFIG_KEYS]) {
         // `0` and `false` are real values, so the test is `!== undefined`,
         // never truthiness.
         if (input[key] !== undefined) carried[key] = input[key]
@@ -1194,4 +1376,9 @@ export function apply(ctx, config = {}) {
   // Separate module, separate listeners: the guard counts *reads*, this counts
   // *characters*, and neither may gate the other.
   installBrevity(ctx, config)
+
+  // The tool whitelist lives here, not in a separate row, because `restrict()`
+  // is scope-bound: it must be called on the PRESET's context, and this module's
+  // `apply` is the only function that runs inside that scope.
+  installToolWhitelist(ctx, resolveToolWhitelist(config))
 }

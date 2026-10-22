@@ -215,6 +215,10 @@ window.__ModuleLoader__.load({
         workspaceDot: "工作区：{title}",
         tagOpen: "打开 {title} 的会话",
         tagNoSession: "{title}（这个 turn 没有对应的会话）",
+        reportOrigin: "来源工作区：{title}",
+        reportOriginUnknown: "未知来源",
+        reportOriginHint: "这条推送来自工作区会话，不是你自己发的消息。",
+        tagTurnOrigin: "发送到 {titles}",
         newMain: "新建主会话",
         newMainBusy: "正在新建…",
         newMainFailed: "新建主会话失败：{reason}",
@@ -345,6 +349,10 @@ window.__ModuleLoader__.load({
         workspaceDot: "Workspace: {title}",
         tagOpen: "Open the {title} session",
         tagNoSession: "{title} (no session found for this turn)",
+        reportOrigin: "From workspace: {title}",
+        reportOriginUnknown: "Unknown source",
+        reportOriginHint: "This push came from a workspace session, not from you.",
+        tagTurnOrigin: "Sent to {titles}",
         newMain: "New main session",
         newMainBusy: "Creating…",
         newMainFailed: "Could not create a main session: {reason}",
@@ -3444,7 +3452,7 @@ window.__ModuleLoader__.load({
     function installStyles() {
       const style = document.createElement("style");
       style.dataset.dshPlugin = "discipline-whale";
-      style.textContent = dockStyles();
+      style.textContent = [dockStyles(), reportRowStyles()].join("\n");
       document.head.appendChild(style);
       return () => style.remove();
     }
@@ -3461,6 +3469,7 @@ window.__ModuleLoader__.load({
     const MEMORY_WORKSPACES_ROUTE = "/api/discipline-whale/memory/workspaces";
     const MEMORY_TAGS_ROUTE = "/api/discipline-whale/memory/tags";
     const MEMORY_DISPATCHED_ROUTE = "/api/discipline-whale/memory/dispatched";
+    const MEMORY_REPORTS_ROUTE = "/api/discipline-whale/memory/reports";
     // Copied from activity.js PALETTE (the server's default workspace colors);
     // the browser half is a plain script and cannot import it.
     const WORKSPACE_PALETTE = ["#3B82F6", "#10B981", "#F59E0B", "#EF4444", "#8B5CF6", "#EC4899", "#14B8A6", "#F97316"];
@@ -3782,6 +3791,269 @@ window.__ModuleLoader__.load({
       return { "--dw-tag": color, "--dw-tag-fg": readableTextOn(color) };
     }
 
+    // ---- the workspace color on a message row ----------------------------
+    //
+    // A pushed Worker report arrives as an ordinary user message
+    // (`sessionController.prompt`, kind "user"), so the transcript gives it no
+    // workspace of its own. The `report id:` line in its text is the one
+    // durable handle on the workspace that wrote it: the row is resolved
+    // against the reports route and painted with that workspace's color, or
+    // left neutral and tagged "unknown" when the lookup misses. Nothing here
+    // touches DSH: the row keeps the Host's own renderer and only gains
+    // custom properties plus one tag element.
+
+    /** The workspace a report row came from, or `null` when it cannot be known. */
+    function reportOriginOf(payload) {
+      const report = payload?.report;
+      if (report === null || typeof report !== "object") return null;
+      if (typeof report.workspaceId !== "string" || report.workspaceId === "") return null;
+      if (typeof report.color !== "string" || !WORKSPACE_COLOR_PATTERN.test(report.color)) return null;
+      const title = typeof report.workspaceTitle === "string" && report.workspaceTitle !== "" ? report.workspaceTitle : report.workspaceId;
+      return { workspaceId: report.workspaceId, title, color: report.color };
+    }
+
+    /**
+     * The report id inside one pushed report message, or `null`.
+     *
+     * Mirrors `memory-routes.js#reportIdOf`: the id is read from the same
+     * `report id:` line a human reads, so a message that merely mentions
+     * `read_report` is not a report row.
+     */
+    function reportIdOfText(text) {
+      if (typeof text !== "string" || text === "") return null;
+      const match = /\breport id:\s*(\S+)/i.exec(text);
+      return match === null ? null : match[1];
+    }
+
+    /**
+     * The origin lookup, shared by every report row on the page: one request
+     * per report id, kept for the life of the page. A failed read answers
+     * `null` and is not cached, so a later row asks again.
+     */
+    function createReportOriginStore(deps) {
+      const options = deps || {};
+      const request = (url) => (typeof options.fetch === "function" ? options.fetch : fetch)(url, { cache: "no-store" });
+      const answers = new Map();
+      const inflight = new Map();
+
+      function resolve(reportId) {
+        const id = typeof reportId === "string" ? reportId : "";
+        if (id === "") return Promise.resolve(null);
+        if (answers.has(id)) return Promise.resolve(answers.get(id));
+        if (inflight.has(id)) return inflight.get(id);
+        const running = (async () => {
+          try {
+            const response = await request(`${MEMORY_REPORTS_ROUTE}?id=${encodeURIComponent(id)}`);
+            if (!response.ok) return null;
+            const origin = reportOriginOf(await response.json());
+            if (origin !== null) answers.set(id, origin);
+            return origin;
+          } catch (_error) {
+            return null;
+          } finally {
+            inflight.delete(id);
+          }
+        })();
+        inflight.set(id, running);
+        return running;
+      }
+
+      return { resolve };
+    }
+
+    /** The page's one origin lookup, shared by every report row. */
+    const reportOriginStore = createReportOriginStore();
+
+    /**
+     * The stylesheet for a report row.
+     *
+     * The tint is the workspace color mixed with the theme surface, so one
+     * rule reads correctly in the light and the dark theme and the text keeps
+     * the theme's own label color. No literal color is written here: a theme
+     * change repaints the tint without a code change.
+     *
+     * The tag is a `::before` on the row, not an inserted element: React owns
+     * that DOM, and a node this package added there would be reconciled away
+     * on the next render. An attribute plus `attr()` survives re-renders
+     * because React never diffs attributes it did not set.
+     */
+    function reportRowStyles() {
+      return [
+        // The source tag above the bubble, in the workspace color, naming the
+        // workspace. `align-self` keeps it on the row's own edge.
+        "[data-dw-report-origin]{position:relative}",
+        "[data-dw-report-origin]::before{",
+        "content:attr(data-dw-ws-tag);",
+        "display:block;margin:0 0 4px;padding-left:14px;position:relative;",
+        "font:inherit;font-size:11px;line-height:1.5;letter-spacing:0;",
+        "color:var(--dsw-alias-label-tertiary,var(--dw-fg-3));",
+        "}",
+        "[data-dw-report-origin]::before{",
+        "background-image:radial-gradient(circle at 4px 50%,var(--dw-msg-ws,currentColor) 0 3.5px,transparent 3.5px);",
+        "}",
+        // The bubble paint. A row without an origin carries no attribute, so
+        // it keeps exactly the background the Host drew.
+        "[data-dw-report-origin] [class*=_bubble]{",
+        "background:color-mix(in srgb,var(--dw-msg-ws,transparent) 14%,var(--dsw-specific-bubble,var(--dsw-alias-bg-base,transparent)));",
+        "box-shadow:inset 0 0 0 1px color-mix(in srgb,var(--dw-msg-ws,transparent) 38%,transparent);",
+        "}",
+        // An unknown origin: a neutral tag and no tint at all.
+        "[data-dw-report-origin][data-dw-ws-unknown]::before{",
+        "background-image:radial-gradient(circle at 4px 50%,var(--dsw-alias-label-caption,var(--dw-fg-3)) 0 3.5px,transparent 3.5px);",
+        "}",
+        "[data-dw-report-origin][data-dw-ws-unknown] [class*=_bubble]{background:revert;box-shadow:revert}",
+        // A user turn that dispatched: the same tag, on the row that caused it.
+        "[data-dw-turn-ws]{position:relative}",
+        "[data-dw-turn-ws]::before{",
+        "content:attr(data-dw-ws-tag);",
+        "display:block;margin:0 0 4px;padding-left:14px;",
+        "font:inherit;font-size:11px;line-height:1.5;text-align:right;",
+        "color:var(--dsw-alias-label-tertiary,var(--dw-fg-3));",
+        "background-image:radial-gradient(circle at calc(100% - 3.5px) 50%,var(--dw-msg-ws,currentColor) 0 3.5px,transparent 3.5px);",
+        "}",
+        "[data-dw-turn-ws] [class*=_bubble]{",
+        "background:color-mix(in srgb,var(--dw-msg-ws,transparent) 14%,var(--dsw-specific-bubble,var(--dsw-alias-bg-base,transparent)));",
+        "box-shadow:inset 0 0 0 1px color-mix(in srgb,var(--dw-msg-ws,transparent) 38%,transparent);",
+        "}",
+      ].join("\n");
+    }
+
+    /**
+     * Keep every report row painted as the transcript renders.
+     *
+     * The Host streams rows in and re-renders them freely, so a one-shot pass
+     * would miss anything that mounts later. The observer walks only added
+     * subtrees, and `decorateReportRows` claims a row once, so a re-render
+     * costs a selector query and writes nothing.
+     *
+     * @returns {() => void} teardown
+     */
+    function watchReportRows({ t, store, reports } = {}) {
+      if (typeof document === "undefined") return () => {};
+      const decorate = (scope) => {
+        // Both passes are decoration: a failed one must never break the
+        // transcript, and each claims its own rows so the two never fight.
+        try {
+          decorateReportRows(scope, { t, store: reports ?? store });
+        } catch (_error) {
+          // ignore: a row that fails to paint keeps the Host's own styling
+        }
+        try {
+          decorateTurnTags(scope, { t, store });
+        } catch (_error) {
+          // ignore: same
+        }
+      };
+      decorate(document);
+      // A turn's tags are read once it closes, so a store change repaints the
+      // rows already on screen.
+      if (typeof store?.subscribe === "function") store.subscribe(() => decorate(document));
+      if (typeof MutationObserver !== "function") return () => {};
+      const observer = new MutationObserver((records) => {
+        for (const record of records) {
+          for (const node of record.addedNodes) {
+            if (node?.nodeType === 1) decorate(node);
+          }
+        }
+      });
+      observer.observe(document.body, { childList: true, subtree: true });
+      return () => observer.disconnect();
+    }
+
+    /**
+     * Paint every report row under `scope` with its workspace color.
+     *
+     * Rows are found by the Host's own markers — a user-kind flow row — and
+     * claimed only when their text carries a `report id:`. Claiming writes
+     * attributes and custom properties only; it adds no nodes, so React's
+     * reconciliation of that subtree is untouched. A row is claimed once: the
+     * marker attribute is the claim, and a re-render keeps it.
+     *
+     * @returns {number} how many rows this pass claimed
+     */
+    function decorateReportRows(scope, { t, store } = {}) {
+      if (scope === null || typeof scope.querySelectorAll !== "function") return 0;
+      const rows = scope.querySelectorAll('[data-chat-flow-kind="user"]:not([data-dw-report-origin])');
+      let claimed = 0;
+      for (const row of rows) {
+        const text = typeof row.textContent === "string" ? row.textContent : "";
+        const reportId = reportIdOfText(text);
+        if (reportId === null) continue;
+        // Claim first, so a slow lookup never re-claims the same row.
+        row.setAttribute("data-dw-report-origin", "");
+        claimed += 1;
+        const paint = (origin) => {
+          if (origin === null) {
+            row.setAttribute("data-dw-ws-unknown", "");
+            row.setAttribute("data-dw-ws-tag", t === undefined ? "unknown" : t("reportOriginUnknown"));
+            return;
+          }
+          // `--dw-msg-ws` is what the stylesheet tints with; the tag text is an
+          // attribute so `attr()` can read it without a second element.
+          row.style.setProperty("--dw-msg-ws", origin.color);
+          row.setAttribute("data-dw-ws-tag", t === undefined ? origin.title : t("reportOrigin", { title: origin.title }));
+        };
+        const pending = store === undefined ? Promise.resolve(null) : store.resolve(reportId);
+        // A promise keeps the first paint synchronous only when it is already
+        // cached; otherwise the row paints on the microtask that follows.
+        if (typeof pending?.then === "function") void pending.then(paint, () => paint(null));
+        else paint(pending ?? null);
+      }
+      return claimed;
+    }
+
+    /**
+     * Paint the main session's own user rows with the color of the workspace
+     * their turn dispatched to.
+     *
+     * The tag used to hang under the assistant reply, at the end of the turn;
+     * it now sits on the user row that caused the dispatch, where the reader
+     * looks for "which workspace did this go to". A turn may name several
+     * workspaces: the first paints the row, and every one is named in the tag
+     * text, because a tint can carry only one color but the row caused all of
+     * them.
+     *
+     * @returns {number} how many rows this pass claimed
+     */
+    function decorateTurnTags(scope, { t, store } = {}) {
+      if (scope === null || typeof scope.querySelectorAll !== "function") return 0;
+      const snapshot = store === undefined ? undefined : store.getSnapshot();
+      // The tags of a turn are read once the turn closes, so the store is the
+      // one that knows them; ask it for the highest turn on screen. Reading is
+      // idempotent and coalesced, so calling it per pass is cheap.
+      if (typeof store?.loadMain === "function") void store.loadMain();
+      const rows = scope.querySelectorAll('[data-chat-flow-kind="user"]:not([data-dw-turn-ws])');
+      let claimed = 0;
+      for (const row of rows) {
+        const turn = Number.parseInt(row.getAttribute?.("data-chat-turn") ?? "", 10);
+        if (!Number.isInteger(turn)) continue;
+        const record = snapshot?.tags?.[snapshot?.mainSessionId]?.[turn];
+        // Ask for this turn's tags: a pass that runs before they land paints
+        // nothing, and the store's next publish repaints the row.
+        if (record === undefined && typeof store?.requestTags === "function" && typeof snapshot?.mainSessionId === "string") {
+          store.requestTags(snapshot.mainSessionId, turn);
+        }
+        const ids = Array.isArray(record?.workspaces)
+          ? [...new Set(record.workspaces.filter((id) => typeof id === "string" && id !== ""))]
+          : [];
+        // A report row is painted by its own origin; a plain turn with no tag
+        // keeps the Host's background.
+        if (ids.length === 0) continue;
+        const named = ids.map((id) => {
+          const workspace = workspaceOf(snapshot, id);
+          return typeof workspace?.title === "string" && workspace.title !== "" ? workspace.title : id;
+        });
+        const first = workspaceOf(snapshot, ids[0]);
+        row.setAttribute("data-dw-turn-ws", "");
+        if (first !== undefined && WORKSPACE_COLOR_PATTERN.test(String(first.color))) {
+          row.style.setProperty("--dw-msg-ws", first.color);
+        }
+        row.setAttribute("data-dw-ws-tag", t === undefined ? named.join(" · ") : t("tagTurnOrigin", { titles: named.join(" · ") }));
+        claimed += 1;
+      }
+      return claimed;
+    }
+
     /**
      * The chips under one main-session turn: one per tagged workspace, in the
      * record's order, each opening that workspace's session for this turn.
@@ -3928,6 +4200,16 @@ window.__ModuleLoader__.load({
       ctx.effect(installStyles, "discipline-whale: styles");
       ctx.effect(() => ctx.locale.register(NS, DICTIONARIES), "discipline-whale: dictionaries");
       const t = ctx.locale.bind(NS);
+      // Report rows: a pushed Worker report is an ordinary user row, so it is
+      // painted where the Host renders it. The observer watches the transcript
+      // for new rows and claims the ones that carry a report id. It writes
+      // attributes and custom properties only, never nodes, so the Host's
+      // reconciliation of that subtree is untouched. The memory store rides
+      // along for the turn tags and for the repaint a tag read triggers.
+      ctx.effect(
+        () => watchReportRows({ t, store: memoryStore, reports: reportOriginStore }),
+        "discipline-whale: message colors",
+      );
       const WhalePage = makeWhalePage(ctx, t);
       ctx.slots.inject("main", () =>
         ctx.slots.register({ name: "main", key: PANEL_ID }, WhalePage)
@@ -3944,23 +4226,13 @@ window.__ModuleLoader__.load({
           VoiceDock
         )
       );
-      // Workspace chips under each tagged turn of the main session. The seat
-      // is session-scoped: `inject` receives the conversation's session id.
+      // Workspace chips sit on the user row that caused the dispatch, painted
+      // by `decorateTurnTags` — not under the assistant reply. The turnTail
+      // seat is deliberately not registered any more: a turn's tags belong to
+      // the message that opened it.
       const openSession = (sessionId) => {
         if (typeof ctx.uiWorkspace?.openSession === "function") ctx.uiWorkspace.openSession(sessionId);
       };
-      ctx.slots.inject("conversation.chat.turnTail", () =>
-        ctx.slots.register(
-          {
-            name: "conversation.chat.turnTail",
-            id: "discipline-whale-tags",
-            order: TAG_TAIL_ORDER,
-            locale: NS,
-            inject: (sessionId) => ({ sessionId, openSession }),
-          },
-          makeTurnTags(memoryStore, t)
-        )
-      );
       // "New main session" in the main session's header.
       ctx.slots.inject("conversation.session.header.actions", () =>
         ctx.slots.register(
@@ -4017,6 +4289,12 @@ window.__ModuleLoader__.load({
     module.exports.createMemoryStore = createMemoryStore;
     module.exports.memoryStore = memoryStore;
     module.exports.readableTextOn = readableTextOn;
+    module.exports.reportOriginOf = reportOriginOf;
+    module.exports.reportIdOfText = reportIdOfText;
+    module.exports.createReportOriginStore = createReportOriginStore;
+    module.exports.reportRowStyles = reportRowStyles;
+    module.exports.decorateReportRows = decorateReportRows;
+    module.exports.decorateTurnTags = decorateTurnTags;
     module.exports.turnTagsView = turnTagsView;
     module.exports.sessionDotView = sessionDotView;
     module.exports.workspaceColorsSection = workspaceColorsSection;

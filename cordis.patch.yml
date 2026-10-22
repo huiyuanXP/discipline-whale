@@ -137,6 +137,18 @@
               watchdogThreshold: 10
               maxInterventions: 2
               watchdogCounting: all
+              # Tool surface (main.js: HOST_TOOL_DENY). The main session draws
+              # its own Dynamic UI and dispatches work; it does not author
+              # office documents or produce media. Those tools are removed from
+              # THIS preset's scope only (`tools.restrict()` is scope-bound), so
+              # coding sessions, the worker preset and the host keep them.
+              #
+              #   toolWhitelist   false turns the whole restriction off (rollback)
+              #   toolDeny        extra names to cut, on top of HOST_TOOL_DENY
+              #
+              # Omit both keys to keep the built-in list. Measured on a real
+              # main session: 13 tools, 4,367 schema tokens, 12.8% of resident.
+              toolWhitelist: true
           # Output discipline (adhd.js): the ADHD ruleset as a prompt section,
           # the same file registered as the `whale-brevity` skill into this
           # preset's scope, a next-step reminder when a turn's prose runs long,

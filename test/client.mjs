@@ -515,7 +515,10 @@ delete globalThis.window
   }
   module.exports.apply(ctx)
   delete globalThis.document
-  assert.deepEqual(injected.sort(), ['conversation.chat.turnTail', 'conversation.session.header.actions', 'main', 'shell.overlay', 'sidebar.panellist', 'sidebar.session.row.leading'])
+  // The turn-tail seat is gone on purpose: a turn's workspace tags now sit on
+  // the user row that caused the dispatch (see test/report-origin-client.mjs),
+  // so no assistant-reply footer registers a slot.
+  assert.deepEqual(injected.sort(), ['conversation.session.header.actions', 'main', 'shell.overlay', 'sidebar.panellist', 'sidebar.session.row.leading'])
   const overlay = registered.find((entry) => entry.options.name === 'shell.overlay')
   assert.ok(overlay, 'the voice dock lives in shell.overlay so it survives navigation')
   assert.equal(overlay.options.id, 'discipline-whale-voice')

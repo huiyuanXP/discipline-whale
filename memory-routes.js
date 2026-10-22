@@ -6,6 +6,7 @@
  *   GET  /api/discipline-whale/memory/tags?sessionId=<main>
  *                                                  the main Session's tagged user turns
  *   GET  /api/discipline-whale/memory/dispatched   worker Session id → workspace id
+ *   GET  /api/discipline-whale/memory/reports      report id → the workspace that wrote it
  *
  * Every response is JSON with `cache-control: no-store`.
  *
@@ -19,6 +20,25 @@ import { listReports, storeRoot } from './store.js'
 export const MEMORY_WORKSPACES_ROUTE = '/api/discipline-whale/memory/workspaces'
 export const MEMORY_TAGS_ROUTE = '/api/discipline-whale/memory/tags'
 export const MEMORY_DISPATCHED_ROUTE = '/api/discipline-whale/memory/dispatched'
+export const MEMORY_REPORTS_ROUTE = '/api/discipline-whale/memory/reports'
+
+/** The `report id: <id>` line every pushed report carries, and its id. */
+const REPORT_ID_PATTERN = /\breport id:\s*(\S+)/i
+
+/**
+ * The report id inside one pushed report message, or `null`.
+ *
+ * The pushed text is the push contract the worker tool writes, so the id is
+ * read from the same line a human reads. Anything else is not a report.
+ *
+ * @param {string} text
+ * @returns {string | null}
+ */
+export function reportIdOf(text) {
+  if (typeof text !== 'string' || text === '') return null
+  const match = REPORT_ID_PATTERN.exec(text)
+  return match === null ? null : match[1]
+}
 
 const HEADERS = { 'cache-control': 'no-store' }
 
@@ -50,6 +70,24 @@ export async function dispatchIndex(root, workspaces) {
     }
   }
   return index
+}
+
+/**
+ * The report written under `reportId`, or `undefined`.
+ *
+ * Reports are stored per workspace (`reports/<workspace>/<id>.json`), so the
+ * id alone does not name a path; each workspace's folder is scanned. A report
+ * that a worker wrote but never delivered is still found here — which is the
+ * point: the row it pushed is the question, and the file is the answer.
+ */
+export async function findReport(root, workspaces, reportId) {
+  const wanted = String(reportId)
+  for (const workspace of workspaces) {
+    for (const report of await listReports(root, workspace.id).catch(() => [])) {
+      if (String(report?.id) === wanted) return report
+    }
+  }
+  return undefined
 }
 
 /**
@@ -112,6 +150,28 @@ export function memoryRoutesHandler({ workspaces = () => [], root = storeRoot } 
         for (const target of (await dispatchIndex(root(), listed)).values()) sessions[target.workerSessionId] = target.workspaceId
         return Response.json({ sessions }, { headers: HEADERS })
       }
+      if (url.pathname === MEMORY_REPORTS_ROUTE) {
+        // A pushed report is an ordinary user row in the transcript; the id in
+        // its own text is the only durable handle on the workspace that wrote
+        // it. A miss is a null answer, so the client can fall back to neutral.
+        const reportId = url.searchParams.get('id')
+        const found = reportId === null || reportId === '' ? undefined : await findReport(root(), listed, reportId)
+        if (found === undefined) return Response.json({ report: null }, { headers: HEADERS })
+        const cards = await readWorkspaceCards(root())
+        const workspace = listed.find((candidate) => String(candidate.id) === String(found.workspaceId))
+        const id = String(found.workspaceId)
+        return Response.json(
+          {
+            report: {
+              id: found.id,
+              workspaceId: id,
+              workspaceTitle: found.workspaceTitle ?? workspace?.title ?? null,
+              color: cards[id]?.color ?? defaultColor(id),
+            },
+          },
+          { headers: HEADERS },
+        )
+      }
       return Response.json({ error: 'not found' }, { status: 404, headers: HEADERS })
     } catch (error) {
       return Response.json({ error: String(error?.message ?? error) }, { status: 500, headers: HEADERS })
@@ -119,12 +179,13 @@ export function memoryRoutesHandler({ workspaces = () => [], root = storeRoot } 
   }
 }
 
-/** Register the three paths on the Host's web connection. */
+/** Register the four paths on the Host's web connection. */
 export function registerMemoryRoutes(connection, deps = {}) {
   const handler = memoryRoutesHandler(deps)
   return Promise.all([
     connection.fetch.register({ path: MEMORY_WORKSPACES_ROUTE, methods: ['GET', 'POST'], requestBody: 'buffered', fetch: handler }),
     connection.fetch.register({ path: MEMORY_TAGS_ROUTE, methods: ['GET'], requestBody: 'buffered', fetch: handler }),
     connection.fetch.register({ path: MEMORY_DISPATCHED_ROUTE, methods: ['GET'], requestBody: 'buffered', fetch: handler }),
+    connection.fetch.register({ path: MEMORY_REPORTS_ROUTE, methods: ['GET'], requestBody: 'buffered', fetch: handler }),
   ])
 }
