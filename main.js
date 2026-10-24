@@ -424,8 +424,10 @@ function dispatchTaskTool(ctx, config) {
         startedAt: new Date().toISOString(),
         // Routing facts for the continuation rule. `topic` is what makes "the
         // same job" decidable rather than a judgement call; `writes` is what
-        // keeps two live Sessions out of one tree.
+        // keeps two live Sessions out of one tree. `topic` and `title` also
+        // label the dispatch's report, through the checkpoint.
         ...(topic === undefined ? {} : { topic }),
+        ...(title === undefined ? {} : { title: appliedTitle ?? title }),
         ...(writes.length === 0 ? {} : { writes }),
       })
       // Tag the user message that caused this dispatch with its workspace.
@@ -1069,6 +1071,8 @@ function resumeDispatchTool(ctx) {
         workerSessionId: checkpoint.workerSessionId,
         workspaceId: checkpoint.workspaceId,
         workspaceTitle: checkpoint.workspaceTitle,
+        ...(checkpoint.topic === undefined ? {} : { topic: checkpoint.topic }),
+        ...(checkpoint.title === undefined ? {} : { title: checkpoint.title }),
         task: '(resumed after a restart)',
         startedAt: checkpoint.startedAt,
       })

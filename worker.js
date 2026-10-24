@@ -30,6 +30,8 @@ import {
   retriesFor,
 } from './registry.js'
 import { setWorkspaceIntro } from './activity.js'
+import { PUSH_PREFIXES } from './pushes.js'
+import { currentMainFor } from './state.js'
 import {
   MAX_DOCUMENT_CHARS,
   boundSummary,
@@ -124,6 +126,8 @@ async function recoverDispatch(workerSessionId) {
     workerSessionId,
     workspaceId: stored.workspaceId,
     workspaceTitle: stored.workspaceTitle,
+    ...(stored.topic === undefined ? {} : { topic: stored.topic }),
+    ...(stored.title === undefined ? {} : { title: stored.title }),
     startedAt: stored.startedAt,
     recoveredFrom: 'checkpoint',
   })
@@ -462,6 +466,11 @@ function reportToMainTool(ctx, config) {
         dispatchId: dispatch.dispatchId,
         workspaceId: dispatch.workspaceId,
         workspaceTitle: dispatch.workspaceTitle,
+        // What the main session called this dispatch; the label is what the
+        // index, the workspace note and the rotation seed show for it.
+        topic: dispatch.topic,
+        title: dispatch.title,
+        label: dispatch.title || dispatch.topic || '',
         workerSessionId,
         mainSessionId: dispatch.mainSessionId,
         status: 'reported',
@@ -499,16 +508,19 @@ function reportToMainTool(ctx, config) {
         }
       } else {
         try {
+          // The dispatching main session may have rotated since: the push goes
+          // to whichever Session continues it now.
+          const target = await currentMainFor(dispatch.mainSessionId, storeRoot())
           await ctx.sessionController.prompt(
             {
               requestId: randomUUID(),
-              sessionId: dispatch.mainSessionId,
+              sessionId: target,
               mode: 'queue',
               content: [
                 {
                   type: 'text',
                   text: [
-                    `[Discipline Whale] Worker report — ${dispatch.workspaceTitle} (${outcome})`,
+                    `${PUSH_PREFIXES.report}${dispatch.workspaceTitle} (${outcome})`,
                     '',
                     report.summary,
                     '',
@@ -520,7 +532,7 @@ function reportToMainTool(ctx, config) {
             },
             signalOf(exec),
           )
-          report.deliveredTo = [dispatch.mainSessionId]
+          report.deliveredTo = [target]
           report.status = 'delivered'
           await writeReport(storeRoot(), report)
           delivered = true
@@ -643,22 +655,24 @@ export function registerEnforcement(ctx, config) {
       // `report_to_main` keeps it. Delivery removes the file; nothing else does.
       if (dispatch.mainSessionId !== undefined) {
         const text = [
-          `[Discipline Whale] Worker failed to report — ${dispatch.workspaceTitle}`,
+          `${PUSH_PREFIXES.failed}${dispatch.workspaceTitle}`,
           '',
           `Worker session ${sessionId} closed ${attempts - 1} turn(s) without calling report_to_main.`,
           'The task may be incomplete. Open that session to inspect what actually happened,',
           'or re-dispatch with a clearer brief.',
         ].join('\n')
         // Fire and forget: a failed escalation must never break this worker's turn.
-        ctx.sessionController
-          .prompt(
-            {
-              requestId: randomUUID(),
-              sessionId: dispatch.mainSessionId,
-              mode: 'queue',
-              content: [{ type: 'text', text }],
-            },
-            new AbortController().signal,
+        currentMainFor(dispatch.mainSessionId, storeRoot())
+          .then((target) =>
+            ctx.sessionController.prompt(
+              {
+                requestId: randomUUID(),
+                sessionId: target,
+                mode: 'queue',
+                content: [{ type: 'text', text }],
+              },
+              new AbortController().signal,
+            ),
           )
           .catch((error) => {
             ctx.logger?.warn?.(`discipline-whale: escalation push failed: ${error?.message ?? error}`)

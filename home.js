@@ -30,22 +30,20 @@
  */
 
 import { randomUUID } from 'node:crypto'
-import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
-import { join } from 'node:path'
+import { mkdir } from 'node:fs/promises'
 
 import { listDispatchCheckpoints } from './checkpoint.js'
 import { installQuestionTool } from './question-host.js'
 import { registerMemoryRoutes } from './memory-routes.js'
-import { dataDir, storeRoot, whaleHomeDir } from './store.js'
+import { PUSH_PREFIXES } from './pushes.js'
+import { readState, writeState } from './state.js'
+import { storeRoot, whaleHomeDir } from './store.js'
 import { registerVoiceRoutes } from './voice.js'
 import { registerVoiceSettingsRoutes } from './voice-settings.js'
 import { registerVoiceAssetRoutes } from './voice-assets.js'
 
 /** Route the Web sidebar entry reads and writes. */
 export const HOME_ROUTE = '/api/discipline-whale/home'
-
-/** Plugin state file inside the data directory. */
-export const STATE_FILENAME = 'state.json'
 
 /** Preset the main session runs. */
 export const MAIN_PRESET = 'discipline-whale'
@@ -55,7 +53,7 @@ export const MAIN_TITLE = '自律鲸鱼'
 
 /** The first turn of a new main session. */
 export const WAKE_PROMPT = [
-  '【唤醒】自律鲸鱼主会话已建立，工作目录是你自己的 home。',
+  `${PUSH_PREFIXES.wake}自律鲸鱼主会话已建立，工作目录是你自己的 home。`,
   '请用两三句话告诉我你能做什么，然后调用 list_dispatches 汇报当前派工状态。',
 ].join('\n')
 
@@ -70,7 +68,7 @@ export function interruptedNotice(checkpoints) {
       `${index + 1}. 工作区「${checkpoint.workspaceTitle ?? checkpoint.workspaceId}」，worker ${checkpoint.workerSessionId}，派工时间 ${checkpoint.startedAt ?? '未知'}`,
   )
   return [
-    `【启动检查】DeepSeek Harness 重启前有 ${checkpoints.length} 条派工没有完成回报：`,
+    `${PUSH_PREFIXES.startup}DeepSeek Harness 重启前有 ${checkpoints.length} 条派工没有完成回报：`,
     ...lines,
     '',
     '请结合你的会话记录，用一句话说明每条派工原本在做什么，然后用 ask_user 让用户为每条派工选择：恢复 / 放弃 / 稍后再说。',
@@ -79,31 +77,6 @@ export function interruptedNotice(checkpoints) {
 }
 
 export const name = 'discipline-whale-home'
-
-function statePath(homeDir) {
-  return join(dataDir(homeDir), STATE_FILENAME)
-}
-
-/** Read the plugin state; a missing or unreadable file is an empty state. */
-export async function readState(homeDir = storeRoot()) {
-  try {
-    const value = JSON.parse(await readFile(statePath(homeDir), 'utf8'))
-    return value !== null && typeof value === 'object' && !Array.isArray(value) ? value : {}
-  } catch {
-    return {}
-  }
-}
-
-/** Merge `patch` into the plugin state, written atomically. */
-export async function writeState(patch, homeDir = storeRoot()) {
-  const next = { ...(await readState(homeDir)), ...patch }
-  await mkdir(dataDir(homeDir), { recursive: true })
-  const target = statePath(homeDir)
-  const temp = `${target}.${process.pid}.tmp`
-  await writeFile(temp, `${JSON.stringify(next, null, 2)}\n`, 'utf8')
-  await rename(temp, target)
-  return next
-}
 
 /** Create the whale's home directory; returns its absolute path. */
 export async function ensureHome(homeDir = storeRoot()) {

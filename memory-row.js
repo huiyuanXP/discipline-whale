@@ -52,6 +52,7 @@ import {
 } from './memory.js'
 import { listDispatches } from './registry.js'
 import { isoDay } from './entry.js'
+import { isHumanMessage } from './pushes.js'
 import { listReports, storeRoot, whaleHomeDir } from './store.js'
 
 export const name = 'discipline-whale-memory'
@@ -561,7 +562,7 @@ export function installMemory(ctx, config = {}, deps = {}) {
     const sessionId = sessionIdOf(agent)
     if (sessionId === undefined) return
     cache.activityDirty = true
-    if (message?.source?.kind !== 'user') return
+    if (!isHumanMessage(message)) return
     const text = messageText(message)
     const record = { turn, messageId: message?.id, text, at: now().toISOString() }
     userTurns.set(sessionId, record)
