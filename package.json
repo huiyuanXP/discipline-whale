@@ -101,7 +101,7 @@
     "test:settings": "node test/settings.mjs",
     "test:adhd": "node test/adhd.mjs",
     "test:report-head": "node test/report-head.mjs",
-    "test:memory": "node test/memory.mjs && node test/activity.mjs && node test/memory-flush.mjs && node test/dream.mjs && node test/pruner.mjs && node test/memory-integration.mjs && node test/memory-wiring.mjs && node test/client-memory.mjs",
+    "test:memory": "node test/memory.mjs && node test/activity.mjs && node test/memory-flush.mjs && node test/dream.mjs && node test/pruner.mjs && node test/memory-integration.mjs && node test/memory-wiring.mjs && node test/client-memory.mjs && node test/board.mjs",
     "test:report-origin": "node test/report-origin.mjs && node test/report-origin-client.mjs",
     "test:context-audit": "node test/context-audit.mjs",
     "audit:context": "node scripts/context-audit.mjs",
@@ -113,7 +113,8 @@
     "test:turn-tags": "node test/turn-tags.mjs",
     "test:fit": "node test/fit.mjs",
     "test:report-index": "node test/report-index.mjs",
-    "audit:dedupe": "node scripts/dedupe-replay.mjs"
+    "audit:dedupe": "node scripts/dedupe-replay.mjs",
+    "test:board": "node test/board.mjs"
   },
   "dsh": {
     "bundle": {
