@@ -16,10 +16,10 @@ DSH 里已经有 `subagent`（同一会话内的子代理）和 `dsh-webhook`（
 
 主会话的工作目录是鲸鱼自己的 home：`$DSH_HOME/discipline-whale/home`。它是插件的后台目录，不注册成工作区，也不出现在工作区列表里；鲸鱼工作中产生的文件写在这里。
 
-- 插件启动时（profile 级的 `discipline-whale` 行，即 `home.js`）创建 home，并提供接口 `/api/discipline-whale/home`：`GET` 返回 home 路径和主会话 id，`POST` 新建主会话
-- 主会话 id 记录在 `$DSH_HOME/discipline-whale/state.json`，换浏览器也是同一个主会话
+- 插件启动时（profile 级的 `discipline-whale` 行，即 `home.js`）创建 home，并提供接口 `/api/discipline-whale/home`：`GET` 返回 home 路径、主会话 id 和最近 20 段续接谱系 `lineage`（旧的在前），`POST` 新建主会话（已有主会话时走续接，见「主会话续接」）
+- 主会话 id 和续接谱系记录在 `$DSH_HOME/discipline-whale/state.json`，换浏览器也是同一个主会话
 - 入口打开时：记录的主会话仍在且未归档就直接打开；否则由 Host 以 `discipline-whale` preset、cwd = home 新建一个，标题「自律鲸鱼」，并立即发一条**唤醒**消息（自我介绍 + `list_dispatches` 汇报）。不属于任何工作区的会话要有过一轮才能在 Web 里输入，唤醒这一轮正好满足
-- 主会话标题栏有「+ 新建主会话」按钮（只在主会话里显示）：Host 新建并唤醒一个主会话、记为新的主会话并直接打开；旧主会话保留在会话列表里
+- 主会话标题栏有「+ 新建主会话」按钮（只在主会话里显示）：手动续接——新主会话带着续接种子醒来，记为新的主会话并直接打开；上一段改名「自律鲸鱼 · 存档 MM-DD HH:mm」保留在会话列表里
 
 ## 两个 preset，两种角色
 
@@ -553,12 +553,45 @@ worker 每次即将结束回合时，插件会检查本轮是否调用过 `repor
 
 **自动机制**：
 - 清工具输出：压缩压力成立时先清工具输出（`pruner.js`）。最近 3 个用户 turn 保留，更早的换成一行占位，原文仍在 session log。
-- 压缩：沿用 `dsh-compaction-basic`。
-- flush：距压缩阈值 32K token 时跑一次后台隐藏调用，把值得留下的观察写进 daily，并更新 Now 和工作区介绍。
+- 压缩：沿用 `dsh-compaction-basic`。1M 窗口路由按 `modelPolicies` 在 131,072 token 触发（主 preset），worker 在 262,144；其它路由用宿主默认 0.8。
+- flush：距压缩阈值 32K token 时跑一次后台隐藏调用，把值得留下的观察写进 daily，并更新 Now 和工作区介绍。阈值按 `compactModelPolicies` 取本路由的比例，1M 路由的 flush 点是 98,304。
+- 续接：主会话空闲时按规则判断，命中就自动换一段新的主会话（见下面「主会话续接」）。
 - nudge：距上次 nudge 满 10 个 DSH turn 时也跑一次，逻辑同 flush；进度存在游标里，重启后接着计。
 - dream：主会话空闲、且距上次 ≥24h、新 daily ≥5 条时运行。它只输出操作列表，由代码执行，并受 6 条门禁约束（删除 ≤25%、条目必须有来源、hash 校验、预算、结构可解析，失败时只追加）。`dream_now` 可以手动触发。
 
 **和宿主 `dsh-auto-memory` 的关系**：主会话的记忆由鲸鱼接管。首次启动时，鲸鱼 home 下已有的 auto-memory 条目会被迁进 USER / MEMORY，原目录改名为 `*.migrated-YYYYMMDD` 保留；SOUL / USER / MEMORY 三个文件和 `daily/` 目录在启动时就建好。主会话 agent 创建时，`memory_*` 工具从它的工具列表里移除，guard 再兜一层：万一被调用，引导去用 `remember`。宿主注入的用户级记忆（`<memory_context>`）在主会话里是只读参考。其它会话照常使用 auto-memory。
+
+### 主会话续接（`rotation.js`）
+
+主会话压缩满 2 次，或输入达到门槛 R2，就在下一个空闲点续接，用户不用做任何选择：
+
+1. 先跑一次 pre-rotation flush（最多 60 s），flush 后 agent 仍空闲才继续
+2. 生成种子：进行中派工的完整 brief（从 worker 会话第一条消息读出）、之后的指令与 worker 最近的话、最近 5 次交付的完整 summary、每个工作区的报告索引指针、上一段的最后一轮
+3. 在 home 里新建 `discipline-whale` 会话并命名「自律鲸鱼」，种子以 notice（`plugin:discipline-whale:rotation`）投给它的 `followup`，拿不到 agent 时改走排队的 `prompt`；正文以 `【续接】` 开头，不计入人类回合
+4. 写种子文件 `home/rotations/<新会话 id>.md`，`state.json` 换 `mainSessionId`、在 `lineage` 末尾追加 `{ sessionId, successor, endedAt, reason, lastInputTokens, compactions, seedFile }`
+5. 指向上一段的检查点和注册表记录改投新会话；上一段改名「自律鲸鱼 · 存档 MM-DD HH:mm」
+
+整个过程持有 `memory-state/rotation.lock`；锁在时 worker 的报告推送最多等 10 s，再按谱系投到当前主会话。只有 `state.json` 记录的当前段会续接，存档段永不续接；一段至少 10 个人类回合。建会话失败或种子两条投递路径都失败时，`state.json` 留在上一段，10 分钟内不再自动尝试。「+ 新建主会话」走同一个入口，跳过 flush，`reason` 记为 `manual`。
+
+R2 = `max(min(rotateInputTokens, ⌊rotateWindowFraction × W⌋), ⌈1.2 × 压缩触发点⌉)`：1M 路由 180,000，262K 路由 196,608，所以任何路由上都是先压缩、后续接。
+
+| 键 | 位置 | 默认 | 含义 |
+|---|---|---|---|
+| `modelPolicies` | 两个 preset 的 `compaction-basic` | 主：`soc/x-test-2`、`soc/x-test-1` 各 `thresholdRatio: 0.125, retainRatio: 0.04`；worker：同两条路由 `0.25 / 0.06` | 按 provider/model 覆盖宿主压缩比例；其它路由用宿主默认 0.8 / 0.16。部署相关，换路由时和 `compactModelPolicies` 一起改 |
+| `compactModelPolicies` | memory 行 | 与主 preset 的 `modelPolicies` 逐项相同（契约测试钉住） | flush 阈值按本路由的 `thresholdRatio` 计算，查不到再用 `compactThresholdRatio`（0.8） |
+| `rotateEnabled` | memory 行 | `true` | `false` 关掉自动续接；手动按钮照常可用 |
+| `rotateAfterCompactions` | memory 行 | `2` | 成功摘要满这么多次后，下一个空闲点续接 |
+| `rotateInputTokens` | memory 行 | `180000` | R2 的输入门槛 |
+| `rotateWindowFraction` | memory 行 | `0.6` | R2 的窗口上限比例 |
+| `rotateMinHumanTurns` | memory 行 | `10` | 一段至少这么多人类回合才续接（防抖） |
+| `seedBudgetChars` | memory 行 | `40000` | 种子总长上限；超出时从最早派出的进行中派工开始降为「标题 + brief 前 2,000 字符 + 指针」 |
+| `seedRunningMaxChars` | memory 行 | `12000` | 单条进行中派工上限；超出时 brief 只留前 3,000 字符并附指针 |
+| `seedCompleted` | memory 行 | `5` | 种子带上的最近交付数 |
+| `DW_ROTATE_INPUT_TOKENS` | 环境变量 | — | 覆盖 `rotateInputTokens`，并直接作为 R2；用于隔离实例验证和现场演示 |
+| `DW_ROTATE_MIN_HUMAN_TURNS` | 环境变量 | — | 覆盖 `rotateMinHumanTurns`；用于隔离实例验证和现场演示 |
+| `DW_ROTATE_AFTER_COMPACTIONS` | 环境变量 | — | 覆盖 `rotateAfterCompactions`；用于隔离实例验证和现场演示 |
+
+三个环境变量只接受正整数，非法值记一条 warning 并沿用配置值。`node scripts/rotation-proof.mjs` 按谱系逐段列出首末输入、摘要次数、runtime-context 快照数与人类消息数、种子大小，以及续接后报告推送落在哪一段；`--watch` 每 2 s 打印一行当前状态。
 
 **客户端**：主会话每轮的回复尾部显示彩色工作区标签，点击打开对应的工作会话。派出去的会话在侧栏有工作区色点。工作区颜色在鲸鱼设置面板里修改。数据来自 `/api/discipline-whale/memory/{workspaces,tags,dispatched}`。
 
@@ -581,7 +614,7 @@ scripts/install-local.sh          # 默认 profile: web
 插件的全部数据都在 `$DSH_HOME/discipline-whale/`，和其他 DSH 插件的数据目录并列：
 
 ```
-$DSH_HOME/discipline-whale/state.json                               ← 插件状态（主会话 id）
+$DSH_HOME/discipline-whale/state.json                               ← 插件状态（主会话 id、续接谱系 lineage）
 $DSH_HOME/discipline-whale/home/                                    ← 主会话的工作目录
 $DSH_HOME/discipline-whale/reports/<workspaceId>/<reportId>.json    ← 报告
 $DSH_HOME/discipline-whale/dispatches/<workerSessionId>.json        ← 派工检查点
@@ -589,7 +622,9 @@ $DSH_HOME/discipline-whale/dispatches/<workerSessionId>.abandoned   ← 用户�
 $DSH_HOME/discipline-whale/voice.json                               ← 语音设置（0600；仅在没有 Host 凭据面时存 key）
 $DSH_HOME/discipline-whale/home/memory/                             ← 记忆文件：SOUL / USER / MEMORY / DREAMS.md、daily/
 $DSH_HOME/discipline-whale/home/AGENTS.md                           ← 主会话运行规则（只经 update_instructions 写）
+$DSH_HOME/discipline-whale/home/rotations/<sessionId>.md            ← 打开这一段主会话的续接种子
 $DSH_HOME/discipline-whale/memory-state/                            ← 工作区卡片与颜色、消息 Tag、flush/dream 游标与锁
+$DSH_HOME/discipline-whale/memory-state/rotation.lock               ← 续接进行中（报告推送等它释放）
 $DSH_HOME/.credentials.yaml                                         ← Host 凭据面（0600；优先，由 dsh-credentials-local 写）
 ```
 
@@ -614,7 +649,10 @@ node test/guard.mjs
 node test/adhd.mjs
 npm run test:memory
 node test/report-head.mjs
+node test/rotation.mjs
 ```
+
+`node test/rotation.mjs` 覆盖主会话续接（8 项）：`sessionStats` 口径、`shouldRotate` 判定表与 R2、`DW_ROTATE_*` 覆盖、种子内容与预算、`rotateMain` 的建会话 / 投递 / 谱系 / 改投 / 存档、idle 钩子只续接当前段一次且 flush 后不空闲就放弃、谱系改投报告、`GET/POST /home`、失败回退与冷却。
 
 `npm run test:memory` 覆盖记忆系统：
 - 条目与分层（`memory.mjs`）
@@ -625,7 +663,7 @@ node test/report-head.mjs
 - 真实 store 串起 flush → dream → 注入的集成测试（`memory-integration.mjs`）
 - 接线测试（`memory-wiring.mjs`）：memory 行注册、迁移、Tag、flush 触发、路由、派工 bootstrap、`workspace_note`、guard 拦截
 
-28 项契约测试（编号 1–27，另加 15b），用假 Host 分别挂载两半；另有 `node test/voice.mjs` 13 项语音端点、幻觉过滤、起停参数、离开防护与检测文件路由测试、`node test/client.mjs` 9 项浏览器半边测试、`node test/dock.mjs` 14 项通话条控件/收音/窗口/拖动/贴边/缩放/文案/接缝测试、`node test/settings.mjs` 10 项设置与密钥测试、`node test/guard.mjs` 10 项主会话刹车测试、`node test/adhd.mjs` 13 项输出纪律测试、`node test/report-head.mjs` 10 项 `read_report` 读取模式测试：
+29 项契约测试（编号 1–28，另加 15b），用假 Host 分别挂载两半；另有 `node test/voice.mjs` 13 项语音端点、幻觉过滤、起停参数、离开防护与检测文件路由测试、`node test/client.mjs` 9 项浏览器半边测试、`node test/dock.mjs` 14 项通话条控件/收音/窗口/拖动/贴边/缩放/文案/接缝测试、`node test/settings.mjs` 10 项设置与密钥测试、`node test/guard.mjs` 10 项主会话刹车测试、`node test/adhd.mjs` 13 项输出纪律测试、`node test/report-head.mjs` 10 项 `read_report` 读取模式测试：
 
 1. 存储往返、长度截断、路径穿越防护
 2. 主会话行注册 7 个工具，schema 在受支持子集内（遍历注册表，未列入清单的工具会直接失败）
@@ -655,6 +693,7 @@ node test/report-head.mjs
 25. **时机语义钉在 Host 源码上**：`steer` 落 `next-step`、`claim` 每个步边界都清空它、turn 循环首步后切 target —— 直接对 Host 源码断言；并断言 `prompt.mode` 只有 `queue`/`steer`、本插件默认 `step`。Host 升级改了语义，这条会红
 26. **纯 `steer` 路径全程不 cancel**：默认与显式 `at:"step"` 都走 `mode:"steer"` 且 `cancel` 调用数为 0；`queue` 也不 cancel；只有 `at:"abort"` 调一次 cancel；`dispatch_task` 复用默认同样不 cancel。step 路径上只要出现 `cancel`，这条就红
 27. **输出纪律只声明在主 preset**：直接对真实 `cordis.patch.yml` 断言 `discipline-whale/adhd` 行存在于 `preset-discipline-whale`、且**不在** `preset-discipline-whale-worker`；并断言全文件里只有**一个** preset 拥有这行（防止日后复制粘贴到 worker）
+28. **压缩路由表一致**：主 preset `compaction-basic` 的 `modelPolicies` 与 memory 行 `compactModelPolicies` 逐项相等，主与 worker 两份列表每项都满足 `retainRatio < thresholdRatio`
 
 假 `prompt` **故意模仿真实实现**，会解引用 `signal` —— 这条强化曾抓出三个真实缺陷（信号未传、`exec` 参数缺失、dispatch 未标记已报）。
 

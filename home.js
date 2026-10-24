@@ -10,13 +10,20 @@
  * (`state.json`, which records the main session), and serves both to the Web
  * sidebar entry through one route:
  *
- *   GET  /api/discipline-whale/home  → { home, mainSessionId }
- *   POST /api/discipline-whale/home  → creates and wakes a new main session,
- *                                      records it, answers like GET
+ *   GET  /api/discipline-whale/home  → { home, mainSessionId, lineage }
+ *   POST /api/discipline-whale/home  → the first main session: creates, wakes
+ *                                      and records it; with a main session
+ *                                      already recorded: rotates it
+ *                                      (rotation.js, `reason: 'manual'`);
+ *                                      answers like GET
  *
- * A new main session is woken with a first turn right away. Besides greeting
- * the user, that turn is what makes the session usable in the Web composer: a
- * session outside every workspace only accepts input once it has a turn.
+ * `lineage` is the latest 20 rotations from `state.json`, oldest first; the
+ * client follows it to the current main session.
+ *
+ * The first main session is woken with a first turn right away; a rotated one
+ * is woken by its seed. Besides greeting the user, that turn is what makes the
+ * session usable in the Web composer: a session outside every workspace only
+ * accepts input once it has a turn.
  *
  * At boot the row also checks for dispatches a restart interrupted (dispatch
  * checkpoints that were never delivered). When there are any and a main session
@@ -36,6 +43,7 @@ import { listDispatchCheckpoints } from './checkpoint.js'
 import { installQuestionTool } from './question-host.js'
 import { registerMemoryRoutes } from './memory-routes.js'
 import { PUSH_PREFIXES } from './pushes.js'
+import { MAIN_PRESET, MAIN_TITLE, rotateMain, sessionStats } from './rotation.js'
 import { readState, writeState } from './state.js'
 import { storeRoot, whaleHomeDir } from './store.js'
 import { registerVoiceRoutes } from './voice.js'
@@ -45,11 +53,14 @@ import { registerVoiceAssetRoutes } from './voice-assets.js'
 /** Route the Web sidebar entry reads and writes. */
 export const HOME_ROUTE = '/api/discipline-whale/home'
 
-/** Preset the main session runs. */
-export const MAIN_PRESET = 'discipline-whale'
+/** Preset and title of the main session, defined with the rotation that also creates one. */
+export { MAIN_PRESET, MAIN_TITLE }
 
-/** Title of the main session in the session list. */
-export const MAIN_TITLE = '自律鲸鱼'
+/** How many lineage entries `GET /home` returns. */
+export const LINEAGE_LIMIT = 20
+
+/** The lineage fields the client reads. */
+const LINEAGE_FIELDS = ['sessionId', 'successor', 'endedAt', 'reason', 'lastInputTokens', 'compactions', 'seedFile']
 
 /** The first turn of a new main session. */
 export const WAKE_PROMPT = [
@@ -87,8 +98,53 @@ export async function ensureHome(homeDir = storeRoot()) {
 
 const isSessionId = (value) => typeof value === 'string' && /^[A-Za-z0-9_-]{1,120}$/.test(value)
 
-/** Create a main session in the home, wake it with its first turn, record it. */
-export async function createMainSession(sessionController) {
+/** The latest `LINEAGE_LIMIT` lineage entries of a state, oldest first. */
+export function recentLineage(state) {
+  const lineage = Array.isArray(state?.lineage) ? state.lineage : []
+  return lineage
+    .filter((entry) => isSessionId(entry?.sessionId) && isSessionId(entry?.successor))
+    .slice(-LINEAGE_LIMIT)
+    .map((entry) => Object.fromEntries(LINEAGE_FIELDS.map((field) => [field, entry[field] ?? null])))
+}
+
+/** A Session's events through the controller, or none when it cannot be inspected. */
+async function eventsOf(sessionController, sessionId) {
+  try {
+    const inspected = await sessionController.inspect?.(sessionId, new AbortController().signal)
+    return Array.isArray(inspected?.events) ? inspected.events : []
+  } catch {
+    return []
+  }
+}
+
+/**
+ * Give the user a fresh main session.
+ *
+ * With a main session already recorded, this is a manual rotation: the same
+ * entry as the automatic one, without the flush (the memory row's flush is out
+ * of this row's reach). Otherwise the first main session is created in the
+ * home, woken with its first turn and recorded.
+ *
+ * @param options.agents - the Host's agent registry, for the seed's notice path.
+ * @returns the main session id now recorded.
+ */
+export async function createMainSession(sessionController, { agents, logger } = {}) {
+  const { mainSessionId: current } = await readState()
+  if (isSessionId(current)) {
+    const result = await rotateMain({
+      sessionController,
+      agents,
+      oldSessionId: current,
+      reason: 'manual',
+      stats: sessionStats(await eventsOf(sessionController, current)),
+      root: storeRoot(),
+      logger,
+    })
+    if (result.newSessionId !== undefined && result.skipped === undefined) return result.newSessionId
+    // Another rotation holds the lock or already moved on: the state it writes is the answer.
+    if (result.skipped === 'busy' || result.skipped === 'not-current') return (await readState()).mainSessionId
+    throw new Error(`the main session could not be rotated (${result.skipped}${result.error ? `: ${result.error}` : ''})`)
+  }
   const home = await ensureHome()
   const created = await sessionController.create({ cwd: home, agentPreset: MAIN_PRESET })
   const sessionId = String(created.sessionId)
@@ -103,8 +159,12 @@ export async function createMainSession(sessionController) {
   return sessionId
 }
 
-/** The route handler, bound to the Host's session controller. */
-export function homeHandler(sessionController) {
+/**
+ * The route handler, bound to the Host's session controller.
+ *
+ * @param options.agents - `() => agents`: the Host's agent registry, read per request.
+ */
+export function homeHandler(sessionController, { agents, logger } = {}) {
   // One creation at a time: a second request joins the running one, so the
   // home never gets two main sessions from a double click.
   let creating = null
@@ -113,15 +173,17 @@ export function homeHandler(sessionController) {
     try {
       if (request.method === 'POST') {
         if (creating === null) {
-          creating = createMainSession(sessionController).finally(() => {
+          const registry = typeof agents === 'function' ? agents() : agents
+          creating = createMainSession(sessionController, { agents: registry, logger }).finally(() => {
             creating = null
           })
         }
         await creating
       }
       const home = await ensureHome()
-      const { mainSessionId } = await readState()
-      return Response.json({ home, mainSessionId: isSessionId(mainSessionId) ? mainSessionId : null }, { headers })
+      const state = await readState()
+      const mainSessionId = isSessionId(state.mainSessionId) ? state.mainSessionId : null
+      return Response.json({ home, mainSessionId, lineage: recentLineage(state) }, { headers })
     } catch (error) {
       return Response.json({ error: String(error?.message ?? error) }, { status: 500, headers })
     }
@@ -208,7 +270,10 @@ export function apply(ctx) {
       path: HOME_ROUTE,
       methods: ['GET', 'POST'],
       requestBody: 'buffered',
-      fetch: homeHandler(c.sessionController),
+      fetch: homeHandler(c.sessionController, {
+        agents: () => (typeof ctx.get === 'function' ? ctx.get('agents') : undefined),
+        logger: ctx.logger,
+      }),
     })
   })
 }

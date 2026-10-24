@@ -123,6 +123,9 @@
                 - worker 会话已经不存在（被重启清掉）时不要问：会话死掉的问题会被自动 retire 并报成 `expired`，你说一句它已作废即可。问一个没人等的问题等于浪费用户的注意力。
                 - 没有待答问题就不要调 `pending_questions`：它是给「worker 明显在等决定」或「本轮结束前扫一遍」用的，不是每回合的仪式。
                 - 你始终是唯一和用户对话的人：worker 的问题经你转述时必须保持原意，不要压缩成你自己的一句话，也不要把多个问题糊成一条。
+
+                ## 10. 续接
+                会话开头若有「主会话已续接」通知：里面是上一段进行中派工的完整 brief 和最近 5 次交付。按它接着跟进，只回一行确认；更早的交付用 read_report(mode:"index") 或读 home/index/。worker 上下文过大时 send_to_session 会被拒并给出改用 dispatch_task 的提示，照提示做。
               includeRuntimeContext: true
           - id: agent-instructions
             name: '@deepseek-ai/dsh-agent-instructions'
@@ -185,7 +188,26 @@
           # as a prompt section, the running and recent conversations as a
           # runtime context, the remember / update_instructions /
           # set_workspace_intro / dream_now tools, the pre-compaction flush, the
-          # ten-turn nudge and the idle dream. Main preset only.
+          # ten-turn nudge, the idle dream and the idle rotation check
+          # (rotation.js). Main preset only.
+          #
+          #   compactModelPolicies   the main preset's compaction-basic
+          #                          `modelPolicies`, item for item, so the
+          #                          flush lands flushMarginTokens before the
+          #                          route's compaction (1M routes: 98,304)
+          #   rotateAfterCompactions rotate at the next idle point after this
+          #                          many successful summaries
+          #   rotateInputTokens      input threshold R2 =
+          #   rotateWindowFraction   max(min(rotateInputTokens, ⌊fraction × W⌋),
+          #                          ⌈1.2 × compaction trigger⌉) (rotation.js)
+          #   rotateMinHumanTurns    human turns a segment needs before it rotates
+          #   seedBudgetChars        whole seed, in characters
+          #   seedRunningMaxChars    one running dispatch in the seed
+          #   seedCompleted          latest deliveries the seed carries
+          #
+          # DW_ROTATE_INPUT_TOKENS / DW_ROTATE_MIN_HUMAN_TURNS /
+          # DW_ROTATE_AFTER_COMPACTIONS override the three rotate* keys for
+          # isolated-instance verification and live demos.
           - id: discipline-whale-memory
             name: 'discipline-whale/memory'
             config:
@@ -193,6 +215,17 @@
               nudgeInterval: 10
               dreamMinHours: 24
               dreamMinEntries: 5
+              compactModelPolicies:
+                - { provider: soc, model: x-test-2, thresholdRatio: 0.125, retainRatio: 0.04 }
+                - { provider: soc, model: x-test-1, thresholdRatio: 0.125, retainRatio: 0.04 }
+              rotateEnabled: true
+              rotateAfterCompactions: 2
+              rotateInputTokens: 180000
+              rotateWindowFraction: 0.6
+              rotateMinHumanTurns: 10
+              seedBudgetChars: 40000
+              seedRunningMaxChars: 12000
+              seedCompleted: 5
           - id: tool-fs
             name: '@deepseek-ai/dsh-tool-fs'
             config:
@@ -250,6 +283,17 @@
             config:
               - id: compaction-basic
                 name: '@deepseek-ai/dsh-compaction-basic'
+                config:
+                  # 1M-window routes (soc/x-test-1 and soc/x-test-2 carry
+                  # contextWindow: 1048576 in ~/.dsh/profiles/web/cordis.patch.yml):
+                  # trigger floor(min(W × 0.125, W − O − 65,536)) = 131,072, a
+                  # verbatim tail of about 0.04 × (W − O). Other routes keep the
+                  # host default (0.8 / 0.16). This list is deployment
+                  # configuration: when the routes change, change it here and in
+                  # the memory row's compactModelPolicies together.
+                  modelPolicies:
+                    - { provider: soc, model: x-test-2, thresholdRatio: 0.125, retainRatio: 0.04 }
+                    - { provider: soc, model: x-test-1, thresholdRatio: 0.125, retainRatio: 0.04 }
               - id: command-compact
                 name: '@deepseek-ai/dsh-command-compact'
               # Claude Code order: clear older tool outputs first, summarize only
@@ -341,6 +385,14 @@
             config:
               - id: compaction-basic
                 name: '@deepseek-ai/dsh-compaction-basic'
+                config:
+                  # 1M-window routes: trigger 1,048,576 × 0.25 = 262,144, so only
+                  # the largest workers compact. Other routes keep the host
+                  # default (0.8 / 0.16). Deployment configuration, like the main
+                  # preset's list.
+                  modelPolicies:
+                    - { provider: soc, model: x-test-2, thresholdRatio: 0.25, retainRatio: 0.06 }
+                    - { provider: soc, model: x-test-1, thresholdRatio: 0.25, retainRatio: 0.06 }
               - id: command-compact
                 name: '@deepseek-ai/dsh-command-compact'
               # Claude Code order: clear older tool outputs first, summarize only

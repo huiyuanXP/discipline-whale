@@ -1074,15 +1074,15 @@ const checkpointPath = (workerSessionId) =>
   const handle = homeHandler(controller)
   const request = (method) => handle(new Request(`http://dsh${HOME_ROUTE}`, { method }))
 
-  assert.deepEqual(await (await request('GET')).json(), { home: homePath, mainSessionId: null })
+  assert.deepEqual(await (await request('GET')).json(), { home: homePath, mainSessionId: null, lineage: [] })
 
   // Two POSTs racing (a double click) create exactly one main session.
   const first = request('POST')
   const second = request('POST')
   release()
   const [a, b] = await Promise.all([first, second])
-  assert.deepEqual(await a.json(), { home: homePath, mainSessionId: 'session-main-1' })
-  assert.deepEqual(await b.json(), { home: homePath, mainSessionId: 'session-main-1' })
+  assert.deepEqual(await a.json(), { home: homePath, mainSessionId: 'session-main-1', lineage: [] })
+  assert.deepEqual(await b.json(), { home: homePath, mainSessionId: 'session-main-1', lineage: [] })
   assert.equal(calls.create.length, 1)
   assert.deepEqual(calls.create[0], { cwd: homePath, agentPreset: MAIN_PRESET })
   assert.deepEqual(calls.rename[0], { sessionId: 'session-main-1', title: MAIN_TITLE })
@@ -1790,6 +1790,32 @@ const checkpointPath = (workerSessionId) =>
   assert.deepEqual(owners, ['discipline-whale'], `the brevity row belongs to one preset only, found ${JSON.stringify(owners)}`)
 
   console.log('ok 27 — the brevity row is declared in the main preset and absent from the worker preset')
+
+  // Per-route compaction: the main preset's compaction-basic `modelPolicies`
+  // and the memory row's `compactModelPolicies` are one list, so the flush
+  // always lands just before the compaction it prepares for.
+  const compactionBasic = (presetId) => {
+    const group = presetPlugins(patches, presetId).find((row) => row?.id === 'compaction')
+    return (Array.isArray(group?.config) ? group.config : []).find((row) => row?.id === 'compaction-basic')
+  }
+  const mainPolicies = compactionBasic('discipline-whale')?.config?.modelPolicies
+  const workerPolicies = compactionBasic('discipline-whale-worker')?.config?.modelPolicies
+  const memoryRow = presetPlugins(patches, 'discipline-whale').find((row) => row?.name === 'discipline-whale/memory')
+  assert.ok(Array.isArray(mainPolicies) && mainPolicies.length > 0, 'the main preset declares modelPolicies')
+  assert.ok(Array.isArray(workerPolicies) && workerPolicies.length > 0, 'the worker preset declares modelPolicies')
+  assert.deepEqual(memoryRow?.config?.compactModelPolicies, mainPolicies, 'memory compactModelPolicies == main modelPolicies')
+  for (const policy of [...mainPolicies, ...workerPolicies]) {
+    assert.ok(policy.retainRatio < policy.thresholdRatio, `${policy.provider}/${policy.model}: retainRatio < thresholdRatio`)
+  }
+  assert.deepEqual(
+    mainPolicies.map((policy) => [policy.provider, policy.model, policy.thresholdRatio]),
+    [['soc', 'x-test-2', 0.125], ['soc', 'x-test-1', 0.125]],
+  )
+  assert.deepEqual(
+    workerPolicies.map((policy) => [policy.provider, policy.model, policy.thresholdRatio]),
+    [['soc', 'x-test-2', 0.25], ['soc', 'x-test-1', 0.25]],
+  )
+  console.log('ok 28 — main modelPolicies == memory compactModelPolicies; every route keeps retainRatio < thresholdRatio')
 }
 
 await rm(home, { recursive: true, force: true })
