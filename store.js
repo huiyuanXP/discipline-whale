@@ -409,11 +409,13 @@ export async function deleteReport(homeDir, workspaceId, reportId) {
  *
  * Delivery is "at most once per report per main session": a report is pushed
  * when it is first reported, and the delivery marker prevents a later drain
- * from pushing the same summary again.
+ * from pushing the same summary again. A revision stored with
+ * `pushSuppressed` stays on disk and in the index only; a drain leaves it there.
  */
 export function notYetDeliveredTo(reports, mainSessionId) {
   return reports.filter((report) => {
     if (report.status !== 'reported') return false
+    if (report.pushSuppressed !== undefined) return false
     const delivered = Array.isArray(report.deliveredTo) ? report.deliveredTo : []
     return !delivered.includes(mainSessionId)
   })
