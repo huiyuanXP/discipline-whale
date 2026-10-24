@@ -30,7 +30,7 @@ import { basename, join } from 'node:path'
 
 import { atomicWrite, charLength, clip, formatEntry, isoDay } from './entry.js'
 import { isWhalePushText } from './pushes.js'
-import { HOME_DIRNAME, INDEX_DIRNAME, dataDir, whaleHomeDir, workspaceKey } from './store.js'
+import { INDEX_DIRNAME, dataDir, whaleHomeDir, workspaceKey } from './store.js'
 
 /** Directory under the plugin data directory that holds memory state files. */
 export const STATE_DIRNAME = 'memory-state'
@@ -578,7 +578,7 @@ export function renderWorkspaceNote(workspace, facts = {}) {
     }
   }
   if (facts.reportCount > 0) {
-    lines.push('## 更早', `- 共 ${facts.reportCount} 份报告，索引：${HOME_DIRNAME}/${INDEX_DIRNAME}/${workspaceKey(id)}.md`)
+    lines.push('## 更早', `- 共 ${facts.reportCount} 份报告，索引：${INDEX_DIRNAME}/${workspaceKey(id)}.md`)
   }
   return `${lines.join('\n')}\n`
 }

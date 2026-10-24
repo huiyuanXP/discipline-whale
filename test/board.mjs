@@ -345,7 +345,7 @@ try {
     assert.match(expected, /\n# blog \(ws-blog\)\n介绍：个人博客 \[updated: 2026-10-24\]\n最近活跃：2026-10-24 09:40\n/)
     assert.match(expected, /\n## 进行中\n- 迁移 RSS \[session: 6adf23f0; dispatch: d-run; started: 2026-10-24 09:40\]\n/)
     assert.match(expected, /\n## 最近交付（最多 5 条，新的在前）\n- 评论区 — done：评论区上线 \[report: r-a; ended: 2026-10-24\]\n- 主题切换一半 — partial \[report: r-b; ended: 2026-10-24\]\n/)
-    assert.match(expected, /\n## 更早\n- 共 2 份报告，索引：home\/index\/ws-blog\.md\n$/)
+    assert.match(expected, /\n## 更早\n- 共 2 份报告，索引：index\/ws-blog\.md\n$/)
     await assert.rejects(readFile(workspaceNotePath(root, 'ws-idle'), 'utf8'), { code: 'ENOENT' }, 'only active workspaces get a note')
     console.log('ok 7 — each render writes home/notes/<key>.md equal to renderWorkspaceNote')
   }

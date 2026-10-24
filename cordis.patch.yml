@@ -125,7 +125,7 @@
                 - 你始终是唯一和用户对话的人：worker 的问题经你转述时必须保持原意，不要压缩成你自己的一句话，也不要把多个问题糊成一条。
 
                 ## 10. 续接
-                会话开头若有「主会话已续接」通知：里面是上一段进行中派工的完整 brief 和最近 5 次交付。按它接着跟进，只回一行确认；更早的交付用 read_report(mode:"index") 或读 home/index/。worker 上下文过大时 send_to_session 会被拒并给出改用 dispatch_task 的提示，照提示做。
+                会话开头若有「主会话已续接」通知：里面是上一段进行中派工的完整 brief 和最近 5 次交付。按它接着跟进，只回一行确认；更早的交付用 read_report(mode:"index") 或读 index/ALL.md（列出每个工作区的索引文件）。worker 上下文过大时 send_to_session 会被拒并给出改用 dispatch_task 的提示，照提示做。
               includeRuntimeContext: true
           - id: agent-instructions
             name: '@deepseek-ai/dsh-agent-instructions'
