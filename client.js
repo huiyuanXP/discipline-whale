@@ -249,6 +249,8 @@ window.__ModuleLoader__.load({
         newMain: "新建主会话",
         newMainBusy: "正在新建…",
         newMainFailed: "新建主会话失败：{reason}",
+        rotated: "已续接 →",
+        rotatedTitle: "这一段主会话已续接，打开当前主会话",
         authLost: "页面与重启后的服务端失去了认证。这不是数据丢失：重启会生成新的访问令牌。",
         authReopen: "重新认证并刷新",
         authPasteHint: "如果没有自动恢复，把 dsh web 启动时打印的 ?token= 链接粘贴到地址栏，回车即可。",
@@ -410,6 +412,8 @@ window.__ModuleLoader__.load({
         newMain: "New main session",
         newMainBusy: "Creating…",
         newMainFailed: "Could not create a main session: {reason}",
+        rotated: "Continued →",
+        rotatedTitle: "This main session continues in a new one; open it",
         authLost: "This page lost its credential to the restarted server. Nothing was lost: a restart mints a new launch token.",
         authReopen: "Re-authenticate and reload",
         authPasteHint: "If it does not come back by itself, paste the ?token= URL that dsh web printed into the address bar.",
@@ -687,6 +691,114 @@ window.__ModuleLoader__.load({
         },
         h("span", { "aria-hidden": true }, "+"),
         h("span", null, busy ? t("newMainBusy") : t("newMain"))
+      );
+    }
+
+    // ---- following a rotation of the main session --------------------------
+
+    // A rotation this recent moves the main view on its own; an older one
+    // only offers the chip.
+    const AUTO_FOLLOW_WINDOW_MS = 10 * 60 * 1000;
+    // How often a main or lineage header re-reads the home record.
+    const ROTATION_POLL_MS = 5000;
+    // Rotations this page already followed, as `sessionId→successor`.
+    const autoFollowed = new Set();
+
+    function isLineageEntry(entry) {
+      return entry !== null && typeof entry === "object"
+        && typeof entry.sessionId === "string" && entry.sessionId !== ""
+        && typeof entry.successor === "string" && entry.successor !== "";
+    }
+
+    function lineageEntryOf(sessionId, snapshot) {
+      const lineage = Array.isArray(snapshot?.lineage) ? snapshot.lineage : [];
+      return lineage.find((entry) => isLineageEntry(entry) && entry.sessionId === sessionId);
+    }
+
+    /**
+     * The current main session a rotated session continues in: the
+     * `successor` chain from `sessionId` up to `snapshot.mainSessionId`.
+     * @returns that id, or null when `sessionId` is not in the lineage or its chain ends elsewhere.
+     */
+    function rotatedTo(sessionId, snapshot) {
+      const main = snapshot?.mainSessionId;
+      if (typeof sessionId !== "string" || typeof main !== "string" || sessionId === main) return null;
+      const seen = new Set();
+      let current = sessionId;
+      while (current !== main) {
+        if (seen.has(current)) return null;
+        seen.add(current);
+        const entry = lineageEntryOf(current, snapshot);
+        if (entry === undefined) return null;
+        current = entry.successor;
+      }
+      return main;
+    }
+
+    /**
+     * Whether the main view moves on its own from `viewedSessionId` to the
+     * session it continues in: it is in the lineage, its segment ended within
+     * the last 10 minutes, and this rotation was not followed yet. A true
+     * answer records the rotation in `followed`, so each rotation moves the
+     * view once.
+     */
+    function shouldAutoFollow({ viewedSessionId, snapshot, followed, now }) {
+      if (rotatedTo(viewedSessionId, snapshot) === null) return false;
+      const entry = lineageEntryOf(viewedSessionId, snapshot);
+      const endedAt = typeof entry.endedAt === "number" ? entry.endedAt : Date.parse(entry.endedAt);
+      const at = typeof now === "number" ? now : Date.now();
+      if (!Number.isFinite(endedAt) || at - endedAt > AUTO_FOLLOW_WINDOW_MS) return false;
+      const key = `${entry.sessionId}→${entry.successor}`;
+      if (followed.has(key)) return false;
+      followed.add(key);
+      return true;
+    }
+
+    /** Whether the main view is showing `sessionId` right now. */
+    function inMainView(sessions, sessionId) {
+      return (sessions?.list?.getSnapshot()?.byId?.[sessionId]?.retainedBy?.mainView ?? 0) > 0;
+    }
+
+    /**
+     * The rotation follower in a session's header. On the main session or a
+     * lineage session it re-reads the home record every 5 s; on a lineage
+     * session it shows the "continued →" chip, and the main view moves to the
+     * current main session once per fresh rotation.
+     */
+    function makeRotationFollow(store, t, deps) {
+      const every = typeof deps.setInterval === "function" ? deps.setInterval : (fn, ms) => setInterval(fn, ms);
+      const stop = typeof deps.clearInterval === "function" ? deps.clearInterval : (id) => clearInterval(id);
+      const followed = deps.followed instanceof Set ? deps.followed : autoFollowed;
+      return function DisciplineWhaleRotationFollow(props) {
+        const snapshot = React.useSyncExternalStore(store.subscribe, store.getSnapshot);
+        const viewed = typeof props.sessionId === "string" ? props.sessionId : null;
+        const target = viewed === null ? null : rotatedTo(viewed, snapshot);
+        const tracked = viewed !== null && (viewed === snapshot.mainSessionId || target !== null);
+        // Every header reads the home record fresh once, so a rotation that
+        // happened while no header polled is caught on the next open.
+        React.useEffect(() => {
+          void store.loadMain({ force: true });
+        }, []);
+        React.useEffect(() => {
+          if (!tracked) return undefined;
+          const timer = every(() => void store.loadMain({ force: true }), ROTATION_POLL_MS);
+          return () => stop(timer);
+        }, [tracked]);
+        React.useEffect(() => {
+          if (target === null || !inMainView(deps.sessions, viewed)) return;
+          if (shouldAutoFollow({ viewedSessionId: viewed, snapshot, followed })) deps.openSession(target);
+        }, [viewed, target]);
+        if (target === null) return null;
+        return rotatedChipView({ t, onClick: () => deps.openSession(target) });
+      };
+    }
+
+    /** Pure view of the "continued →" chip. */
+    function rotatedChipView({ t, onClick }) {
+      return h(
+        "button",
+        { type: "button", className: "dw-new-main dw-rotated", onClick, title: t("rotatedTitle"), "aria-label": t("rotatedTitle") },
+        h("span", null, t("rotated"))
       );
     }
 
@@ -4404,6 +4516,7 @@ window.__ModuleLoader__.load({
     const COLOR_POST_DELAY_MS = 250;
     const TAG_TAIL_ORDER = 30;
     const NEW_MAIN_ORDER = 40;
+    const ROTATED_ORDER = 39;
 
     /** The error text of a failed JSON answer: `{ error }` as a string or as `{ message | code }`. */
     function memoryErrorText(payload, status) {
@@ -4425,6 +4538,7 @@ window.__ModuleLoader__.load({
      *
      * Snapshot fields:
      *   mainSessionId     the whale's main session, or null until known
+     *   lineage           the latest rotations `{ sessionId, successor, endedAt, reason, lastInputTokens, compactions, seedFile }`, oldest first, or null until loaded
      *   workspaces        registry-ordered `{ id, title, path, color, intro, updatedAt }`, or null until loaded
      *   workspacesFailed  true when the last workspace read failed
      *   tags              `{ [sessionId]: { [turn]: { turn, messageId, at, workspaces, sessions } } }`
@@ -4438,7 +4552,7 @@ window.__ModuleLoader__.load({
       const cancel = typeof options.clearTimeout === "function" ? options.clearTimeout : (id) => clearTimeout(id);
       const now = typeof options.now === "function" ? options.now : () => Date.now();
 
-      let snapshot = { mainSessionId: null, workspaces: null, workspacesFailed: false, tags: {}, dispatched: null, colorErrors: {} };
+      let snapshot = { mainSessionId: null, lineage: null, workspaces: null, workspacesFailed: false, tags: {}, dispatched: null, colorErrors: {} };
       const listeners = new Set();
       const inflight = new Map();
       // Per main session: the highest closed turn asked for, the highest one a
@@ -4480,13 +4594,25 @@ window.__ModuleLoader__.load({
         if (typeof sessionId === "string" && sessionId !== "" && sessionId !== snapshot.mainSessionId) publish({ mainSessionId: sessionId });
       }
 
-      /** Read the recorded main session once; the sidebar entry and the call keep it current after that. */
-      function loadMain() {
-        if (snapshot.mainSessionId !== null) return Promise.resolve(snapshot.mainSessionId);
+      /** Keep the server's lineage; an unchanged one publishes nothing, so a poll repaints only on a rotation. */
+      function setLineage(entries) {
+        const lineage = (Array.isArray(entries) ? entries : []).filter(isLineageEntry);
+        if (snapshot.lineage !== null && JSON.stringify(lineage) === JSON.stringify(snapshot.lineage)) return;
+        publish({ lineage });
+      }
+
+      /**
+       * Read the recorded main session and its lineage once; `force` reads
+       * again, which is how a header follows a rotation.
+       */
+      function loadMain(options) {
+        const force = options?.force === true;
+        if (!force && snapshot.mainSessionId !== null && snapshot.lineage !== null) return Promise.resolve(snapshot.mainSessionId);
         return once("home", async () => {
           try {
             const body = await getJson(HOME_ROUTE);
             setMainSession(body?.mainSessionId);
+            setLineage(body?.lineage);
           } catch (_error) {
             // No main session known: no chips render, and the next tail asks again.
           }
@@ -6111,13 +6237,19 @@ window.__ModuleLoader__.load({
           VoiceDock
         )
       );
-      // "New main session" in the main session's header.
-      ctx.slots.inject("conversation.session.header.actions", () =>
+      // The session header: "new main session" in the main session, and the
+      // rotation follower — the main view moves to a new main session on its
+      // own, and an earlier segment's header links to it.
+      ctx.slots.inject("conversation.session.header.actions", () => [
         ctx.slots.register(
           { name: "conversation.session.header.actions", id: "discipline-whale-new-main", order: NEW_MAIN_ORDER, locale: NS },
           makeNewMainAction(memoryStore, t, { fetch: (url, init) => fetch(url, init), openSession })
-        )
-      );
+        ),
+        ctx.slots.register(
+          { name: "conversation.session.header.actions", id: "discipline-whale-rotated", order: ROTATED_ORDER, locale: NS },
+          makeRotationFollow(memoryStore, t, { openSession, sessions: ctx.sessions })
+        ),
+      ]);
       // The sidebar's own rows: the folder's color and the whale logo before a
       // dispatched session's title. Both are decoration — the Host's folder
       // row has no slot and the session row's leading seat belongs to the
@@ -6183,6 +6315,10 @@ window.__ModuleLoader__.load({
     module.exports.resolveMainSession = resolveMainSession;
     module.exports.createNewMainSession = createNewMainSession;
     module.exports.newMainActionView = newMainActionView;
+    module.exports.rotatedTo = rotatedTo;
+    module.exports.shouldAutoFollow = shouldAutoFollow;
+    module.exports.makeRotationFollow = makeRotationFollow;
+    module.exports.rotatedChipView = rotatedChipView;
     module.exports.restartActionFor = restartActionFor;
     module.exports.reauthUrl = reauthUrl;
     module.exports.isStaleBundleUrl = isStaleBundleUrl;

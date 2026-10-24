@@ -701,4 +701,129 @@ function sidebarScopeOf(rows) {
   console.log('ok 14 — only whale-dispatched sessions get the logo and workspace color')
 }
 
+// --- 15. following a rotation of the main session ------------------------
+//
+// `GET /home` carries `lineage`: each ended segment and its successor, oldest
+// first. A header on an earlier segment links to the current main session,
+// and a fresh rotation moves the main view there exactly once.
+
+{
+  const NOW = Date.parse('2026-10-25T12:00:00Z')
+  const minutesAgo = (minutes) => new Date(NOW - minutes * 60 * 1000).toISOString()
+  const entry = (sessionId, successor, endedAt) => ({ sessionId, successor, endedAt, reason: 'size', lastInputTokens: 180000, compactions: 3, seedFile: `home/rotations/${successor}.md` })
+  const snapshot = {
+    mainSessionId: 'main-c',
+    lineage: [entry('main-a', 'main-b', minutesAgo(90)), entry('main-b', 'main-c', minutesAgo(2))],
+  }
+  assert.equal(client.rotatedTo('main-a', snapshot), 'main-c', 'two segments walk to the current main session')
+  assert.equal(client.rotatedTo('main-b', snapshot), 'main-c')
+  assert.equal(client.rotatedTo('main-c', snapshot), null, 'the current main session is not rotated')
+  assert.equal(client.rotatedTo('worker-1', snapshot), null, 'a session outside the lineage is not rotated')
+  assert.equal(client.rotatedTo('main-a', { ...snapshot, lineage: null }), null)
+  const loop = { mainSessionId: 'main-c', lineage: [entry('x', 'y', minutesAgo(1)), entry('y', 'x', minutesAgo(1))] }
+  assert.equal(client.rotatedTo('x', loop), null, 'a cyclic lineage ends without an answer')
+
+  const followed = new Set()
+  const ask = (viewedSessionId) => client.shouldAutoFollow({ viewedSessionId, snapshot, followed, now: NOW })
+  assert.equal(ask('main-b'), true, 'a rotation two minutes old moves the view')
+  assert.equal(ask('main-b'), false, 'and only once')
+  assert.equal(ask('main-a'), false, 'a segment that ended 90 minutes ago only shows the chip')
+  assert.equal(ask('main-c'), false, 'the current main session never follows')
+  const next = { mainSessionId: 'main-d', lineage: [...snapshot.lineage, entry('main-c', 'main-d', minutesAgo(0))] }
+  assert.equal(client.shouldAutoFollow({ viewedSessionId: 'main-c', snapshot: next, followed, now: NOW }), true, 'the next rotation follows once more')
+
+  // The store keeps the lineage and `force` reads the home record again.
+  let home = { home: '/h', mainSessionId: 'main-b', lineage: [snapshot.lineage[0]] }
+  let reads = 0
+  const store = client.createMemoryStore({
+    fetch: async (url) => {
+      assert.equal(url, '/api/discipline-whale/home')
+      reads += 1
+      return json(200, home)
+    },
+  })
+  await store.loadMain()
+  await store.loadMain()
+  assert.equal(reads, 1, 'an unforced read is cached')
+  assert.deepEqual(store.getSnapshot().lineage, [snapshot.lineage[0]])
+  home = { home: '/h', ...snapshot }
+  await store.loadMain({ force: true })
+  assert.equal(reads, 2, 'a forced read asks again')
+  assert.equal(store.getSnapshot().mainSessionId, 'main-c')
+  assert.deepEqual(store.getSnapshot().lineage, snapshot.lineage)
+  const before = store.getSnapshot()
+  await store.loadMain({ force: true })
+  assert.equal(store.getSnapshot(), before, 'an unchanged lineage publishes nothing')
+
+  // The chip renders only on a lineage session's header, and opens the current main session.
+  const opened = []
+  const Follow = client.makeRotationFollow(store, t, { openSession: (id) => opened.push(id), sessions: {}, followed: new Set() })
+  for (const sessionId of ['main-c', 'worker-1', undefined]) {
+    assert.equal(Follow({ sessionId }), null, `no chip on ${sessionId}`)
+  }
+  for (const sessionId of ['main-a', 'main-b']) {
+    const chip = Follow({ sessionId })
+    assert.equal(chip.type, 'button')
+    assert.ok(textsOf(chip).includes('Continued →'))
+    chip.props.onClick()
+  }
+  assert.deepEqual(opened, ['main-c', 'main-c'])
+  for (const key of ['rotated', 'rotatedTitle']) {
+    assert.equal(typeof client.DICTIONARIES.zh[key], 'string', `zh has ${key}`)
+  }
+  assert.equal(client.DICTIONARIES.zh.rotated, '已续接 →')
+  console.log('ok 15 — rotatedTo walks the lineage, auto-follow fires once per rotation, and the chip shows only on lineage headers')
+}
+
+// --- 16. the follower's effects: polling and the one automatic switch -----
+//
+// A second instance of the browser half whose React runs effects at once and
+// keeps their cleanups, so mounting and unmounting can be observed.
+
+{
+  const cleanups = []
+  const effectReact = { ...React, useEffect: (run) => { const cleanup = run(); if (typeof cleanup === 'function') cleanups.push(cleanup) } }
+  const live = definition.factory(() => effectReact)
+  const endedAt = new Date(Date.now() - 60 * 1000).toISOString()
+  const home = { home: '/h', mainSessionId: 'main-b', lineage: [{ sessionId: 'main-a', successor: 'main-b', endedAt, reason: 'size', lastInputTokens: 1, compactions: 0, seedFile: 'home/rotations/main-b.md' }] }
+  const forced = []
+  const store = live.createMemoryStore({ fetch: async () => json(200, home) })
+  await store.loadMain()
+  const realLoad = store.loadMain
+  store.loadMain = (options) => { forced.push(options?.force === true); return realLoad(options) }
+  const intervals = []
+  const opened = []
+  const mainView = new Set(['main-a'])
+  const sessions = { list: { getSnapshot: () => ({ byId: Object.fromEntries([...mainView].map((id) => [id, { id, retainedBy: { mainView: 1 } }])) }) } }
+  const Follow = live.makeRotationFollow(store, t, {
+    openSession: (id) => opened.push(id),
+    sessions,
+    followed: new Set(),
+    setInterval: (fn, ms) => { intervals.push({ fn, ms, stopped: false }); return intervals.length },
+    clearInterval: (id) => { intervals[id - 1].stopped = true },
+  })
+
+  Follow({ sessionId: 'worker-1' })
+  assert.equal(intervals.length, 0, 'a worker header never polls')
+  assert.deepEqual(forced, [true], 'but it reads the home record fresh once, so a missed rotation is caught')
+  Follow({ sessionId: 'main-a' })
+  assert.deepEqual(opened, ['main-b'], 'the main view leaves the ended segment on its own')
+  assert.equal(intervals.length, 1)
+  assert.equal(intervals[0].ms, 5000, 'a lineage header polls every 5 s')
+  intervals[0].fn()
+  assert.equal(forced.at(-1), true, 'the poll forces a fresh read')
+  Follow({ sessionId: 'main-a' })
+  assert.deepEqual(opened, ['main-b'], 'a second look at the same segment keeps the chip only')
+  Follow({ sessionId: 'main-b' })
+  assert.equal(intervals.length, 3, 'the main session polls too')
+  for (const cleanup of cleanups.splice(0)) cleanup()
+  assert.ok(intervals.every((interval) => interval.stopped), 'unmount stops every poll')
+
+  mainView.clear()
+  const other = live.makeRotationFollow(store, t, { openSession: (id) => opened.push(id), sessions, followed: new Set(), setInterval: () => 0, clearInterval: () => {} })
+  other({ sessionId: 'main-a' })
+  assert.deepEqual(opened, ['main-b'], 'a header outside the main view never switches it')
+  console.log('ok 16 — lineage and main headers poll every 5 s until unmount; the main view switches once')
+}
+
 console.log('\nAll discipline-whale memory client checks passed.')
