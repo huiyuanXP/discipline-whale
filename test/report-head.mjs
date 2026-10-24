@@ -25,6 +25,7 @@ import {
   SMALL_REPORT_CHARS,
   estimateTokens,
   previewDocument,
+  reportIndexPath,
   sectionHeadings,
   setStoreRoot,
   writeReport,
@@ -269,15 +270,15 @@ let defaultHead
 }
 
 /* ------------------------------------------------------------------ *
- * 6. index is a disk scan over one workspace
+ * 6. index reads the workspace's index file
  * ------------------------------------------------------------------ */
 
 {
   const value = await run(tools, 'read_report', { mode: 'index', workspace: 'head-workspace' })
   assert.equal(value.returned, 'index')
-  assert.match(String(value.index.source), /disk scan/i, 'index must admit it scans the disk')
-  assert.match(String(value.index.source), /no index file/i, 'and must not pretend an index file exists')
+  assert.equal(value.index.source, reportIndexPath(home, WS.id), 'index names the file it read')
   assert.equal(value.index.count, 5)
+  assert.equal(value.index.total, 5)
   assert.equal(value.index.truncated, false)
   assert.equal(value.index.lines.length, 5)
   for (const line of value.index.lines) {
@@ -297,7 +298,7 @@ let defaultHead
   assert.equal(capped.index.truncated, true, 'a capped index must say it truncated')
   const violations = validateJsonSchemaValue(tool.output.schema, value, 'index')
   assert.deepEqual(violations, [])
-  console.log('ok 6 — mode:"index" lists the workspace as an explicit disk scan, capped and truncated')
+  console.log('ok 6 — mode:"index" reads the workspace index file, names it in index.source, capped and truncated')
 }
 
 /* ------------------------------------------------------------------ *
