@@ -35,8 +35,11 @@ import { currentMainFor } from './state.js'
 import {
   MAX_DOCUMENT_CHARS,
   boundSummary,
+  listReports,
   storeRoot,
+  writeIndexSummary,
   writeReport,
+  writeReportIndex,
 } from './store.js'
 import { newQuestion, writeQuestion } from './questions.js'
 
@@ -181,10 +184,8 @@ async function sessionEvidence(ctx, exec, sessionId) {
   return { dispatched, cwd: typeof cwd === 'string' ? cwd : undefined }
 }
 
-/** The workspace whose path is this Session's cwd, when one is registered. */
-function workspaceForCwd(ctx, cwd) {
-  if (cwd === undefined) return undefined
-  const trim = (value) => String(value).replace(/\/+$/, '')
+/** Every registered workspace this row can see; empty when the Host offers no registry. */
+function registeredWorkspaces(ctx) {
   let registry
   try {
     registry = typeof ctx.get === 'function' ? ctx.get('workspaceRegistry') : undefined
@@ -198,8 +199,98 @@ function workspaceForCwd(ctx, cwd) {
       registry = undefined
     }
   }
-  const all = registry?.list?.() ?? []
-  return all.find((workspace) => typeof workspace?.path === 'string' && trim(workspace.path) === trim(cwd))
+  try {
+    return registry?.list?.() ?? []
+  } catch {
+    return []
+  }
+}
+
+/** The workspace whose path is this Session's cwd, when one is registered. */
+function workspaceForCwd(ctx, cwd) {
+  if (cwd === undefined) return undefined
+  const trim = (value) => String(value).replace(/\/+$/, '')
+  return registeredWorkspaces(ctx).find(
+    (workspace) => typeof workspace?.path === 'string' && trim(workspace.path) === trim(cwd),
+  )
+}
+
+/* ------------------------------------------------------------------ *
+ * report pushes: one wake-up per new piece of information
+ * ------------------------------------------------------------------ */
+
+/** The `callId` of every `report_to_main` call in a Session's events. */
+function reportCallIds(events) {
+  const ids = new Set()
+  for (const event of events) {
+    if (event?.type === 'tool/call' && event.data?.name === 'report_to_main' && event.data?.callId !== undefined) {
+      ids.add(event.data.callId)
+    }
+  }
+  return ids
+}
+
+/**
+ * Whether a report wakes the main session, or is stored as a revision only.
+ *
+ * `previous` is the newest report of the same dispatch that already reached a
+ * main session, read from disk. `events` are the worker's own Session events
+ * (`agent.session.snapshotEvents()`). `target` is the main session this report
+ * would be pushed to. The rules, in order:
+ *
+ *   1. no `previous` → push
+ *   2. `previous.deliveredTo` lacks `target` (the main session rotated) → push
+ *   3. a `source.kind === 'user'` message arrived after the last successful
+ *      `report_to_main` result — a new instruction → push. Events that show no
+ *      such result prove nothing, so they push too.
+ *   4. the outcome differs from `previous.outcome` → push
+ *   5. otherwise → store as a revision of `previous`, no push
+ *
+ * @returns {{ push: boolean, reason: string }}
+ */
+export function shouldPushReport({ previous, events, outcome, target }) {
+  if (previous === undefined || previous === null) {
+    return { push: true, reason: 'no earlier delivered report for this dispatch' }
+  }
+  const deliveredTo = Array.isArray(previous.deliveredTo) ? previous.deliveredTo : []
+  if (!deliveredTo.includes(target)) {
+    return { push: true, reason: `${previous.id} never reached ${target}` }
+  }
+  const list = Array.isArray(events) ? events : []
+  const calls = reportCallIds(list)
+  let anchor = -1
+  list.forEach((event, index) => {
+    if (event?.type !== 'tool/result' || event.data?.message?.isError === true) return
+    if (calls.has(event.data?.message?.toolCallId)) anchor = index
+  })
+  if (anchor === -1) {
+    return { push: true, reason: 'no earlier report_to_main result in this Session' }
+  }
+  const instructed = list
+    .slice(anchor + 1)
+    .some((event) => event?.type === 'user/message' && event.data?.source?.kind === 'user')
+  if (instructed) return { push: true, reason: `new instruction since ${previous.id}` }
+  if (outcome !== previous.outcome) {
+    return { push: true, reason: `outcome changed since ${previous.id}: ${previous.outcome} → ${outcome}` }
+  }
+  return { push: false, reason: `no new instruction since ${previous.id}, same outcome` }
+}
+
+/** The newest report of one dispatch that already reached a main session, from disk. */
+async function previousDelivery(dispatch) {
+  if (dispatch.workspaceId === undefined) return undefined
+  const reports = await listReports(storeRoot(), dispatch.workspaceId)
+  return reports.find((report) => report.dispatchId === dispatch.dispatchId && report.status === 'delivered')
+}
+
+/** This Session's own events, or none when the Host cannot snapshot them. */
+function ownEvents(exec) {
+  try {
+    const events = exec?.agent?.session?.snapshotEvents?.()
+    return Array.isArray(events) ? events : []
+  } catch {
+    return []
+  }
 }
 
 /**
@@ -346,7 +437,7 @@ function reportToMainTool(ctx, config) {
   return {
     name: 'report_to_main',
     description:
-      'Report your result to the main session that dispatched this task. Call this exactly once before finishing. The summary is pushed to the main session immediately, which wakes it; the document is stored and read only if someone needs the detail. If the Host restarted and the dispatch record is gone, the report is still written to the store and the result says deliveredToMain: false with orphaned: true, plus a warning telling the main session to fetch it with read_report.',
+      'Report your result to the main session that dispatched this task. Call this exactly once before finishing. The summary is pushed to the main session immediately, which wakes it; the document is stored and read only if someone needs the detail. If the Host restarted and the dispatch record is gone, the report is still written to the store and the result says deliveredToMain: false with orphaned: true, plus a warning telling the main session to fetch it with read_report. A further report for the same dispatch with no new instruction since the last delivered one and the same status is stored as a revision of it and wakes nobody: deliveredToMain: false with revisionOf set.',
     parameters: {
       type: 'object',
       additionalProperties: false,
@@ -382,6 +473,7 @@ function reportToMainTool(ctx, config) {
         properties: {
           reportId: { type: 'string' },
           deliveredToMain: { type: 'boolean' },
+          revisionOf: { type: 'string' },
           orphaned: { type: 'boolean' },
           warnings: { type: 'array', items: { type: 'string' } },
         },
@@ -460,6 +552,13 @@ function reportToMainTool(ctx, config) {
         )
       }
       const orphaned = dispatch.mainSessionId === undefined
+      // Read before this report lands, so `previous` is never the report itself.
+      let previous
+      try {
+        previous = await previousDelivery(dispatch)
+      } catch (error) {
+        ctx.logger?.warn?.(`discipline-whale: could not read earlier reports of ${dispatch.dispatchId}: ${error?.message ?? error}`)
+      }
 
       const report = {
         id: `r-${randomUUID()}`,
@@ -502,6 +601,7 @@ function reportToMainTool(ctx, config) {
       clearRetries(dispatch.dispatchId)
 
       let delivered = false
+      let revisionOf
       if (dispatch.mainSessionId === undefined) {
         if (!orphaned) {
           warnings.push('the dispatch recorded no main session id; the report was stored but not pushed')
@@ -511,41 +611,69 @@ function reportToMainTool(ctx, config) {
           // The dispatching main session may have rotated since: the push goes
           // to whichever Session continues it now.
           const target = await currentMainFor(dispatch.mainSessionId, storeRoot())
-          await ctx.sessionController.prompt(
-            {
-              requestId: randomUUID(),
-              sessionId: target,
-              mode: 'queue',
-              content: [
-                {
-                  type: 'text',
-                  text: [
-                    `${PUSH_PREFIXES.report}${dispatch.workspaceTitle} (${outcome})`,
-                    '',
-                    report.summary,
-                    '',
-                    `report id: ${report.id}`,
-                    'Call read_report with that id for the full document.',
-                  ].join('\n'),
-                },
-              ],
-            },
-            signalOf(exec),
-          )
-          report.deliveredTo = [target]
-          report.status = 'delivered'
+          const verdict = shouldPushReport({ previous, events: ownEvents(exec), outcome, target })
+          if (verdict.push) {
+            await ctx.sessionController.prompt(
+              {
+                requestId: randomUUID(),
+                sessionId: target,
+                mode: 'queue',
+                content: [
+                  {
+                    type: 'text',
+                    text: [
+                      `${PUSH_PREFIXES.report}${dispatch.workspaceTitle} (${outcome})`,
+                      '',
+                      report.summary,
+                      '',
+                      `report id: ${report.id}`,
+                      'Call read_report with that id for the full document.',
+                    ].join('\n'),
+                  },
+                ],
+              },
+              signalOf(exec),
+            )
+            report.deliveredTo = [target]
+            report.status = 'delivered'
+          } else {
+            // The main session already holds this dispatch's result and nothing
+            // asked for more: the report is kept as a revision and the main
+            // session is left asleep.
+            report.revisionOf = previous.id
+            report.pushSuppressed = { reason: verdict.reason }
+          }
           await writeReport(storeRoot(), report)
-          delivered = true
+          if (verdict.push) {
+            delivered = true
+          } else {
+            revisionOf = previous.id
+            warnings.push('已存为修订版，不再唤醒主会话')
+          }
         } catch (error) {
           warnings.push(`report stored but the push to the main session failed: ${String(error?.message ?? error)}`)
         }
       }
 
-      if (delivered) await dropCheckpoint(workerSessionId, dispatch.dispatchId)
+      // A revision leaves the dispatch exactly as finished as the delivery it revises.
+      if (delivered || revisionOf !== undefined) await dropCheckpoint(workerSessionId, dispatch.dispatchId)
+
+      // The index file is a view of the report folder: a failed rewrite is
+      // healed by the next reader, so it never fails the report.
+      if (dispatch.workspaceId !== undefined) {
+        try {
+          await writeReportIndex(storeRoot(), dispatch.workspaceId, dispatch.workspaceTitle)
+          const known = registeredWorkspaces(ctx).map((workspace) => ({ id: workspace.id, title: workspace.title }))
+          await writeIndexSummary(storeRoot(), [...known, { id: dispatch.workspaceId, title: dispatch.workspaceTitle }])
+        } catch (error) {
+          ctx.logger?.warn?.(`discipline-whale: report index for ${dispatch.workspaceId} not rewritten: ${error?.message ?? error}`)
+        }
+      }
 
       return {
         reportId: report.id,
         deliveredToMain: delivered,
+        ...(revisionOf === undefined ? {} : { revisionOf }),
         ...(orphaned ? { orphaned: true } : {}),
         ...(warnings.length === 0 ? {} : { warnings }),
       }

@@ -57,6 +57,7 @@ DSH 里已经有 `subagent`（同一会话内的子代理）和 `dsh-webhook`（
 **分成两半是有意的**：
 - `summary` 被**主动推送**成主会话的一条消息，直接唤醒主 Agent —— 主会话不需要轮询、不需要调工具。
 - `document` 落到磁盘，不会自动进上下文：主会话要看时用 `read_report`，而它**默认只给 head**（元信息 + 完整 `summary` + 章节标题 + 前 2000 字符），确实需要整份才显式 `mode: "full"`。
+- **一次新信息只唤醒一次**：同一个派工已经投递过报告后，worker 再次 `report_to_main` 时由 `shouldPushReport` 判定。上一份已投到当前主会话、之后 worker 没收到新指令（`source.kind: "user"` 的消息）、结论也没变，这份就存为上一份的修订版（`revisionOf`、`pushSuppressed`），不推送；工具返回 `deliveredToMain: false`、`revisionOf` 和警告「已存为修订版，不再唤醒主会话」。主会话读上一份时，head 里的 `newerRevision` 指向最新修订版。真实日志回放：`node scripts/dedupe-replay.mjs`。
 
 ### `read_report`（主会话）
 ```json
@@ -68,9 +69,9 @@ DSH 里已经有 `subagent`（同一会话内的子代理）和 `dsh-webhook`（
 |---|---|---|
 | `head`（默认，可省略） | `chars` / `estimatedTokens`、`id` / `status` / `outcome` / `reportedAt` / `workerSessionId`、**完整 `summary`**、章节标题（只取代码块之外的 ATX `#`~`###`）、文档前 2000 字符预览、`documentTruncated`，以及一句 `howToReadFull`（里面写着 `read_report(report_id="…", mode="full")`） | 判断「这份要不要读全」，通常够直接答复用户 |
 | `full` | 整份 `document`，也就是旧行为 | 只在 head 的预览与标题不足以回答时 |
-| `index` | 一个工作区一行一份：`- <reportedAt> [<status>/<outcome>] <summary 首行，≤120 字> — <reportId>` | 扫一眼有哪些报告，不读正文 |
+| `index` | 一个工作区一行一份，新的在前：`- <reportedAt> [<status>/<outcome>] (revision of <id>) <label> · <summary 首行，≤120 字> — <reportId>`（修订标记和 label 有才出现，没有 label 时只写 summary 首行） | 扫一眼有哪些报告，不读正文 |
 
-`mode: "index"` 是**磁盘扫描**：M2 才会有真正的索引文件，现在没有；返回值里的 `index.source` 就是这么写的（还带 `count` / `total` / `truncated`），不会假装有索引。不带 `report_id` 的列表调用行为不变。
+`mode: "index"` 读**索引文件** `home/index/<workspaceKey>.md`：每次 `report_to_main` 落盘后重写，超过 100 行时保留最新 75 行 +「… 省略 N 份 …」+ 最老 25 行；`home/index/ALL.md` 每个工作区一行（份数 + 索引路径）。读取时**自愈**：文件缺失，或 header 里的 `count` 与报告目录里 `*.json` 的个数不一致，就先重建再读，返回 `index.rebuilt: true`。`index.source` 是索引文件路径，另带 `count`（本次返回的行数）/ `total`（header 里的份数）/ `truncated`。索引在 home 里，主会话的只读文件工具也能直接读。不带 `report_id` 的列表调用行为不变。
 
 **短报告不走预览**：`document` 不足 3000 字符时直接整份返回，`returned: "full (small report)"`——为省 1000 字再让主会话多花一次往返不划算。这一档**不带 `sectionHeadings`**：整份文档里本来就看得见标题，再列一遍反而让它比 `mode:"full"` 还贵（实测 6 份小报告贵 8%–15%）；`test/report-head.mjs` ok 5 比较两者渲染后的字符数来防止这条退化。
 
@@ -583,6 +584,8 @@ scripts/install-local.sh          # 默认 profile: web
 ```
 $DSH_HOME/discipline-whale/state.json                               ← 插件状态（主会话 id）
 $DSH_HOME/discipline-whale/home/                                    ← 主会话的工作目录
+$DSH_HOME/discipline-whale/home/index/<workspaceKey>.md             ← 报告索引（每次报告后重写，读时自愈）
+$DSH_HOME/discipline-whale/home/index/ALL.md                        ← 全部工作区的索引汇总：份数 + 索引路径
 $DSH_HOME/discipline-whale/reports/<workspaceId>/<reportId>.json    ← 报告
 $DSH_HOME/discipline-whale/dispatches/<workerSessionId>.json        ← 派工检查点
 $DSH_HOME/discipline-whale/dispatches/<workerSessionId>.abandoned   ← 用户放弃的派工

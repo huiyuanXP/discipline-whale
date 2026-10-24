@@ -1,6 +1,13 @@
 /**
- * Report pushes: recognizing them, and keeping them out of the user's turns.
+ * Report pushes: one wake-up per new piece of information, recognizing every
+ * push, and keeping pushes out of the user's turns.
  *
+ *   1. shouldPushReport: one row per rule 1–5
+ *   2. two report_to_main calls with only a dsh-doublecheck nudge between and
+ *      the same outcome: one push; the second report is a revision carrying
+ *      the dispatch's label
+ *   3. a `source.kind: 'user'` message between the two: two pushes
+ *   4. partial, then done: two pushes
  *   5. isWhalePushText recognizes every text the worker side, the home side and
  *      the rotation seed build, and nothing the user types
  *   6. the memory row records no `kind:"turn"` for a report push or a 【续接】
@@ -19,8 +26,10 @@ import * as mainRow from '../main.js'
 import { installMemory } from '../memory-row.js'
 import { PUSH_PREFIXES, isHumanMessage, isWhalePushText } from '../pushes.js'
 import { resetRegistry } from '../registry.js'
-import { clearStoreRoot, dataDir, readReport, setStoreRoot } from '../store.js'
+import { dispatchCheckpointPath } from '../checkpoint.js'
+import { clearStoreRoot, dataDir, listReports, readReport, readReportIndex, setStoreRoot } from '../store.js'
 import * as workerRow from '../worker.js'
+import { shouldPushReport } from '../worker.js'
 
 const root = await mkdtemp(join(tmpdir(), 'whale-report-dedupe-'))
 setStoreRoot(root)
@@ -57,6 +66,32 @@ function mount(row, config = {}) {
 
 const execAs = (sessionId) => ({ signal: new AbortController().signal, agent: { session: { id: sessionId } } })
 
+/**
+ * A worker Session whose `snapshotEvents()` grows the way the Host log does:
+ * each report_to_main call appends its tool/call before it runs and its
+ * tool/result after it returns.
+ */
+function workerSession(sessionId) {
+  const events = [{ type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: 'You are a Discipline Whale worker…' }] } }]
+  let calls = 0
+  const exec = { signal: new AbortController().signal, agent: { session: { id: sessionId, snapshotEvents: () => [...events] } } }
+  return {
+    say(kind, text) {
+      events.push({ type: 'user/message', data: { source: { kind }, content: [{ type: 'text', text }] } })
+    },
+    async report(tool, args) {
+      const callId = `call-${++calls}`
+      events.push({ type: 'tool/call', data: { name: 'report_to_main', callId, arguments: JSON.stringify(args) } })
+      const value = await tool.execute(args, exec)
+      events.push({ type: 'tool/result', data: { message: { role: 'tool', toolCallId: callId, isError: false, content: [{ type: 'text', text: JSON.stringify(value) }] } } })
+      return value
+    },
+  }
+}
+
+/** The reports of one dispatch on disk. */
+const reportsOf = async (dispatchId) => (await listReports(root, WS.id)).filter((report) => report.dispatchId === dispatchId)
+
 /** A fake Host context with the services the memory row reads. */
 function memoryHost() {
   const listeners = new Map()
@@ -84,6 +119,99 @@ const turnRows = async () => {
 }
 
 try {
+  // 1 — the decision table, one row per rule.
+  {
+    const previous = { id: 'r-1', outcome: 'done', deliveredTo: [MAIN] }
+    const call = { type: 'tool/call', data: { name: 'report_to_main', callId: 'c-1' } }
+    const result = { type: 'tool/result', data: { message: { toolCallId: 'c-1', isError: false } } }
+    const nudge = { type: 'user/message', data: { source: { kind: 'dsh-doublecheck' }, content: [] } }
+    const instruction = { type: 'user/message', data: { source: { kind: 'user' }, content: [] } }
+    const settled = [call, result, nudge]
+    const rows = [
+      ['1 no previous', { previous: undefined, events: settled, outcome: 'done', target: MAIN }, true, /no earlier delivered report/],
+      ['2 another main', { previous, events: settled, outcome: 'done', target: 'main-2' }, true, /never reached main-2/],
+      ['3 new instruction', { previous, events: [...settled, instruction], outcome: 'done', target: MAIN }, true, /new instruction since r-1/],
+      ['3 no earlier result', { previous, events: [nudge], outcome: 'done', target: MAIN }, true, /no earlier report_to_main result/],
+      ['4 outcome changed', { previous: { ...previous, outcome: 'partial' }, events: settled, outcome: 'done', target: MAIN }, true, /partial → done/],
+      ['5 revision', { previous, events: settled, outcome: 'done', target: MAIN }, false, /^no new instruction since r-1, same outcome$/],
+    ]
+    for (const [name, input, push, reason] of rows) {
+      const verdict = shouldPushReport(input)
+      assert.equal(verdict.push, push, name)
+      assert.match(verdict.reason, reason, name)
+    }
+    const instructedBefore = shouldPushReport({ previous, events: [instruction, call, result, nudge], outcome: 'done', target: MAIN })
+    assert.equal(instructedBefore.push, false, 'an instruction before the last report result is not a new one')
+    console.log('ok 1 — shouldPushReport: rules 1–5 each decide their own row')
+  }
+
+  // 2 — a doublecheck nudge, same outcome: one push, the second report is a revision.
+  {
+    const main = mount(mainRow)
+    const worker = mount(workerRow)
+    const dispatched = await main.tools.get('dispatch_task').execute(
+      { workspace: 'blog', task: 'Fix the sitemap.', topic: 'sitemap', title: '修 sitemap' },
+      execAs(MAIN),
+    )
+    const checkpoint = JSON.parse(await readFile(dispatchCheckpointPath(root, dispatched.workerSessionId), 'utf8'))
+    assert.equal(checkpoint.title, '修 sitemap')
+    const session = workerSession(dispatched.workerSessionId)
+    const tool = worker.tools.get('report_to_main')
+    const first = await session.report(tool, { summary: 'Sitemap fixed.' })
+    session.say('dsh-doublecheck', 'Double-check your work before finishing.')
+    const second = await session.report(tool, { summary: 'Sitemap fixed; checked twice.' })
+    assert.equal(first.deliveredToMain, true)
+    assert.equal(worker.prompts.length, 1, 'the main session is woken once')
+    assert.equal(second.deliveredToMain, false)
+    assert.equal(second.revisionOf, first.reportId)
+    assert.ok(second.warnings.includes('已存为修订版，不再唤醒主会话'))
+    const stored = await reportsOf(dispatched.dispatchId)
+    assert.deepEqual(stored.map((report) => report.id).sort(), [first.reportId, second.reportId].sort())
+    const revision = stored.find((report) => report.id === second.reportId)
+    assert.equal(revision.revisionOf, first.reportId)
+    assert.equal(revision.status, 'reported')
+    assert.deepEqual(revision.pushSuppressed, { reason: `no new instruction since ${first.reportId}, same outcome` })
+    assert.equal(revision.label, '修 sitemap', 'the revision carries the label the checkpoint recorded')
+    const index = await readReportIndex(root, WS.id)
+    assert.equal(index.count, (await listReports(root, WS.id)).length, 'report_to_main leaves the index file current')
+    assert.ok(index.text.includes(`(revision of ${first.reportId}) 修 sitemap · `), 'the index marks the revision')
+
+    const head = await main.tools.get('read_report').execute({ report_id: first.reportId }, execAs(MAIN))
+    assert.equal(head.report.newerRevision, second.reportId, 'reading the delivered report points at its newer revision')
+    console.log('ok 2 — only a dsh-doublecheck nudge between, same outcome: 1 push, 2 reports, the second a labelled revision')
+  }
+
+  // 3 — a new instruction between: two pushes.
+  {
+    const main = mount(mainRow)
+    const worker = mount(workerRow)
+    const dispatched = await main.tools.get('dispatch_task').execute({ workspace: 'blog', task: 'Tune the feed.', topic: 'feed' }, execAs(MAIN))
+    const session = workerSession(dispatched.workerSessionId)
+    const tool = worker.tools.get('report_to_main')
+    await session.report(tool, { summary: 'Feed tuned.' })
+    session.say('user', 'Also cap the feed at 20 items.')
+    const second = await session.report(tool, { summary: 'Feed tuned and capped.' })
+    assert.equal(worker.prompts.length, 2)
+    assert.equal(second.deliveredToMain, true)
+    assert.equal(second.revisionOf, undefined)
+    console.log('ok 3 — a source.kind:"user" message between the two reports: 2 pushes')
+  }
+
+  // 4 — partial, then done: two pushes.
+  {
+    const main = mount(mainRow)
+    const worker = mount(workerRow)
+    const dispatched = await main.tools.get('dispatch_task').execute({ workspace: 'blog', task: 'Port the theme.', topic: 'theme' }, execAs(MAIN))
+    const session = workerSession(dispatched.workerSessionId)
+    const tool = worker.tools.get('report_to_main')
+    await session.report(tool, { summary: 'Half the theme is ported.', status: 'partial' })
+    session.say('dsh-doublecheck', 'Double-check your work before finishing.')
+    const second = await session.report(tool, { summary: 'Theme ported.', status: 'done' })
+    assert.equal(worker.prompts.length, 2)
+    assert.equal(second.deliveredToMain, true)
+    console.log('ok 4 — the outcome moves from partial to done: 2 pushes')
+  }
+
   // 5 — capture the texts the worker side really pushes.
   const main = mount(mainRow)
   const worker = mount(workerRow, { maxReportRetries: 1 })

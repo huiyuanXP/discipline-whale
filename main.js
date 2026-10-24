@@ -24,7 +24,15 @@ import { dispatchBootstrap, noteDispatch } from './memory-row.js'
 import { dispatchForWorker, listDispatches, recordDispatch } from './registry.js'
 import { GUARD_CONFIG_KEYS, installGuard, resolveGuardConfig } from './guard.js'
 import { BREVITY_CONFIG_KEYS, installBrevity } from './adhd.js'
-import { indexReportLine, isReportId, listReports, readReport, reportDir, storeRoot, summarizeReport } from './store.js'
+import {
+  ensureReportIndex,
+  isReportId,
+  listReports,
+  readReport,
+  storeRoot,
+  summarizeReport,
+  writeIndexSummary,
+} from './store.js'
 
 /**
  * A usable AbortSignal for a Host call.
@@ -506,6 +514,25 @@ function dispatchTaskTool(ctx, config) {
   }
 }
 
+/**
+ * The newest revision stored after `report` for the same dispatch, by id.
+ *
+ * A worker that reports again without a new instruction and with the same
+ * outcome stores a revision instead of waking the main session; a read of the
+ * delivered report points at it so the newer text is one call away.
+ */
+async function newerRevisionOf(workspaceId, report) {
+  if (report.dispatchId === undefined) return undefined
+  const reports = await listReports(storeRoot(), workspaceId)
+  return reports.find(
+    (other) =>
+      other.dispatchId === report.dispatchId &&
+      other.id !== report.id &&
+      typeof other.revisionOf === 'string' &&
+      (other.revisionOf === report.id || String(other.reportedAt ?? '') > String(report.reportedAt ?? '')),
+  )?.id
+}
+
 function readReportTool(ctx) {
   // The three reads this tool offers. `head` is the default, and it is a real
   // default: `mode` below falls back to it when the argument is omitted.
@@ -517,7 +544,7 @@ function readReportTool(ctx) {
       'Read one worker report, or list recent reports for a workspace. Summaries already arrive as pushed messages. ' +
       `\`mode\` defaults to "head": metadata, the full summary, section headings, and the first part of the document — ` +
       `that is usually enough to decide. Ask for mode:"full" only when the head preview is not enough, ` +
-      `or mode:"index" to see one workspace's reports as a one-line-each disk scan.`,
+      `or mode:"index" to read one workspace's report index file: one line per report, newest first.`,
     parameters: {
       type: 'object',
       additionalProperties: false,
@@ -532,7 +559,7 @@ function readReportTool(ctx) {
           description:
             'How much to return. "head" (default): metadata + full summary + section headings + a bounded document ' +
             'preview, plus how to get the rest. Reports under 3000 characters come back whole. "full": the whole ' +
-            'document. "index": one line per report in a workspace, scanned from disk.',
+            'document. "index": one line per report in a workspace, read from its index file.',
         },
       },
     },
@@ -554,7 +581,7 @@ function readReportTool(ctx) {
             type: 'object',
             additionalProperties: true,
             properties: {},
-            description: 'Only on mode:"index": the disk scan that was performed and its one-line entries.',
+            description: 'Only on mode:"index": the index file that answered (`source`), whether it was rebuilt, and its one-line entries.',
           },
         },
       },
@@ -575,18 +602,25 @@ function readReportTool(ctx) {
           throw new Error('`mode:"index"` lists a workspace; it cannot be combined with `report_id`')
         }
         const workspace = await resolveWorkspace(ctx.workspaceRegistry, args.workspace)
-        const all = await listReports(storeRoot(), workspace.id)
-        const lines = all.slice(0, limit).map((report) => indexReportLine(report))
+        // The index file is rewritten after every report; one whose header count
+        // no longer matches the report folder is rebuilt here before it is read.
+        const index = await ensureReportIndex(storeRoot(), workspace.id, workspace.title)
+        if (index.rebuilt) {
+          await writeIndexSummary(storeRoot(), ctx.workspaceRegistry.list()).catch((error) => {
+            ctx.logger?.warn?.(`discipline-whale: ALL.md not rewritten: ${error?.message ?? error}`)
+          })
+        }
+        const entries = index.text.split('\n').filter((line) => line.startsWith('- '))
+        const lines = entries.slice(0, limit)
         return {
           index: {
-            // M2 will add a real index file; until then this is a scan of the
-            // report directory, and it says so rather than implying an index.
-            source: `disk scan of ${reportDir(storeRoot(), workspace.id)} (no index file exists yet)`,
+            source: index.path,
+            rebuilt: index.rebuilt,
             workspaceId: workspace.id,
             workspaceTitle: workspace.title,
             count: lines.length,
-            total: all.length,
-            truncated: all.length > lines.length,
+            total: index.count,
+            truncated: index.count > lines.length,
             lines,
           },
           returned: 'index',
@@ -598,8 +632,11 @@ function readReportTool(ctx) {
         for (const workspace of ctx.workspaceRegistry.list()) {
           const report = await readReport(storeRoot(), workspace.id, args.report_id)
           if (report === undefined) continue
-          if (mode === 'full') return { report, returned: 'full' }
-          return summarizeReport(report)
+          const newer = await newerRevisionOf(workspace.id, report)
+          const extra = newer === undefined ? {} : { newerRevision: newer }
+          if (mode === 'full') return { report: { ...report, ...extra }, returned: 'full' }
+          const value = summarizeReport(report)
+          return { ...value, report: { ...value.report, ...extra } }
         }
         return { note: `no report with id "${args.report_id}" was found in any workspace` }
       }
