@@ -1,6 +1,6 @@
 {
   "name": "discipline-whale",
-  "version": "0.6.6",
+  "version": "0.7.0",
   "description": "Discipline Whale for DeepSeek Harness: one main conversation routes work into workspaces, workers report back as pushed messages, and a turn-end check makes the report contract real.",
   "license": "MIT",
   "author": "huiyuanXP",
