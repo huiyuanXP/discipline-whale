@@ -13,7 +13,7 @@ import { mkdtemp, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-import { readWorkspaceCards, renderWorkspaces, setWorkspaceIntro } from '../activity.js'
+import { readWorkspaceCards, setWorkspaceIntro } from '../activity.js'
 import { collectNewDaily, dreamsLogPath, runDream, shouldDream } from '../dream.js'
 import { readCursor, runFlush } from '../memory-flush.js'
 import {
@@ -51,13 +51,13 @@ try {
   const first = await runFlush({
     homeDir: root,
     transcript: [
-      { role: 'context', text: '## 正在进行的对话 …' },
+      { role: 'context', text: '# 我们正在做什么（按工作区，只列活跃的）…' },
       { role: 'user', text: '博客迁到 Astro，RSS 先做' },
       { role: 'tool', toolName: 'dispatch_task' },
       { role: 'assistant', text: '已派给 blog' },
     ],
     complete: async ({ user }) => {
-      assert.ok(!user.includes('## 正在进行的对话'), 'injected context stays out of the flush prompt')
+      assert.ok(!user.includes('# 我们正在做什么'), 'injected context stays out of the flush prompt')
       return JSON.stringify({
         daily: [1, 2, 3, 4, 5].map((n) => ({ text: `观察 ${n}：博客迁移相关决定` })),
         user_now: ['Prefer 本周先把博客 RSS 做完'],
@@ -75,7 +75,7 @@ try {
   )
   assert.equal((await readDaily(root, day)).length, 5)
   assert.match((await readLayer(root, 'user')).text, /本周先把博客 RSS 做完/)
-  assert.match(renderWorkspaces(workspaces, await readWorkspaceCards(root)), /正在迁移到 Astro/)
+  assert.match((await readWorkspaceCards(root))['ws-blog'].intro, /正在迁移到 Astro/)
   assert.equal((await readCursor(root)).lastFlushAt, now.toISOString())
   console.log('ok 1 — flush writes daily, Now and the workspace intro through the real store')
 

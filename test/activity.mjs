@@ -1,5 +1,5 @@
 /**
- * Tests for activity.js: workspace cards, conversation entries, tags, bootstrap.
+ * Tests for activity.js: workspace cards, dispatch state, tags, bootstrap.
  *
  * Run: node test/activity.mjs
  */
@@ -12,19 +12,18 @@ import { join } from 'node:path'
 import {
   PALETTE,
   buildBootstrap,
-  conversationEntries,
   defaultColor,
-  historyCount,
+  dispatchState,
+  readTagRows,
   readTags,
   readWorkspaceCards,
   recordUserTurn,
-  renderConversations,
-  renderWorkspaces,
   setWorkspaceColor,
   setWorkspaceIntro,
+  tagMention,
   tagTurn,
 } from '../activity.js'
-import { charLength, clip, parseEntry } from '../entry.js'
+import { charLength, parseEntry } from '../entry.js'
 import { dataDir } from '../store.js'
 
 const root = await mkdtemp(join(tmpdir(), 'dw-activity-'))
@@ -45,13 +44,7 @@ try {
     pass('palette + defaultColor')
   }
 
-  // 2. historyCount boundaries
-  {
-    assert.deepEqual([0, 1, 12, 13, 20].map(historyCount), [5, 5, 5, 6, 8])
-    pass('historyCount boundaries')
-  }
-
-  // 3. cards: intro, color, concurrency, missing file
+  // 2. cards: intro, color, concurrency, missing file
   {
     const home = await newHome()
     assert.deepEqual(await readWorkspaceCards(home), {})
@@ -96,22 +89,7 @@ try {
     pass('cards: intro/color/concurrency')
   }
 
-  // 4. renderWorkspaces incl. missing card
-  {
-    const workspaces = [
-      { id: 'ws-a', title: 'blog', path: '/w/blog' },
-      { id: 'ws-b', title: 'whale', path: '/w/whale' },
-    ]
-    const out = renderWorkspaces(workspaces, { 'ws-a': { intro: '个人博客', color: '#000000', updatedAt: '2026-10-21' } })
-    assert.equal(out, '## 工作区\n- blog · 个人博客 [id: ws-a; updated: 2026-10-21]\n- whale · （待补充） [id: ws-b]')
-    assert.deepEqual(parseEntry(out.split('\n')[1]).meta, { id: 'ws-a', updated: '2026-10-21' })
-    assert.equal(renderWorkspaces([], {}), '')
-    assert.equal(renderWorkspaces(workspaces, { 'ws-b': { intro: '', color: '#111111' } }).split('\n')[2], '- whale · （待补充） [id: ws-b]')
-    assert.equal(renderWorkspaces(workspaces, {}), renderWorkspaces(workspaces, {}))
-    pass('renderWorkspaces (missing card, empty list)')
-  }
-
-  // 5. conversation classification
+  // 3. dispatch state: running and ended
   const iso = (day, hour = 10) => new Date(2026, 9, day, hour, 5).toISOString()
   const dispatch = (n, extra = {}) => ({
     dispatchId: `d-${n}`,
@@ -148,60 +126,28 @@ try {
       report(6, { status: 'abandoned', outcome: 'abandoned' }),
       report(7, { status: 'delivered' }),
     ]
-    const { running, history } = conversationEntries({ dispatches, reports })
+    const { running, ended } = dispatchState({ dispatches, reports })
     // d-1 reported, d-4/d-5 abandoned, d-6 abandoned report, d-7 delivered: only d-2 and d-3 run
-    assert.deepEqual(running.map((entry) => entry.meta.dispatch), ['d-3', 'd-2'])
-    assert.equal(running[1].text, '[blog] rss migration — 进行中')
-    assert.equal(running[0].text, `[blog] ${clip('task body number 3 '.repeat(10), 60)} — 进行中`)
-    assert.equal(running[1].meta.session, '9c1e4b0a')
-    assert.match(running[1].meta.started, /^2026-10-02 10:05$/)
-    assert.ok(running.every((entry) => charLength(entry.text) <= 240))
-    // history: terminal reports only (pending excluded), newest first
-    assert.deepEqual(history.map((entry) => entry.meta.report), ['r-7', 'r-6', 'r-1'])
-    assert.equal(history[2].text, '[blog] Fix build — done：summary 1')
-    assert.equal(history[2].meta.ended, '2026-10-01')
-    assert.equal(history[1].text, '[blog] abandoned：summary 6')
+    assert.deepEqual(running.map((record) => record.dispatchId), ['d-3', 'd-2'])
+    // ended: terminal reports only (pending excluded), newest first
+    assert.deepEqual(ended.map((record) => record.id), ['r-7', 'r-6', 'r-1'])
 
     // latest report per dispatch wins
-    const dup = conversationEntries({
+    const dup = dispatchState({
       dispatches: [dispatch(1)],
       reports: [report(1, { id: 'r-old', reportedAt: iso(2) }), report(1, { id: 'r-new', reportedAt: iso(9) })],
     })
-    assert.deepEqual(dup.history.map((entry) => entry.meta.report), ['r-new'])
+    assert.deepEqual(dup.ended.map((record) => record.id), ['r-new'])
     assert.equal(dup.running.length, 0)
 
-    // a report whose dispatch record is gone still lands in history; long labels are clipped to 240
-    const orphan = conversationEntries({
-      dispatches: [dispatch(8, { title: '题'.repeat(500), workspaceTitle: 'w'.repeat(200) })],
-      reports: [report(9, { summary: '字'.repeat(300) })],
-    })
-    assert.equal(charLength(orphan.running[0].text), 240)
-    assert.ok(orphan.running[0].text.endsWith('… — 进行中'))
-    assert.equal(orphan.history[0].text, `[blog] done：${'字'.repeat(119)}…`)
-    pass('conversation classification (running/history/abandoned)')
+    // a report whose dispatch record is gone still counts as ended
+    const orphan = dispatchState({ dispatches: [dispatch(8)], reports: [report(9)] })
+    assert.deepEqual(orphan.running.map((record) => record.dispatchId), ['d-8'])
+    assert.deepEqual(orphan.ended.map((record) => record.id), ['r-9'])
+    pass('dispatch state (running/ended/abandoned)')
   }
 
-  // 6. renderConversations: history window
-  {
-    const mk = (n) => ({ text: `entry ${n}`, meta: { n } })
-    const lines = (text) => text.split('\n').filter((line) => line.startsWith('- '))
-    const history = Array.from({ length: 10 }, (_, i) => mk(i))
-    const few = renderConversations({ running: [], history: history.slice(0, 3) })
-    assert.equal(lines(few).length, 3)
-    assert.ok(!few.includes('正在进行的对话'))
-    const base = renderConversations({ running: [], history })
-    assert.equal(lines(base).length, 5)
-    const running13 = Array.from({ length: 13 }, (_, i) => mk(100 + i))
-    const text = renderConversations({ running: running13, history: Array.from({ length: 12 }, (_, i) => mk(i)) })
-    assert.equal(lines(text).length, 13 + 6)
-    assert.ok(text.startsWith('## 正在进行的对话\n'))
-    assert.ok(text.includes('\n\n## 最近结束的对话\n'))
-    assert.equal(renderConversations({ running: [], history: [] }), '')
-    assert.equal(renderConversations({ running: running13.slice(0, 1), history: [] }), '## 正在进行的对话\n- entry 100 [n: 100]')
-    pass('renderConversations (history window, omitted headings)')
-  }
-
-  // 7. tags
+  // 4. tags
   {
     const home = await newHome()
     assert.deepEqual(await readTags(home), [])
@@ -217,6 +163,11 @@ try {
     // a tag whose turn record is missing, and an unparsable line
     await tagTurn(home, { sessionId: 's1', turn: 9, workspaceId: 'ws-blog', dispatchId: 'd-9', at: '2026-10-21T20:00:00.000Z' })
     await writeFile(join(dataDir(home), 'memory-state', 'tags.jsonl'), 'not json\n', { flag: 'a' })
+    // a mention is a raw row only: it never adds a workspace to the turn's tags
+    await tagMention(home, { sessionId: 's1', turn: 3, workspaceId: 'ws-whale', at: '2026-10-21T12:00:01.000Z' })
+    const rows = await readTagRows(home)
+    assert.equal(rows.length, 11)
+    assert.deepEqual(rows.at(-1), { kind: 'mention', sessionId: 's1', turn: 3, workspaceId: 'ws-whale', at: '2026-10-21T12:00:01.000Z' })
 
     const all = await readTags(home)
     assert.deepEqual(all.map((r) => r.turn), [1, 2, 3, 4, 9])
@@ -237,10 +188,10 @@ try {
     assert.deepEqual((await readTags(home, { workspaceId: 'ws-none' })), [])
     assert.deepEqual((await readTags(home, { workspaceId: 'ws-blog', limit: 2 })).map((r) => r.turn), [4, 9])
     assert.deepEqual((await readTags(home, { limit: 1 })).map((r) => r.turn), [9])
-    pass('tags (multi-workspace turn, filter, limit, missing turn, bad line)')
+    pass('tags (multi-workspace turn, mention row, filter, limit, missing turn, bad line)')
   }
 
-  // 8. bootstrap
+  // 5. bootstrap
   {
     const workspace = { id: 'ws-blog', title: 'blog' }
     const empty = await newHome()
