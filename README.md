@@ -127,6 +127,13 @@ DSH 里已经有 `subagent`（同一会话内的子代理）和 `dsh-webhook`（
 - `at`：复用已有会话时的投递时机，`step`（默认，步边界）、`queue`（等回合结束）、`abort`（硬中止）。
 - `writes`：本任务会改的路径前缀。同一工作区里两个仍活着的会话若前缀重叠（`a/b` 与 `a` 算重叠），**派工直接拒绝**并指出该找谁续。声明了不相交的前缀才允许并行。
 - 已 reported 的会话不会被复用：交付完的事再提新需求属于新活。
+- 复用前先看 worker 装不装得下：读该会话最后一条 `assistant/message` 的 `usage.inputTokens`，达到 `workerReuseMaxTokens` 就另开一个会话，brief 第一行写「接续 <旧 dispatchId>（topic: …）」，返回值带 `reused: false, continues: <旧 dispatchId>`；`send_to_session` 发给这样的 worker 会报错，提示改用 `dispatch_task`。读不到大小（host 没有 `inspect` 或读取失败）时按装得下处理，并在结果里加一条 warning。
+
+`discipline-whale-main` 行的配置键：
+
+| 键 | 默认 | 含义 |
+|---|---|---|
+| `workerReuseMaxTokens` | `160000` | worker 最新一次请求的输入 token 达到这个数就不再复用、不再追发；正整数 |
 
 ### `list_dispatches`（主会话）
 看板：本次进程里记录的所有派工，带 worker session、状态（`running` / `reported` / `abandoned`）、已派出多久。
