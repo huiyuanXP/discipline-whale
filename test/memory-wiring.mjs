@@ -7,7 +7,7 @@
  *   3. a real user message becomes the current turn; a dispatch tags it
  *   4. remember writes with the turn as source and the section picks it up
  *   5. update_instructions accepts only the user's own words from this turn
- *   6. the activity context shows a running dispatch
+ *   6. after a human message the activity board shows a running dispatch under its workspace
  *   7. the flush starts once near the compaction threshold, once per cycle
  *   8. ten real user turns start one nudge flush
  *   9. dream waits until due; dream_now runs it
@@ -235,10 +235,11 @@ try {
     startedAt: now.toISOString(),
   })
   await writeDispatchCheckpoint(root, 'session-worker-a1', { dispatchId: 'dispatch-a', mainSessionId: MAIN, workspaceId: 'ws-blog', workspaceTitle: 'blog', startedAt: now.toISOString() })
+  // The human message steps the board epoch; the next step renders the board.
   await userSays(h, 5, '进度怎样')
   await step(h)
-  assert.match(h.contexts[0].text(), /## 正在进行的对话\n- \[blog\] 迁移 RSS 生成器 — 进行中/)
-  console.log('ok 6 — the activity context lists the running dispatch')
+  assert.match(h.contexts[0].text(), /## blog · [^\n]*\n- 进行中：迁移 RSS 生成器 \[session: worker-a; started: 10-21 15:00\]/)
+  console.log('ok 6 — after a human message the activity board lists the running dispatch under its workspace')
 
   // 7: threshold = min(1e6 × 0.8, 1e6 − 0 − 65536) = 800000; flush from 767232.
   const before = h.llmCalls.length

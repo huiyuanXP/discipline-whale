@@ -4,14 +4,17 @@
  * Mounted only in the Discipline Whale preset, next to the main row. It owns:
  *
  *   injection  — a system-prompt section with Soul / User / Memory and the
- *                workspace cards (stable text, rewritten only after a write),
- *                and a runtime context with the running and recent
- *                conversations (refreshed when dispatch state changes)
+ *                writing rules (stable text, rewritten only after a write),
+ *                and a runtime context with the activity board: the active
+ *                workspaces, re-rendered at most once per human turn
+ *   notes      — each board render writes every active workspace's note to
+ *                `home/notes/<key>.md`, where the main session can `read` it
  *   tools      — remember, update_instructions, set_workspace_intro, dream_now
  *   automation — the pre-compaction flush, the ten-turn nudge, and the dream
  *                that runs when the main session goes idle
  *   tags       — the current user turn per main Session, so dispatch_task and
- *                send_to_session can tag the message that caused them
+ *                send_to_session can tag the message that caused them, and a
+ *                mention row for every workspace a human message names
  *
  * Model calls for flush and dream are hidden requests through the `llm`
  * service; their text never enters the main session.
@@ -24,14 +27,21 @@ import { readdir, rename, stat } from 'node:fs/promises'
 import { join } from 'node:path'
 
 import {
+  TAGS_WARN_BYTES,
+  activeWorkspaces,
   buildBootstrap,
-  conversationEntries,
+  mentionedWorkspaces,
+  readTagRows,
   readWorkspaceCards,
   recordUserTurn,
-  renderConversations,
-  renderWorkspaces,
+  renderBoard,
+  renderWorkspaceNote,
   setWorkspaceIntro,
+  tagMention,
   tagTurn,
+  tagsPath,
+  workspaceFacts,
+  workspaceNotePath,
 } from './activity.js'
 import { isDispatchAbandoned, listDispatchCheckpoints } from './checkpoint.js'
 import { AUTO_MEMORY_TOOLS } from './guard.js'
@@ -51,8 +61,8 @@ import {
   writeLayer,
 } from './memory.js'
 import { listDispatches } from './registry.js'
-import { isoDay } from './entry.js'
-import { isHumanMessage } from './pushes.js'
+import { atomicWrite, isoDay } from './entry.js'
+import { isHumanMessage, messageText } from './pushes.js'
 import { listReports, storeRoot, whaleHomeDir } from './store.js'
 
 export const name = 'discipline-whale-memory'
@@ -104,7 +114,7 @@ export const memoryStore = Object.freeze({
 /** main sessionId -> { turn, messageId, text, at } of the latest real user message. */
 const userTurns = new Map()
 
-/** Called when anything the activity block shows has changed. */
+/** Called when anything the activity board shows has changed. */
 const activityListeners = new Set()
 
 /** The latest real user message of one main Session, or undefined. */
@@ -166,21 +176,10 @@ export function compactThreshold({ contextWindow, reservedTokens = 0, ratio, hea
   return Math.floor(Math.min(contextWindow * ratio, contextWindow - reservedTokens - headroom))
 }
 
-/** Concatenated text blocks of a message. */
-function messageText(message) {
-  const content = message?.content
-  if (typeof content === 'string') return content
-  if (!Array.isArray(content)) return ''
-  return content
-    .filter((block) => block?.type === 'text' && typeof block.text === 'string')
-    .map((block) => block.text)
-    .join('\n')
-}
-
 /**
  * Turn Session log events into the flush transcript.
  *
- * Runtime-context snapshots (this row's activity block among them) become
+ * Runtime-context snapshots (this row's activity board among them) become
  * `context` items, which the flush prompt leaves out: injected memory is never
  * extracted again. Tool calls keep only their names.
  */
@@ -332,12 +331,24 @@ export function installMemory(ctx, config = {}, deps = {}) {
 
   const cache = { memory: '', activity: '', memoryDirty: true, activityDirty: true }
 
+  /**
+   * The board re-renders only when `epoch` moves past `rendered`. The epoch
+   * steps on a Session's first step and on every claimed human message, so
+   * between two human turns the context provider returns the same string and
+   * the host appends no new snapshot. `activityDirty` records that board state
+   * changed since the last render; the next epoch picks that change up.
+   */
+  const board = { epoch: 0, rendered: -1 }
+  /** main sessionIds whose first step already stepped the epoch. */
+  const boardSessions = new Set()
+  /** main sessionId -> the turn and mention writes of its latest human message. */
+  const pendingTurnWrites = new Map()
+  let tagsWarned = false
+
   async function refreshMemory() {
     cache.memoryDirty = false
     try {
-      const listed = workspaces()
-      const cards = await readWorkspaceCards(root())
-      const parts = [await loadMemorySection(root()), renderWorkspaces(listed, cards), MEMORY_RULES]
+      const parts = [await loadMemorySection(root()), MEMORY_RULES]
       cache.memory = parts.filter((part) => typeof part === 'string' && part.trim() !== '').join('\n\n')
     } catch (error) {
       cache.memoryDirty = true
@@ -345,25 +356,57 @@ export function installMemory(ctx, config = {}, deps = {}) {
     }
   }
 
+  /** Everything the board and the notes are derived from, read from disk and the registry. */
+  async function boardInput() {
+    const byId = new Map()
+    for (const record of await listDispatchCheckpoints(root())) {
+      const abandoned = isDispatchAbandoned(root(), record.workerSessionId)
+      byId.set(record.dispatchId, { ...record, ...(abandoned ? { status: 'abandoned' } : {}) })
+    }
+    for (const record of listDispatches()) byId.set(record.dispatchId, { ...byId.get(record.dispatchId), ...record })
+    const listed = workspaces()
+    const reports = []
+    for (const workspace of listed) {
+      reports.push(...(await listReports(root(), workspace.id).catch(() => [])))
+    }
+    return {
+      workspaces: listed,
+      cards: await readWorkspaceCards(root()),
+      tags: await readTagRows(root()),
+      reports,
+      dispatches: [...byId.values()],
+    }
+  }
+
+  async function warnLargeTags() {
+    if (tagsWarned) return
+    const size = await stat(tagsPath(root())).then((info) => info.size, () => 0)
+    if (size <= TAGS_WARN_BYTES) return
+    tagsWarned = true
+    warn(`tags.jsonl is ${size} bytes (over ${TAGS_WARN_BYTES}); every human turn reads it whole`)
+  }
+
+  /** Render the board for the current epoch and write each active workspace's note. */
   async function refreshActivity() {
+    const epoch = board.epoch
     cache.activityDirty = false
     try {
-      const byId = new Map()
-      for (const record of await listDispatchCheckpoints(root())) {
-        const abandoned = isDispatchAbandoned(root(), record.workerSessionId)
-        byId.set(record.dispatchId, { ...record, ...(abandoned ? { status: 'abandoned' } : {}) })
+      await warnLargeTags()
+      const input = await boardInput()
+      // A render that started before a newer one finished keeps the newer board.
+      if (epoch < board.rendered) return
+      cache.activity = renderBoard(input)
+      board.rendered = epoch
+      const facts = workspaceFacts(input)
+      for (const workspace of activeWorkspaces(input).active) {
+        const note = renderWorkspaceNote(workspace, facts.get(String(workspace.id)))
+        await atomicWrite(workspaceNotePath(root(), workspace.id), note).catch((error) =>
+          warn(`could not write the note for ${workspace.id}: ${error?.message ?? error}`),
+        )
       }
-      for (const record of listDispatches()) byId.set(record.dispatchId, { ...byId.get(record.dispatchId), ...record })
-      const reports = []
-      for (const workspace of workspaces()) {
-        reports.push(...(await listReports(root(), workspace.id).catch(() => [])))
-      }
-      const entries = conversationEntries({ dispatches: [...byId.values()], reports })
-      const block = renderConversations(entries)
-      cache.activity = block === '' ? '' : `# 我们正在做什么（自律鲸鱼派出的对话）\n\n${block}`
     } catch (error) {
       cache.activityDirty = true
-      warn(`could not render the activity block: ${error?.message ?? error}`)
+      warn(`could not render the activity board: ${error?.message ?? error}`)
     }
   }
 
@@ -555,8 +598,10 @@ export function installMemory(ctx, config = {}, deps = {}) {
     if (isMainAgent(agent)) hideAutoMemoryTools(agent)
   })
 
-  // A real user message: remember its turn for tagging, refresh both blocks,
-  // and check the nudge.
+  // A human message: remember its turn for tagging, record the turn and every
+  // workspace it names, step the board epoch, and check the nudge. The writes
+  // are kept per Session so the next pre-step renders after they land, whether
+  // or not the host awaits this listener.
   ctx.on('agent/inbox/claimed', ({ agent, message, turn }) => {
     if (!isMainAgent(agent)) return
     const sessionId = sessionIdOf(agent)
@@ -566,7 +611,23 @@ export function installMemory(ctx, config = {}, deps = {}) {
     const text = messageText(message)
     const record = { turn, messageId: message?.id, text, at: now().toISOString() }
     userTurns.set(sessionId, record)
-    recordUserTurn(root(), { sessionId, ...record }).catch((error) => warn(`could not record the user turn: ${error?.message ?? error}`))
+    const named = mentionedWorkspaces(text, workspaces())
+    const previous = pendingTurnWrites.get(sessionId) ?? Promise.resolve()
+    const writes = previous.then(async () => {
+      try {
+        await recordUserTurn(root(), { sessionId, ...record })
+        for (const workspace of named) {
+          await tagMention(root(), { sessionId, turn, workspaceId: String(workspace.id), at: record.at })
+        }
+      } catch (error) {
+        warn(`could not record the user turn: ${error?.message ?? error}`)
+      }
+    })
+    pendingTurnWrites.set(sessionId, writes)
+    void writes.then(() => {
+      if (pendingTurnWrites.get(sessionId) === writes) pendingTurnWrites.delete(sessionId)
+    })
+    board.epoch += 1
     return noteNudge(agent, sessionId, turn)
   })
 
@@ -576,8 +637,13 @@ export function installMemory(ctx, config = {}, deps = {}) {
   ctx.on('agent/pre-step', async ({ agent }, next) => {
     if (isMainAgent(agent)) {
       if (cache.memoryDirty) await refreshMemory()
-      if (cache.activityDirty) await refreshActivity()
       const sessionId = sessionIdOf(agent)
+      if (sessionId !== undefined && !boardSessions.has(sessionId)) {
+        boardSessions.add(sessionId)
+        board.epoch += 1
+      }
+      if (sessionId !== undefined) await pendingTurnWrites.get(sessionId)
+      if (board.rendered !== board.epoch) await refreshActivity()
       const meter = service('tokenMeter')
       if (sessionId !== undefined && meter?.measure !== undefined) {
         const state = stateFor(sessionId)
@@ -614,7 +680,9 @@ export function installMemory(ctx, config = {}, deps = {}) {
 
   ctx.on('agent/disposed', ({ agent }) => {
     const sessionId = sessionIdOf(agent)
-    if (sessionId !== undefined) sessions.delete(sessionId)
+    if (sessionId === undefined) return
+    sessions.delete(sessionId)
+    boardSessions.delete(sessionId)
   })
 
   /* -------- tools -------- */
@@ -703,7 +771,7 @@ export function installMemory(ctx, config = {}, deps = {}) {
         )
         if (workspace === undefined) throw new Error(`no registered workspace "${selector}"; call list_workspaces for ids`)
         const card = await setWorkspaceIntro(root(), String(workspace.id), String(args.intro ?? ''), { now: now() })
-        cache.memoryDirty = true
+        cache.activityDirty = true
         return { workspaceId: String(workspace.id), ...card }
       },
     },
@@ -767,10 +835,10 @@ export function installMemory(ctx, config = {}, deps = {}) {
     await refreshActivity()
   })()
 
-  return { config: resolved, cache, sessions, ready, refreshMemory, refreshActivity, startFlush, startDream, tools }
+  return { config: resolved, cache, board, sessions, ready, refreshMemory, refreshActivity, startFlush, startDream, tools }
 }
 
-/** Main-session tools whose effect changes the activity block. */
+/** Main-session tools whose effect changes the activity board. */
 const ACTIVITY_TOOLS = new Set(['dispatch_task', 'send_to_session', 'resume_dispatch', 'abandon_dispatch', 'read_report'])
 
 /** Usage note appended to the memory section. */
@@ -778,6 +846,7 @@ const MEMORY_RULES = [
   '## 记忆的写法',
   '- 用户说「记住」、表达偏好、纠正你 → `remember`；用户说接下来想做什么 → `remember(target:"user", section:"Now")`。',
   '- 派工后工作区介绍缺失或过时 → `set_workspace_intro`（≤200 字符：用途 + 现状 + 下一步）。',
+  '- 便签板只列活跃的工作区；每个活跃工作区的完整便签在 `notes/<key>.md`，需要细节时 `read` 它。',
   '- AGENTS.md 只经 `update_instructions` 修改，且只在用户本轮明确要求时。',
   '- 日常观察由后台自动写入 daily 笔记，定期整理进上面的条目；你专注于用户明确交代的内容。',
   '- 宿主注入的 `<memory_context>`（用户级记忆）是只读参考；本会话写记忆只用 `remember`。',

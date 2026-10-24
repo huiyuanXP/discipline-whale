@@ -181,8 +181,8 @@
               decisionProseChars: 400
               maxCorrections: 1
               enabled: true
-          # Memory (memory-row.js): Soul / User / Memory and the workspace cards
-          # as a prompt section, the running and recent conversations as a
+          # Memory (memory-row.js): Soul / User / Memory as a prompt section,
+          # the activity board (active workspaces, once per human turn) as a
           # runtime context, the remember / update_instructions /
           # set_workspace_intro / dream_now tools, the pre-compaction flush, the
           # ten-turn nudge and the idle dream. Main preset only.

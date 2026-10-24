@@ -549,13 +549,16 @@ worker 每次即将结束回合时，插件会检查本轮是否调用过 `repor
 | Soul | `SOUL.md` | `remember(target:"soul")` | 每步全量 |
 | User | `USER.md`（Preferences + Now） | `remember`；Now 由后台 flush 轮换 | 每步全量 |
 | Memory | `MEMORY.md` | `remember` + dream 提升 | 每步全量 |
-| Activity | 由派工记录生成 | 程序 | 每次派工状态变化后刷新 |
+| Activity | 由派工记录、报告和 Tag 推导 | 程序 | 便签板每个人类回合最多刷新一次；活跃工作区的便签按需 `read` |
 | Daily | `daily/YYYY-MM-DD.md` | 后台 flush / nudge，只追加 | 按需 `read` |
 | Review | `DREAMS.md` | dream 的整理记录 | 给人看 |
 
 **Activity（我们正在做什么）**：
-- 工作区卡片：每个工作区一段 ≤200 字的介绍，写用户拿它在做什么、下一步想做什么。可通过 `set_workspace_intro` 修改，worker 回报时也能带上 `workspace_note`。
-- 对话条目：鲸鱼派出的对话里，进行中的全部注入；最近结束的注入 max(5, ⌈进行中条数 × 40%⌉) 条。
+- 工作区卡片：每个工作区一段 ≤200 字的介绍，写用户拿它在做什么、下一步想做什么。可通过 `set_workspace_intro` 修改，worker 回报时也能带上 `workspace_note`。介绍显示在便签板的工作区标题行和工作区便签里。
+- 兴趣规则：有进行中派工的工作区全部活跃；其余的按最近一次触碰倒序，取最近 8 个人类回合内碰过的，补到 4 个为止。触碰 = 派工 Tag、点名、报告、派工开始。人类回合只算用户自己发的消息，插件推送的报告、启动检查、唤醒和续接种子按前缀识别后排除。
+- 点名：人类消息里出现工作区标题或路径 basename（各 ≥3 字符）、完整 id、或 UUID 形 id 的前 8 位（不区分大小写），就在 `tags.jsonl` 记一条 `mention`。
+- 便签板：runtime context `discipline-whale:activity`。每个活跃工作区一节：全部进行中派工 + 最近 2 次交付，合计 ≤450 字符；整板 ≤2,000 字符，超预算先删交付、再截短标签；末行列出其余工作区的名字。便签板只在会话第一步和每条人类消息之后重渲染，两条人类消息之间文本保持同一份；宿主只在文本变化时追加快照，所以每个人类回合最多一份。
+- 工作区便签：每次渲染便签板，同时把每个活跃工作区的便签写到 `home/notes/<key>.md`：介绍、最近活跃时间、进行中派工、最近 5 次交付、报告总数和索引路径。主会话需要细节时 `read` 它。
 - 消息 Tag：主会话某一轮里派了活，这一轮的用户消息就打上目标工作区的 Tag，派到几个工作区就打几个。
 - 派工 bootstrap：向一个工作区派新会话时，brief 开头附上该工作区的介绍、用户说过的相关话、最近的交付。
 
@@ -599,7 +602,8 @@ $DSH_HOME/discipline-whale/dispatches/<workerSessionId>.abandoned   ← 用户�
 $DSH_HOME/discipline-whale/voice.json                               ← 语音设置（0600；仅在没有 Host 凭据面时存 key）
 $DSH_HOME/discipline-whale/home/memory/                             ← 记忆文件：SOUL / USER / MEMORY / DREAMS.md、daily/
 $DSH_HOME/discipline-whale/home/AGENTS.md                           ← 主会话运行规则（只经 update_instructions 写）
-$DSH_HOME/discipline-whale/memory-state/                            ← 工作区卡片与颜色、消息 Tag、flush/dream 游标与锁
+$DSH_HOME/discipline-whale/home/notes/<key>.md                      ← 工作区便签（由报告、检查点和 tags.jsonl 生成）
+$DSH_HOME/discipline-whale/memory-state/                            ← 工作区卡片与颜色、消息 Tag 与点名、flush/dream 游标与锁
 $DSH_HOME/.credentials.yaml                                         ← Host 凭据面（0600；优先，由 dsh-credentials-local 写）
 ```
 
@@ -628,7 +632,8 @@ node test/report-head.mjs
 
 `npm run test:memory` 覆盖记忆系统：
 - 条目与分层（`memory.mjs`）
-- 工作区卡片、对话条目、Tag、bootstrap（`activity.mjs`）
+- 工作区卡片、派工状态、Tag、bootstrap（`activity.mjs`）
+- 兴趣规则、点名、便签板预算与刷新、工作区便签（`board.mjs`）
 - flush / nudge（`memory-flush.mjs`）
 - dream 与门禁（`dream.mjs`）
 - 清空型 pruner（`pruner.mjs`）
