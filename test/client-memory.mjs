@@ -90,8 +90,8 @@ const json = (status, body) => new Response(JSON.stringify(body), { status, head
 
 const MAIN = 'main-1'
 const WORKSPACES = [
-  { id: 'ws-blog', title: '博客', path: '/p/blog', color: '#3B82F6', intro: '', updatedAt: '2026-10-21T00:00:00Z' },
-  { id: 'ws-api', title: 'API', path: '/p/api', color: '#F59E0B', intro: '', updatedAt: '2026-10-21T00:00:00Z' },
+  { id: 'ws-blog', title: '博客', path: '/p/blog', color: '#6E7E91', intro: '', updatedAt: '2026-10-21T00:00:00Z' },
+  { id: 'ws-api', title: 'API', path: '/p/api', color: '#748162', intro: '', updatedAt: '2026-10-21T00:00:00Z' },
 ]
 const TURNS = [
   { turn: 3, messageId: 'm-3', at: '2026-10-21T10:00:00Z', workspaces: ['ws-blog'], sessions: { 'ws-blog': ['w-blog-1'] } },
@@ -176,14 +176,14 @@ const closedTurn = (turn) => ({ turn, status: 'closed', start: undefined, end: u
   const oneChips = nodesOf(one).filter((node) => node.props?.className === 'dw-tag')
   assert.equal(oneChips.length, 1)
   assert.deepEqual(textsOf(oneChips[0]), ['博客'])
-  assert.equal(oneChips[0].props.style['--dw-tag'], '#3B82F6', 'the chip is painted in the workspace color')
+  assert.equal(oneChips[0].props.style['--dw-tag'], '#6E7E91', 'the chip is painted in the workspace color')
 
   const two = render(5)
   assert.equal(two.props.className, 'dw-tags')
   assert.equal(two.props['data-dw-turn'], 5)
   const twoChips = nodesOf(two).filter((node) => node.props?.className === 'dw-tag')
   assert.deepEqual(twoChips.map((chip) => textsOf(chip)[0]), ['博客', 'API'], 'two workspaces give two chips side by side, in record order')
-  assert.deepEqual(twoChips.map((chip) => chip.props.style['--dw-tag']), ['#3B82F6', '#F59E0B'])
+  assert.deepEqual(twoChips.map((chip) => chip.props.style['--dw-tag']), ['#6E7E91', '#748162'])
   console.log('ok 1 — chips render for 0 / 1 / 2 workspaces with their titles and colors')
 }
 
@@ -256,24 +256,26 @@ const closedTurn = (turn) => ({ turn, status: 'closed', start: undefined, end: u
   console.log('ok 4 — tags load once per batch of mounted tails and again when a newer turn completes')
 }
 
-// --- 5. a color change repaints chips and dots at once ---------------------
+// --- 5. a color change repaints chips and folder rows at once --------------
 
 {
   const h = await loadedHarness()
   const Tags = client.makeTurnTags(h.store, t)
-  const Dot = client.makeSessionDot(h.store, t)
   const chipColor = () => nodesOf(Tags({ turn: closedTurn(3), seq: 1, openFile: () => {}, sessionId: MAIN, openSession: () => {} }))
     .find((node) => node.props?.className === 'dw-tag').props.style['--dw-tag']
-  const dotColor = () => nodesOf(Dot({ sessionId: 'w-blog-1' })).find((node) => node.props?.className === 'dw-ws-dot').props.style['--dw-tag']
-  assert.equal(chipColor(), '#3B82F6')
-  assert.equal(dotColor(), '#3B82F6')
+  // The folder row's paint is what replaced the dot: same color, same store.
+  const folderColor = () => client.folderPaint(
+    h.store.getSnapshot().workspaces.find((workspace) => workspace.id === 'ws-blog'),
+  )['--dw-ws-folder']
+  assert.equal(chipColor(), '#6E7E91')
+  assert.equal(folderColor(), '#6E7E91')
 
   let notified = 0
   h.store.subscribe(() => { notified += 1 })
   const posted = h.store.setColor('ws-blog', '#112233', 0)
   // Before the POST has even gone out, both surfaces show the new color.
   assert.equal(chipColor(), '#112233', 'the chip repaints at once')
-  assert.equal(dotColor(), '#112233', 'the dot repaints at once')
+  assert.equal(folderColor(), '#112233', 'the folder row repaints at once')
   assert.ok(notified > 0, 'subscribers are told')
   await h.flush()
   assert.deepEqual(await posted, { ok: true })
@@ -351,25 +353,87 @@ const closedTurn = (turn) => ({ turn, status: 'closed', start: undefined, end: u
   assert.equal(h.store.getSnapshot().colorErrors['ws-api'], undefined, 'a new attempt clears the old error')
   await h.flush()
   assert.equal((await refused).ok, false)
-  assert.equal(h.store.getSnapshot().workspaces.find((workspace) => workspace.id === 'ws-api').color, '#F59E0B', 'the stored color comes back')
+  assert.equal(h.store.getSnapshot().workspaces.find((workspace) => workspace.id === 'ws-api').color, '#748162', 'the stored color comes back')
   assert.equal(h.store.getSnapshot().colorErrors['ws-api'], 'unknown workspace: ws-api')
   console.log('ok 6 — a 400 shows the server text inline under that workspace and restores the stored color')
 }
 
-// --- 7. the sidebar dot ---------------------------------------------------
+// --- 7. the sidebar rows the whale paints ---------------------------------
+//
+// The old dot is gone from the leading seat; what remains is the folder row's
+// own color and the logo on a dispatched session. Both are DOM paints, so the
+// rows here are stand-in elements carrying the Host's own markers.
+
+/** A stand-in sidebar row: the attributes and style the paint touches. */
+function rowOf(rowKey) {
+  const attributes = new Map([['data-row-key', rowKey]])
+  const properties = new Map()
+  return {
+    attributes,
+    properties,
+    getAttribute: (name) => (attributes.has(name) ? attributes.get(name) : null),
+    hasAttribute: (name) => attributes.has(name),
+    setAttribute: (name, value) => attributes.set(name, String(value)),
+    removeAttribute: (name) => attributes.delete(name),
+    querySelector: () => null,
+    style: {
+      setProperty: (name, value) => properties.set(name, value),
+      removeProperty: (name) => properties.delete(name),
+    },
+  }
+}
+
+/** A scope whose querySelectorAll splits rows by the marker prefix. */
+function sidebarScopeOf(rows) {
+  return {
+    querySelectorAll(selector) {
+      if (selector.startsWith('[data-row-key^="workspace:"]')) return rows.filter((row) => row.getAttribute('data-row-key').startsWith('workspace:'))
+      if (selector.startsWith('[data-row-key^="session:"]')) return rows.filter((row) => row.getAttribute('data-row-key').startsWith('session:'))
+      return []
+    },
+  }
+}
 
 {
   const h = await loadedHarness()
-  const Dot = client.makeSessionDot(h.store, t)
-  const present = Dot({ sessionId: 'w-api-1' })
-  assert.ok(present, 'a dispatched session has a dot')
-  assert.equal(present.props['data-dw-workspace'], 'ws-api')
-  const dot = nodesOf(present).find((node) => node.props?.className === 'dw-ws-dot')
-  assert.equal(dot.props.style['--dw-tag'], '#F59E0B')
-  assert.equal(dot.props['aria-label'], 'Workspace: API')
-  assert.equal(Dot({ sessionId: MAIN }), null, 'the main session has no dot')
-  assert.equal(Dot({ sessionId: 'never-dispatched' }), null, 'any other session has no dot')
-  assert.equal(client.makeSessionDot(harness().store, t)({ sessionId: 'w-api-1' }), null, 'nothing renders before the map loads')
+  const folder = rowOf('workspace:ws-api')
+  const whaleRow = rowOf('session:w-api-1')
+  const userRow = rowOf('session:user-opened')
+  assert.equal(client.decorateSidebarRows(sidebarScopeOf([folder, whaleRow, userRow]), { store: h.store }), 2, 'one folder row and one dispatched session')
+
+  assert.equal(folder.getAttribute('data-dw-ws-folder'), '#748162', 'the folder row carries its workspace color')
+  assert.equal(folder.properties.get('--dw-ws-folder'), '#748162')
+  assert.equal(folder.getAttribute('title'), 'API')
+
+  assert.equal(whaleRow.getAttribute('data-dw-whale'), '#748162', 'a dispatched session is marked with its workspace color')
+  assert.equal(whaleRow.properties.get('--dw-ws-folder'), '#748162')
+  assert.match(whaleRow.properties.get('--dw-whale-mask'), /^url\("data:image\/svg\+xml,/, 'the logo is the whale glyph, as a mask')
+  assert.equal(whaleRow.getAttribute('data-dw-whale-label'), 'API')
+
+  assert.equal(userRow.getAttribute('data-dw-whale'), null, 'a session the user opened is left exactly as the Host drew it')
+  assert.equal(userRow.properties.get('--dw-ws-folder'), undefined)
+
+  // A second pass writes nothing: the row already carries the color.
+  assert.equal(client.decorateSidebarRows(sidebarScopeOf([folder, whaleRow, userRow]), { store: h.store }), 0, 'a repaint of an unchanged row writes nothing')
+
+  // A color change repaints the same rows in place.
+  const posted = h.store.setColor('ws-api', '#123456', 0)
+  client.decorateSidebarRows(sidebarScopeOf([folder, whaleRow]), { store: h.store })
+  assert.equal(folder.getAttribute('data-dw-ws-folder'), '#123456')
+  assert.equal(whaleRow.getAttribute('data-dw-whale'), '#123456')
+  await h.flush()
+  assert.deepEqual(await posted, { ok: true })
+  assert.deepEqual(h.calls.find((call) => call.method === 'POST').body, { id: 'ws-api', color: '#123456' })
+
+  // A workspace that disappears unpaints its rows rather than leaving a stale color.
+  h.server.workspaces = h.server.workspaces.filter((workspace) => workspace.id !== 'ws-api')
+  await h.store.loadWorkspaces(true)
+  client.decorateSidebarRows(sidebarScopeOf([folder, whaleRow]), { store: h.store })
+  assert.equal(folder.getAttribute('data-dw-ws-folder'), null, 'an uncolorable folder row goes back to the Host styling')
+  assert.equal(whaleRow.getAttribute('data-dw-whale'), null)
+
+  // The map is not loaded yet: nothing is painted at all.
+  assert.equal(client.decorateSidebarRows(sidebarScopeOf([rowOf('session:w-api-1'), rowOf('workspace:ws-api')]), { store: harness().store }), 0)
 
   // A row of an unknown session refreshes the map, at most once per window.
   const dispatchedCalls = () => h.calls.filter((call) => call.url === '/api/discipline-whale/memory/dispatched').length
@@ -382,7 +446,7 @@ const closedTurn = (turn) => ({ turn, status: 'closed', start: undefined, end: u
   h.store.requestDispatched('another-new')
   await h.flush()
   assert.equal(dispatchedCalls(), before + 1, 'after the window one refresh serves every unknown row')
-  console.log('ok 7 — the sidebar dot shows for dispatched sessions only')
+  console.log('ok 7 — the folder row and a dispatched session paint from the store; a user session never does')
 }
 
 // --- 8. the settings section ----------------------------------------------
@@ -400,16 +464,16 @@ const closedTurn = (turn) => ({ turn, status: 'closed', start: undefined, end: u
   assert.deepEqual(rows.map((row) => row.props['data-dw-workspace']), ['ws-blog', 'ws-api'], 'every workspace, in registry order')
   const blog = rows[0]
   assert.ok(textsOf(blog).includes('博客'))
-  assert.equal(nodesOf(blog).find((node) => node.props?.className === 'dw-ws-swatch').props.style['--dw-tag'], '#3B82F6')
+  assert.equal(nodesOf(blog).find((node) => node.props?.className === 'dw-ws-swatch').props.style['--dw-tag'], '#6E7E91')
   const choices = nodesOf(blog).filter((node) => node.props?.className === 'dw-ws-choice')
   assert.deepEqual(choices.map((node) => node.props['data-dw-color']), PALETTE)
-  assert.deepEqual(choices.filter((node) => node.props['aria-pressed'] === true).map((node) => node.props['data-dw-color']), ['#3B82F6'])
+  assert.deepEqual(choices.filter((node) => node.props['aria-pressed'] === true).map((node) => node.props['data-dw-color']), ['#6E7E91'])
   choices[4].props.onClick()
   const custom = nodesOf(blog).find((node) => node.type === 'input')
   assert.equal(custom.props.type, 'color')
-  assert.equal(custom.props.value, '#3b82f6', 'the color input gets the lowercase form it requires')
+  assert.equal(custom.props.value, '#6e7e91', 'the color input gets the lowercase form it requires')
   custom.props.onChange({ target: { value: '#abcdef' } })
-  assert.deepEqual(chosen[0], ['ws-blog', '#8B5CF6', 0], 'a palette click posts at once')
+  assert.deepEqual(chosen[0], ['ws-blog', PALETTE[4], 0], 'a palette click posts the clicked slot at once')
   assert.equal(chosen[1][0], 'ws-blog')
   assert.equal(chosen[1][1], '#abcdef')
   assert.ok(chosen[1][2] > 0, 'the custom picker waits for the pointer to rest')
@@ -472,12 +536,14 @@ const closedTurn = (turn) => ({ turn, status: 'closed', start: undefined, end: u
   assert.equal(client.memoryStore.getSnapshot().mainSessionId, 'main-from-home')
 
   const keys = ['settingsSectionWorkspaces', 'workspacesLoading', 'workspacesEmpty', 'workspacesUnavailable', 'workspacePalette',
-    'workspacePaletteColor', 'workspaceCustomColor', 'workspaceColorFailed', 'workspaceDot', 'tagOpen', 'tagNoSession']
+    'workspacePaletteColor', 'workspaceCustomColor', 'workspaceColorFailed', 'workspaceSetColor', 'workspaceColorPicker',
+    'workspaceColorDone', 'workspaceCustomColorTitle', 'whaleSession', 'tagOpen', 'tagNoSession']
   for (const key of keys) {
     assert.equal(typeof client.DICTIONARIES.zh[key], 'string', `zh.${key}`)
     assert.equal(typeof client.DICTIONARIES.en[key], 'string', `en.${key}`)
   }
   assert.equal(client.DICTIONARIES.zh.settingsSectionWorkspaces, '工作区颜色')
+  assert.equal(client.DICTIONARIES.zh.workspaceSetColor, '设置颜色', 'the folder menu row is the label the user asked for')
   console.log('ok 9 — chip labels keep WCAG AA contrast, the main session is shared, and both dictionaries carry the copy')
 }
 
@@ -515,6 +581,124 @@ const closedTurn = (turn) => ({ turn, status: 'closed', start: undefined, end: u
     assert.equal(typeof client.DICTIONARIES.zh[key], 'string', `zh has ${key}`)
   }
   console.log('ok 10 — the header button posts home, opens the new main session and shows failures')
+}
+
+// --- 11. the session-row color dot is gone --------------------------------
+//
+// The dot sat in the `sidebar.session.row.leading` seat, which is also where
+// the Host paints the session's real status dot. A workspace color must never
+// take that seat: the reservation is what pushed the status aside, so hiding
+// the node would not be enough — nothing may be injected there at all.
+
+{
+  assert.equal(client.makeSessionDot, undefined, 'the dot component is removed, not hidden')
+  assert.equal(client.sessionDotView, undefined, 'the dot view is removed, not hidden')
+  const css = client.dockStyles()
+  assert.doesNotMatch(css, /dw-ws-dot/, 'no stylesheet rule reserves the leading seat any more')
+  console.log('ok 11 — the workspace dot and its reserved 16px seat are gone')
+}
+
+// --- 12. the workspace folder carries its color ---------------------------
+//
+// The color rides a custom property on the folder row, so the title and the
+// folder glyph are painted from the workspace color and the stylesheet keeps
+// no literal color of its own.
+
+{
+  assert.equal(typeof client.folderPaint, 'function', 'a folder paint exists')
+  const paint = client.folderPaint({ color: '#6E7E91' })
+  assert.deepEqual(paint, { '--dw-ws-folder': '#6E7E91' }, 'the folder row gets its color as a custom property')
+  assert.equal(client.folderPaint({ color: 'not-a-color' }), undefined, 'an invalid color paints nothing')
+  assert.equal(client.folderPaint(undefined), undefined, 'no workspace paints nothing')
+
+  // The stylesheet reads the variable and mixes it with the theme's own text
+  // color: no literal hex, so light and dark both stay readable.
+  assert.equal(typeof client.folderStyles, 'function', 'folder styles exist')
+  const folderCss = client.folderStyles()
+  assert.match(folderCss, /var\(--dw-ws-folder/)
+  assert.match(folderCss, /color-mix\(in srgb/)
+  assert.match(folderCss, /--dsw-alias-label-primary|--dsw-specific-sidebar-fill|--dsw-alias-bg-base/, 'the mix falls back to theme variables')
+  assert.doesNotMatch(folderCss, /#[0-9a-fA-F]{6}/, 'the folder stylesheet must not hardcode a color')
+  // The title's ink is RESOLVED per row, because a fixed share cannot read on
+  // both themes: the 60% mix measured 20.06:1 on the light sidebar and 1.22:1
+  // on the dark one (live Chromium, 2026-10-24), which is the bug this replaced.
+  // The rule therefore reads `--dw-folder-ink` and keeps the 60% mix only as the
+  // fallback for a row an older pass painted.
+  assert.match(folderCss, /_title\]\{\s*color:var\(--dw-folder-ink,/, 'the title ink comes from the per-row resolved value')
+  assert.match(folderCss, /color-mix\(in srgb,var\(--dw-ws-folder\) 60%/, 'the 60% mix stays as the fallback')
+  assert.equal(typeof client.folderTitlePaint, 'function', 'the resolver exists')
+  // Both themes must clear AA, which is the fact the fixed share got wrong.
+  for (const [surface, label] of [['#F9FAFB', '#0F1115'], ['#1B1B1C', '#ADB2B8']]) {
+    for (const color of client.WORKSPACE_PALETTE) {
+      const ink = client.folderTitlePaint(color, surface, label)
+      const ratio = client.contrastOf(ink.color, surface)
+      assert.ok(ratio >= 4.5, `${color} on ${surface} must clear AA, got ${ratio.toFixed(2)}:1 at share ${ink.share}%`)
+    }
+  }
+  console.log('ok 12 — the folder row paints from its workspace color through theme variables')
+}
+
+// --- 13. "set color" in the folder menu -----------------------------------
+
+{
+  // The menu row itself: one more entry beside the Host's rename and delete.
+  assert.equal(typeof client.setColorMenuItem, 'function', 'a menu row exists for the third item')
+  const item = client.setColorMenuItem({ t })
+  assert.equal(item.props.role, 'menuitem')
+  assert.deepEqual(textsOf(item), [t('workspaceSetColor')])
+  assert.equal(item.props['data-dw-menu-item'], 'color')
+
+  // The picker: the eight palette colors plus a custom hex, writing through
+  // the store the settings section already uses.
+  assert.equal(typeof client.workspaceColorPicker, 'function', 'a picker exists')
+  const chosen = []
+  const ws = { id: 'ws-blog', title: '博客', color: '#6E7E91' }
+  const picker = client.workspaceColorPicker({ t, workspace: ws, choose: (...args) => chosen.push(args), onClose: () => {} })
+  const swatches = nodesOf(picker).filter((node) => node.props?.className === 'dw-ws-choice')
+  assert.deepEqual(swatches.map((node) => node.props['data-dw-color']), client.WORKSPACE_PALETTE, 'the eight palette colors')
+  assert.deepEqual(swatches.filter((node) => node.props['aria-pressed'] === true).map((node) => node.props['data-dw-color']), ['#6E7E91'])
+  swatches[2].props.onClick()
+  assert.deepEqual(chosen[0], ['ws-blog', PALETTE[2], 0], 'a palette click posts the clicked slot at once')
+  const custom = nodesOf(picker).find((node) => node.type === 'input' && node.props.type === 'color')
+  custom.props.onChange({ target: { value: '#abcdef' } })
+  assert.equal(chosen[1][1], '#abcdef', 'a custom hex is accepted too')
+  assert.ok(chosen[1][2] > 0, 'the dragged picker waits for the pointer to rest')
+
+  // The picker resolves through the store's own setColor, so the write lands
+  // on the same route and the same field the settings section uses.
+  const h = await loadedHarness()
+  const posted = h.store.setColor('ws-blog', '#748162', 0)
+  await h.flush()
+  assert.deepEqual(await posted, { ok: true })
+  const post = h.calls.find((call) => call.method === 'POST')
+  assert.deepEqual(post.body, { id: 'ws-blog', color: '#748162' }, 'the write carries the id and the color field')
+  console.log('ok 13 — the folder menu gains "set color" and writes { id, color } through the shared store')
+}
+
+// --- 14. the whale logo only on whale-opened sessions ---------------------
+//
+// "Opened by the whale" is the dispatch record: the worker session id in the
+// checkpoint/report index the `dispatched` route serves. A session the user
+// opened has no record there, so it shows no logo — that is the whole test.
+
+{
+  assert.equal(typeof client.whalePrefix, 'function', 'a title prefix exists')
+  const h = await loadedHarness()
+  const prefix = (sessionId) => client.whalePrefix({ t, snapshot: h.store.getSnapshot(), sessionId })
+
+  const whale = prefix('w-blog-1')
+  assert.notEqual(whale, null, 'a dispatched session carries the logo')
+  assert.equal(whale.props['data-dw-whale'], '', 'the prefix is marked for the stylesheet')
+  assert.equal(whale.props.title, t('whaleSession'))
+  assert.equal(whale.props.role, 'img', 'the logo is announced, not decoration')
+  assert.equal(whale.props['aria-label'], t('whaleSession'))
+  assert.equal(whale.props.style['--dw-ws-folder'], '#6E7E91', 'the logo takes the workspace color')
+  assert.match(whale.props.style['--dw-whale-mask'], /^url\("data:image\/svg\+xml,/, 'the logo glyph is the whale, painted as a mask')
+
+  assert.equal(prefix(MAIN), null, 'the whale main session itself carries no logo')
+  assert.equal(prefix('user-opened'), null, 'a session the user opened carries no logo')
+  assert.equal(client.whalePrefix({ t, snapshot: harness().store.getSnapshot(), sessionId: 'w-blog-1' }), null, 'nothing renders before the map loads')
+  console.log('ok 14 — only whale-dispatched sessions get the logo and workspace color')
 }
 
 console.log('\nAll discipline-whale memory client checks passed.')

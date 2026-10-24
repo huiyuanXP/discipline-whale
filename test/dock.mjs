@@ -538,61 +538,62 @@ function listenerHarness(gates = {}) {
   console.log('ok 9 — done-talking and the 60s cap hand a segment over and keep listening; close releases every track')
 }
 
-// --- 10. the settings panel's TTS wording --------------------------------
+// --- 10. the settings panel's speech wording ------------------------------
 
 {
-  // The user's correction: keep the browser read-aloud as a fallback, and do
-  // NOT describe TTS as if it does not exist — but also never claim it is
-  // integrated. Both dictionaries have to say all four things:
-  //   1. a browser speech-synthesis fallback exists (and is off by default)
-  //   2. a real TTS is NOT integrated
-  //   3. the fields are a placeholder kept for later
-  //   4. a real TTS needs its own separate key
+  // Speech OUT is a real channel now, configured by its own form. Both
+  // dictionaries must say four true things about it:
+  //   1. the browser speech-synthesis fallback still exists and is off by default
+  //   2. read-aloud prefers the configured backend
+  //   3. a backend failure falls back to the browser synthesizer (automatically)
+  //   4. the speech key is separate from the transcription key
   const { zh, en } = dock.DICTIONARIES
   const cases = [
     ['zh', zh, {
-      fallback: /浏览器|browser/i,
-      off: /默认关闭|默认/,
-      notIntegrated: /未接入/,
-      placeholder: /占位|留作将来|预留/,
+      backend: /语音合成|朗读/,
+      fallback: /浏览器/,
+      automatic: /自动|退回/,
       ownKey: /单独.*key|自己的.*key|独立.*key/,
-      integratedClaim: /已接入\s*TTS|TTS\s*已接入/,
     }],
     ['en', en, {
+      backend: /speech (backend|synthesis)|read aloud/i,
       fallback: /browser/i,
-      off: /off by default|default off/i,
-      notIntegrated: /not (yet )?integrated/i,
-      placeholder: /placeholder|kept for later|reserved/i,
-      ownKey: /its own (separate )?(API )?key|separate key/i,
-      integratedClaim: /TTS is integrated|integrated TTS channel/i,
+      automatic: /falls back|automatically/i,
+      ownKey: /its own key|separate key/i,
     }],
   ]
   for (const [lang, copy, rules] of cases) {
     const note = copy.settingsTtsNote
     assert.equal(typeof note, 'string', `${lang}.settingsTtsNote must exist`)
+    assert.match(note, rules.backend, `${lang}.settingsTtsNote must name the speech backend`)
     assert.match(note, rules.fallback, `${lang}.settingsTtsNote must mention the browser fallback`)
-    assert.match(note, rules.off, `${lang}.settingsTtsNote must say the fallback is off by default`)
-    assert.match(note, rules.notIntegrated, `${lang}.settingsTtsNote must say real TTS is not integrated`)
-    assert.match(note, rules.placeholder, `${lang}.settingsTtsNote must say the fields are placeholders for later`)
-    assert.match(note, rules.ownKey, `${lang}.settingsTtsNote must say a real TTS needs its own key`)
-    assert.equal(rules.integratedClaim.test(note), false, `${lang}.settingsTtsNote may not claim TTS is integrated`)
-    // The title must not read as "TTS is missing entirely", and must not read
-    // as "TTS is ready" either.
-    assert.match(copy.settingsTtsTitle, rules.notIntegrated, `${lang}.settingsTtsTitle must scope the "not integrated" claim`)
-    assert.match(copy.settingsTtsModel, rules.notIntegrated)
-    assert.match(copy.settingsTtsVoice, rules.notIntegrated)
-    // The fallback is named as a fallback on the dock too, not just in settings.
+    assert.match(note, rules.automatic, `${lang}.settingsTtsNote must say the fallback is automatic`)
+    assert.match(note, rules.ownKey, `${lang}.settingsTtsNote must say the speech key is its own key`)
+    // The old placeholder language must be gone: this is not a "kept for
+    // later" form any more, and it must not read as unimplemented.
+    assert.equal(/未接入|留作将来|占位/.test(note), false, `${lang}.settingsTtsNote may not call the form a placeholder`)
+    assert.equal(/not integrated|placeholder|kept for later/i.test(note), false, `${lang}.settingsTtsNote may not call the form a placeholder`)
+    // The per-field labels carry no "not integrated" suffix either.
+    for (const key of ['settingsTtsModel', 'settingsTtsVoice', 'settingsTtsBaseUrl', 'settingsTtsApiKey']) {
+      assert.equal(/未接入|留作将来|placeholder|not integrated/i.test(copy[key]), false, `${lang}.${key} must be a plain label`)
+    }
+    // The fallback is still named as a fallback on the dock, not only in settings.
     assert.match(copy.speakNote, /fallback|兜底|备用/i)
+    // And every fallback reason has a line, so a downgrade is never silent.
+    for (const key of ['ttsMissingKey', 'ttsInvalidKey', 'ttsUnreachable', 'ttsTimeout', 'ttsBadAudio', 'ttsTooLong', 'ttsFallbackGeneric']) {
+      assert.equal(typeof copy[key], 'string', `${lang}.${key} must exist`)
+      assert.ok(copy[key].length > 0, `${lang}.${key} may not be empty`)
+    }
   }
 
-  // The TTS block keeps its fields (placeholder for later), and they stay
-  // disabled: nothing here may look like a working TTS configuration form.
-  // They live on the settings panel's "tts" page; the overview links to it
-  // with a row that says "not integrated".
-  const settingsInput = (page, navigated) => ({
+  // The TTS page is a real form: every field is editable, the key is a masked
+  // password box, and nothing is disabled. It lives behind a row on the
+  // overview that describes the channel rather than disclaiming it.
+  const ttsDraft = { ...dock.EMPTY_SETTINGS_DRAFT }
+  const settingsInput = (page, navigated, info = null) => ({
     t: (key) => key,
-    info: null,
-    draft: { baseUrl: '', model: '', language: '', apiKey: '', apiKeyTouched: false, clearKey: false },
+    info,
+    draft: { ...ttsDraft },
     set: () => {},
     busy: false,
     testing: false,
@@ -600,59 +601,80 @@ function listenerHarness(gates = {}) {
     testResult: null,
     error: null,
     page,
-    actions: { save: () => {}, test: () => {}, close: () => {}, navigate: (target) => navigated.push(target) },
+    speak: false,
+    ttsEnabled: true,
+    workspaces: undefined,
+    actions: { navigate: (target) => navigated.push(target) },
   })
   const nodesOf = (tree) => {
     const found = []
     const visit = (node) => {
-      if (node === null || node === undefined || typeof node === 'string') return
+      if (node === null || node === undefined) return
       if (Array.isArray(node)) { node.forEach(visit); return }
       if (typeof node === 'object') { found.push(node); visit(node.children) }
     }
     visit(tree)
     return found
   }
-  const textsOf = (tree) => {
-    const found = []
-    const visit = (node) => {
-      if (node === null || node === undefined) return
-      if (typeof node === 'string') { found.push(node); return }
-      if (Array.isArray(node)) { node.forEach(visit); return }
-      if (typeof node === 'object') visit(node.children)
+  // Recursive on purpose: the title of a nav row is nested in a span.
+  const textsOf = (node) => {
+    const out = []
+    const visit = (child) => {
+      if (typeof child === 'string') { out.push(child); return }
+      if (Array.isArray(child)) { child.forEach(visit); return }
+      if (child !== null && typeof child === 'object') visit(child.children)
     }
-    visit(tree)
-    return found
+    visit(node?.children)
+    return out
   }
   const navigated = []
   const overview = dock.settingsView(settingsInput(undefined, navigated))
   const ttsEntry = nodesOf(overview).find((node) => node.type === 'button' && textsOf(node).includes('settingsTtsEntry'))
-  assert.ok(ttsEntry, 'the overview links to the TTS placeholders')
-  assert.ok(textsOf(ttsEntry).includes('settingsNotIntegrated'), 'the TTS entry says it is not integrated')
+  assert.ok(ttsEntry, 'the overview links to the speech settings')
   ttsEntry.props.onClick()
-  assert.deepEqual(navigated, ['tts'], 'the TTS entry opens the tts page')
+  assert.deepEqual(navigated, ['tts'], 'the speech entry opens the tts page')
+  // With no key configured the row says the browser fallback is what runs.
+  assert.ok(textsOf(ttsEntry).join(' ').includes('settingsTtsFallback'), 'an unconfigured channel names the fallback')
 
-  const view = dock.settingsView(settingsInput('tts', []))
+  const view = dock.settingsView(settingsInput('tts', [], null))
   const nodes = nodesOf(view)
   const block = nodes.find((node) => node.props?.['data-dw-tts'] !== undefined)
-  assert.ok(block, 'the TTS block is still rendered, not removed')
-  assert.equal(block.props['data-dw-tts'], 'not-integrated')
-  const disabledInputs = nodes.filter((node) => node.type === 'input' && node.props?.disabled === true)
-  assert.equal(disabledInputs.length, 4, 'base URL, model, voice and a SEPARATE TTS key field remain, all disabled')
-  // The TTS key is its own field: a real TTS does not reuse the transcription key.
-  const types = disabledInputs.map((node) => node.props.type)
-  assert.ok(types.includes('password'), 'the placeholder TTS key field is a password field, not a text one')
-  // Every placeholder says it is not integrated, so a filled value never looks live.
-  for (const node of disabledInputs) {
-    assert.equal(node.props.placeholder, 'settingsNotIntegrated', 'each TTS placeholder is labelled not-integrated')
-    assert.equal(node.props.value, '', 'no TTS placeholder carries a value')
-  }
+  assert.ok(block, 'the speech form is rendered')
+  assert.equal(block.props['data-dw-tts'], 'configured', 'the block reports a configured channel, not a placeholder')
+  const inputs = nodes.filter((node) => node.type === 'input')
+  assert.ok(inputs.length >= 4, `base URL, key, voice and model are all present (got ${inputs.length})`)
+  assert.deepEqual(inputs.filter((node) => node.props?.disabled === true).map((node) => node.props.type), [],
+    'nothing is disabled on a fresh form: every field is editable')
+  // The one disabled state is the key box, and only while its clear switch is
+  // on (typing into a box that is about to be erased would be a trap).
+  const clearDraft = { ...ttsDraft, clearTtsKey: true, ttsApiKeyTouched: true }
+  const clearingView = dock.settingsView({ ...settingsInput('tts', [], {
+    tts: { hasApiKey: true, keySource: 'settings', apiKeyEnv: 'MIMO_TOKEN_PLAN_KEY', baseUrl: 'https://speech.example/v1', voice: '', format: 'wav', formats: ['wav'], model: 'm1', fallback: 'browser-speech-synthesis' },
+  }), draft: clearDraft })
+  const clearingInputs = nodesOf(clearingView).filter((node) => node.type === 'input')
+  assert.deepEqual(clearingInputs.filter((node) => node.props?.disabled === true).map((node) => node.props.type), ['password'],
+    'the key box is disabled only while marked for clearing')
+  assert.ok(inputs.some((node) => node.props?.type === 'password'), 'the key is a masked password field')
+  assert.ok(inputs.some((node) => node.props?.type === 'url'), 'the base URL is a URL field')
+  const selects = nodes.filter((node) => node.type === 'select')
+  assert.ok(selects.length >= 1, 'the audio format is a select, so only the served containers can be chosen')
+  // The "prefer the backend" switch is present and on by default.
+  const switches = nodes.filter((node) => node.props?.role === 'switch')
+  assert.ok(switches.length >= 1, 'the backend preference is a switch')
+
+  // With a key saved elsewhere, the row reports where it came from.
+  const configuredRow = dock.settingsView(settingsInput('tts', [], {
+    tts: { hasApiKey: true, keySource: 'env', apiKeyEnv: 'MIMO_TOKEN_PLAN_KEY', baseUrl: 'https://speech.example/v1', voice: 'v1', format: 'wav', formats: ['wav', 'mp3', 'pcm'], model: 'm1', fallback: 'browser-speech-synthesis' },
+  }))
+  const sourceRow = nodesOf(configuredRow).find((node) => node.props?.['data-dw-tts-source'] !== undefined)
+  assert.equal(sourceRow.props['data-dw-tts-source'], 'env', 'the form says WHERE the key came from')
 
   // The clear-key switch is the one control that can erase a stored key. It
   // appears only for a key saved here; on marks the key for erasing, and
   // switching it back off restores "leave the key alone".
   const serviceWith = (keySource, draft, writes) => dock.settingsView({
     ...settingsInput('service', []),
-    info: { keySource, hasApiKey: keySource !== 'none', apiKeyEnv: 'SOCLAAS_API_KEY', baseUrl: 'https://x.test/v1', model: 'whisper-large-v3', language: '' },
+    info: { keySource, hasApiKey: keySource !== 'none', apiKeyEnv: 'DW_STT_API_KEY', baseUrl: 'https://x.test/v1', model: 'whisper-large-v3', language: '' },
     draft,
     set: (patch) => writes.push(patch),
   })
@@ -674,7 +696,7 @@ function listenerHarness(gates = {}) {
   draft = { ...draft, ...writes.at(-1) }
   assert.deepEqual([draft.clearKey, draft.apiKeyTouched], [false, false], 'off restores "leave the key alone"')
   assert.equal('apiKey' in dock.settingsDraftPatch(draft), false, 'so a save after switching back sends no key at all')
-  console.log('ok 10 — settings TTS copy keeps the fallback, denies integration, and marks the fields as placeholders')
+  console.log('ok 10 — the speech form is live: fallback named, key separate, every field editable')
 }
 
 // --- 11. the logic/visual seam -------------------------------------------
@@ -883,3 +905,53 @@ function listenerHarness(gates = {}) {
 }
 
 console.log('\nAll discipline-whale dock checks passed.')
+
+// --- 14. a field the user did not edit never enters the patch --------------
+//
+// The reported data-loss bug: the Base URL box shows the server's value as a
+// PLACEHOLDER and starts empty, so a save that only typed an API key sent
+// `baseUrl: ""` and wiped a working endpoint. `dirty` is the record of what the
+// person actually typed; a field absent from it must not be in the request.
+
+{
+  assert.equal(typeof dock.settingsDraftPatch, 'function')
+
+  // 1. Only the key was typed: the endpoint must not be in the patch at all.
+  const keyOnly = dock.settingsDraftPatch({
+    baseUrl: '',
+    model: '',
+    language: '',
+    apiKey: 'sk-typed-0123456789',
+    apiKeyTouched: true,
+    ttsBaseUrl: '',
+    ttsApiKey: '',
+    ttsApiKeyTouched: false,
+    dirty: {},
+  })
+  assert.deepEqual(keyOnly, { apiKey: 'sk-typed-0123456789' }, 'a save that only typed a key carries nothing else')
+  assert.equal('baseUrl' in keyOnly, false, 'an untouched Base URL is omitted, so the stored endpoint survives')
+
+  // 2. Only the endpoint was typed: the stored key must not be disturbed.
+  const urlOnly = dock.settingsDraftPatch({
+    baseUrl: ' https://stt.example.test/v1 ',
+    apiKey: '',
+    apiKeyTouched: false,
+    dirty: { baseUrl: true },
+  })
+  assert.deepEqual(urlOnly, { baseUrl: 'https://stt.example.test/v1' })
+  assert.equal('apiKey' in urlOnly, false, 'an untouched key field never travels with a Base URL change')
+
+  // 3. A field the user emptied on purpose IS written, as the empty string.
+  const clearedOnPurpose = dock.settingsDraftPatch({
+    baseUrl: '',
+    apiKey: '',
+    apiKeyTouched: false,
+    dirty: { baseUrl: true },
+  })
+  assert.equal(clearedOnPurpose.baseUrl, '', 'an explicitly cleared field is sent as empty, which means unset')
+
+  // 4. A mask is never a key, even when the box was touched.
+  const masked = dock.settingsDraftPatch({ apiKey: '••••••••', apiKeyTouched: true, dirty: {} })
+  assert.equal('apiKey' in masked, false, 'a masked display value is never written back as the key')
+  console.log('ok 14 — a field the user did not edit never enters the patch; a mask is never a key')
+}

@@ -4,7 +4,7 @@
  *
  * The browser records one utterance (its own silence detector ends it), uploads
  * the bytes here, and this module forwards them to the configured
- * OpenAI-compatible transcription backend (NUS SoCLaaS by default). The
+ * OpenAI-compatible transcription backend the operator configures. The
  * transcript is what the caller then sends into the main session — with the
  * same `sessionController.prompt` call the dispatch path already uses, so voice
  * is an input method, not a second message channel.
@@ -24,13 +24,23 @@
 
 import { randomUUID } from 'node:crypto'
 
-import { describeVoice, resolveKey } from './voice-settings.js'
+import { describeVoice, resolveKey, resolveTtsKey } from './voice-settings.js'
+import { speakHandler } from './mimo-tts.js'
 
 /** Route the browser half uploads one recording to. */
 export const VOICE_ROUTE = '/api/discipline-whale/voice/transcribe'
 
 /** Route the browser half asks whether voice input can work at all. */
 export const VOICE_STATUS_ROUTE = '/api/discipline-whale/voice/status'
+
+/**
+ * Route that speaks one piece of text.
+ *
+ * Speech OUT is independent of speech IN: it has its own key, its own endpoint
+ * and its own failure codes, so a broken transcription backend never silences
+ * the whale and a broken speech backend never blocks a recording.
+ */
+export const VOICE_SPEAK_ROUTE = '/api/discipline-whale/voice/speak'
 
 /**
  * Route that sends one transcript into the main session.
@@ -42,14 +52,21 @@ export const VOICE_STATUS_ROUTE = '/api/discipline-whale/voice/status'
  */
 export const VOICE_SAY_ROUTE = '/api/discipline-whale/voice/say'
 
-/** Environment variable holding the SoCLaaS API key. Never echoed anywhere. */
-export const API_KEY_ENV = 'SOCLAAS_API_KEY'
+/** Environment variable holding the transcription key. Never echoed anywhere. */
+export const API_KEY_ENV = 'DW_STT_API_KEY'
 
-/** Environment variable overriding the backend base URL (must end in `/v1`). */
-export const BASE_URL_ENV = 'SOCLAAS_BASE_URL'
+/** Environment variable holding the transcription base URL (must end in `/v1`). */
+export const BASE_URL_ENV = 'DW_STT_BASE_URL'
 
-/** Default OpenAI-compatible endpoint root. */
-export const DEFAULT_BASE_URL = 'https://soclaas-api.comp.nus.edu.sg/v1'
+/**
+ * The transcription base URL when nothing is configured.
+ *
+ * Empty on purpose. A published plugin does not name a default transcription
+ * host: a deployment choice is the operator's, so an unset endpoint is reported
+ * as unset and the route refuses with "not configured" instead of reaching for
+ * a host nobody named.
+ */
+export const DEFAULT_BASE_URL = ''
 
 /** Transcription model id. */
 export const MODEL = 'whisper-large-v3'
@@ -85,6 +102,7 @@ export const VOICE_ERRORS = {
   empty: 'voice/empty-audio',
   tooLarge: 'voice/audio-too-large',
   missingKey: 'voice/missing-key',
+  missingEndpoint: 'voice/missing-endpoint',
   invalidKey: 'voice/invalid-key',
   noModel: 'voice/model-unavailable',
   unreachable: 'voice/backend-unreachable',
@@ -184,8 +202,8 @@ export function transcriptOf(payload) {
  *
  * `no_speech_prob` is checked on its own. Whisper's built-in skip rule needs
  * `no_speech_prob > 0.6` AND `avg_logprob < -1.0`, and that combination lets
- * the classic room-tone hallucinations through: measured on SoCLaaS
- * whisper-large-v3, four seconds of room tone came back as 「由 Amara.org 社群提
+ * the classic room-tone hallucinations through: measured on whisper-large-v3,
+ * four seconds of room tone came back as 「由 Amara.org 社群提
  * 供的字幕」 with no_speech_prob 0.83 and avg_logprob -0.27, while clear near
  * speech scored no_speech_prob 0.02.
  */
@@ -206,7 +224,7 @@ export const SEGMENT_LIMITS = Object.freeze({
  * when it is nothing but that line: `whole` by exact match, `credits` by
  * pattern. Everything is compared after `normalizeForMatch`. Sources: the "Bag
  * of Hallucinations" list (arXiv:2501.11378), WhisprRT `app/config.py`,
- * TypeLate `hallucinationDetector.ts`, and the SoCLaaS outputs measured above.
+ * TypeLate `hallucinationDetector.ts`, and the outputs measured above.
  */
 export const HALLUCINATIONS = Object.freeze({
   markers: Object.freeze(['amara.org', '明镜与点点', '请不吝点赞', '优优独播剧场', 'yoyotelevision']),
@@ -290,6 +308,20 @@ export async function transcribeAudio(input, deps = {}) {
     : deps.keyResolver !== undefined
       ? (await deps.keyResolver()).value
       : apiKey(env)
+  const endpoint = typeof config.baseUrl === 'string' && config.baseUrl !== ''
+    ? config.baseUrl
+    : baseUrl(env)
+  if (endpoint === '') {
+    // No transcription backend is configured. This is a configuration gap, not
+    // a network failure: naming the variable to set is the whole answer, and
+    // no request is attempted against a host nobody named.
+    return failure(
+      VOICE_ERRORS.missingEndpoint,
+      `voice input is not configured: set the transcription endpoint in the voice settings or ${BASE_URL_ENV} in the environment`,
+      503,
+      { baseUrlEnv: BASE_URL_ENV },
+    )
+  }
   if (key === '') {
     return failure(VOICE_ERRORS.missingKey, `voice input needs a key in the voice settings or ${API_KEY_ENV} in the environment`, 503)
   }
@@ -312,7 +344,7 @@ export async function transcribeAudio(input, deps = {}) {
     : AbortSignal.any([input.signal, deadline.signal])
   let response
   try {
-    response = await fetchImpl(`${config.baseUrl ?? baseUrl(env)}/audio/transcriptions`, {
+    response = await fetchImpl(`${endpoint}/audio/transcriptions`, {
       method: 'POST',
       headers: { authorization: `Bearer ${key}` },
       body: form,
@@ -419,10 +451,11 @@ export function voiceHandler(options = {}) {
           language: config.language ?? '',
           maxBytes: MAX_AUDIO_BYTES,
           maxSeconds: MAX_AUDIO_SECONDS,
-          // TTS is not integrated; the status route says so rather than letting
-          // the UI imply a capability the plugin does not have.
-          tts: { integrated: false },
-          source: 'NUS SoCLaaS (cloud transcription)',
+          // Inside this route "configured" means transcription can work: a key
+          // AND an endpoint. An unset endpoint is reported separately so the UI
+          // can say which of the two is missing.
+          endpointConfigured: (config.baseUrl ?? baseUrl(env)) !== '',
+          source: 'configured transcription endpoint',
         },
         { headers: { 'cache-control': 'no-store' } },
       )
@@ -564,6 +597,31 @@ export function registerVoiceRoutes(connection, options = {}) {
     { path: VOICE_ROUTE, methods: ['GET', 'POST'], requestBody: 'buffered', fetch: handler },
     { path: VOICE_STATUS_ROUTE, methods: ['GET'], requestBody: 'buffered', fetch: handler },
   ]
+  // Speech out: one POST of text, audio bytes back. The key is resolved per
+  // request so a value saved in the form reaches the very next reply.
+  routes.push({
+    path: VOICE_SPEAK_ROUTE,
+    methods: ['POST'],
+    requestBody: 'buffered',
+    fetch: speakHandler({
+      env: options.env,
+      logger: options.logger,
+      fetch: options.fetch,
+      timeoutMs: options.ttsTimeoutMs,
+      describe: async () => {
+        const env = options.env ?? process.env
+        const config = await describeVoice({ env, credentials: options.credentials, homeDir: options.homeDir })
+        const key = await resolveTtsKey({ env, credentials: options.credentials, homeDir: options.homeDir })
+        return {
+          apiKey: key.value,
+          baseUrl: config.tts?.baseUrl ?? '',
+          model: config.tts?.model ?? '',
+          voice: config.tts?.voice ?? '',
+          format: config.tts?.format ?? '',
+        }
+      },
+    }),
+  })
   if (options.say !== undefined) {
     routes.push({
       path: VOICE_SAY_ROUTE,

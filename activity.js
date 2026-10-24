@@ -43,8 +43,36 @@ const TERMINAL = new Set(['reported', 'delivered', 'abandoned'])
 /** Placeholder shown for a workspace that has no intro yet. */
 const NO_INTRO = '（待补充）'
 
-/** Workspace colors: eight distinct, readable hues. */
-export const PALETTE = ['#3B82F6', '#10B981', '#F59E0B', '#EF4444', '#8B5CF6', '#EC4899', '#14B8A6', '#F97316']
+/**
+ * Workspace colors: eight Morandi hues — low saturation, greyed, never red.
+ *
+ * WHY MORANDI AND NOT TAILWIND. Two constraints decided this set:
+ *
+ *   1. NO RED, NO ORANGE. Red is the harness's own warning color, so a red
+ *      folder would read as "this workspace is broken" when nothing is wrong.
+ *      The old set carried #EF4444 (red, saturation 0.79) and two oranges
+ *      (#F59E0B, #F97316); #F59E0B is also the color that forced the folder
+ *      title mix down to 60% to clear AA on white.
+ *   2. EVERY COLOR MUST BE READABLE IN BOTH THEMES, both as the mixed title
+ *      and as the raw swatch. The sidebar paints the title as
+ *      `color-mix(<hue> 60%, <theme label>)`, but the menu chips and the whale
+ *      logo are painted in the raw color, so the raw value has to clear the 3:1
+ *      graphic bar on a white sidebar AND on a near-black one. That brackets
+ *      each color's relative luminance to a narrow band, which is why these
+ *      read quieter than a "designer grey" would.
+ *
+ * Measured in a real Chromium against the live tokens (label rgb(15,17,21) on
+ * light, rgb(249,250,251) on dark; sidebar fill rgb(249,250,251) / rgb(21,21,23))
+ * by letting Chromium resolve the same color-mix() the stylesheet uses:
+ * title 7.54-7.62:1, folder glyph 5.59-5.66:1, raw swatch 3.96-4.41:1 — all
+ * clearing their bars with room to spare. `test/palette-morandi.mjs` pins the
+ * hue ban, the saturation band and those ratios, so a later edit fails there
+ * instead of in the sidebar.
+ *
+ * KEEP THE EIGHT IN THIS ORDER: `defaultColor` hashes a workspace id into a
+ * slot, so reordering reassigns the colors of workspaces that never chose one.
+ */
+export const PALETTE = ['#6E7E91', '#678187', '#63827E', '#648371', '#668364', '#748162', '#8F7398', '#81779D']
 
 /** Per-path promise chains that serialize read-modify-write cycles inside this process. */
 const chains = new Map()
@@ -81,6 +109,82 @@ export function defaultColor(workspaceId) {
   return PALETTE[hash % PALETTE.length]
 }
 
+/**
+ * The palette this plugin shipped BEFORE the Morandi change, in slot order.
+ *
+ * It exists only to recognize colors already stored in `workspaces.json`; no
+ * new code path may assign one of these. `morandiForLegacy` maps a slot to the
+ * Morandi color at the SAME index, so migration preserves the user's intent
+ * ("my API workspace is the blue one") instead of picking a new relative hue.
+ */
+export const LEGACY_PALETTE = ['#3B82F6', '#10B981', '#F59E0B', '#EF4444', '#8B5CF6', '#EC4899', '#14B8A6', '#F97316']
+
+/**
+ * The Morandi color that replaces a legacy palette slot, or null.
+ *
+ * Null means "not a legacy palette member", which includes every custom hex a
+ * user typed and every color that is already Morandi. Returning null rather
+ * than a fallback is the point: a color this function does not recognize must
+ * never be rewritten.
+ *
+ * @param {unknown} color
+ * @returns {string | null}
+ */
+export function morandiForLegacy(color) {
+  if (typeof color !== 'string') return null
+  const index = LEGACY_PALETTE.findIndex((legacy) => legacy.toLowerCase() === color.toLowerCase())
+  return index === -1 ? null : PALETTE[index]
+}
+
+/**
+ * Which stored workspace colors the Morandi change would replace, and with what.
+ *
+ * A PLAN, not a write: the caller shows this to the user (or logs it), because
+ * silently repainting a color somebody picked is exactly what this change must
+ * not do. Only exact legacy palette members are candidates — a custom hex and
+ * an already-Morandi color are not.
+ *
+ * @param {Record<string, { color?: string }>} cards from {@link readWorkspaceCards}
+ * @returns {{ id: string, from: string, to: string }[]}
+ */
+export function planColorMigration(cards) {
+  if (cards === null || typeof cards !== 'object') return []
+  const plan = []
+  for (const [id, card] of Object.entries(cards)) {
+    const from = typeof card?.color === 'string' ? card.color : undefined
+    const to = morandiForLegacy(from)
+    if (to !== null) plan.push({ id, from, to })
+  }
+  return plan
+}
+
+/**
+ * Apply the Morandi color migration to `workspaces.json`.
+ *
+ * DRY RUN BY DEFAULT (`apply: false`). With `apply: true` it rewrites only the
+ * cards named by {@link planColorMigration} and leaves every other field and
+ * every other card exactly as it found them — a user's custom color, their
+ * intros and their `updatedAt` all survive.
+ *
+ * @param {string} homeDir DSH root
+ * @param {{ apply?: boolean }} [options]
+ * @returns {Promise<{ changed: { id: string, from: string, to: string }[], applied: boolean }>}
+ */
+export async function applyColorMigration(homeDir, { apply = false } = {}) {
+  const cards = await readWorkspaceCards(homeDir)
+  const changed = planColorMigration(cards)
+  if (changed.length === 0 || !apply) return { changed, applied: false }
+  await updateAllCards(homeDir, (all) => {
+    for (const row of changed) {
+      const card = all[row.id]
+      if (card === undefined) continue
+      all[row.id] = { ...card, color: row.to }
+    }
+    return all
+  })
+  return { changed, applied: true }
+}
+
 /** Load the cards file. `strict` rethrows a corrupt file so a writer never overwrites it. */
 async function loadCards(homeDir, strict) {
   let text
@@ -108,6 +212,27 @@ async function loadCards(homeDir, strict) {
  */
 export async function readWorkspaceCards(homeDir) {
   return loadCards(homeDir, false)
+}
+
+/**
+ * Read-modify-write the whole cards file under the per-file chain.
+ *
+ * Separate from {@link updateCard} because a migration touches several cards in
+ * one write: doing it as N single-card writes would rewrite the file N times
+ * and, if one failed midway, leave the store half-migrated.
+ *
+ * @param {string} homeDir DSH root
+ * @param {(cards: Record<string, object>) => Record<string, object>} change
+ * @returns {Promise<Record<string, object>>} the written map
+ */
+function updateAllCards(homeDir, change) {
+  const path = statePath(homeDir, 'workspaces.json')
+  return serialized(path, async () => {
+    const cards = await loadCards(homeDir, true)
+    const next = change({ ...cards })
+    await atomicWrite(path, `${JSON.stringify(next, null, 2)}\n`)
+    return next
+  })
 }
 
 /** Read-modify-write one card under the per-file chain. */

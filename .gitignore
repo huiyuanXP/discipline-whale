@@ -19,3 +19,6 @@ HANDOFF-*.md
 VERIFICATION.md
 docs/**/*.md
 .dsh-tmp/
+
+# Screenshots and JSON written by scripts/probe-dom.mjs, verify-dom.mjs, verify-tts-regressions.mjs
+artifacts/

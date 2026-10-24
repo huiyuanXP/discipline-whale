@@ -19,18 +19,18 @@
  */
 
 import assert from 'node:assert/strict'
-import { mkdtemp, readFile, rm, stat } from 'node:fs/promises'
+import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import {
   API_KEY_ENV,
   BASE_URL_ENV,
-  DEFAULT_BASE_URL,
   DEFAULT_MODEL,
   KEY_SOURCES,
   SETTINGS_FILENAME,
   SETTINGS_ERRORS,
+  TTS_KEY_REF,
   VOICE_SETTINGS_ROUTE,
   VOICE_TEST_ROUTE,
   applySettings,
@@ -38,10 +38,12 @@ import {
   readStoredSettings,
   registerVoiceSettingsRoutes,
   resolveKey,
+  resolveTtsKey,
   settingsPath,
   testConnection,
   voiceSettingsHandler,
 } from '../voice-settings.js'
+import { DEFAULT_TTS_BASE_URL, DEFAULT_TTS_MODEL, DEFAULT_TTS_VOICE, TTS_API_KEY_ENV } from '../mimo-tts.js'
 import {
   VOICE_STATUS_ROUTE,
   registerVoiceRoutes,
@@ -128,17 +130,24 @@ const get = (env = {}) => handler(env)(new Request(`http://dsh${VOICE_SETTINGS_R
   const none = await describeVoice({ env: {}, homeDir: home })
   assert.equal(none.hasApiKey, false)
   assert.equal(none.keySource, KEY_SOURCES.none)
-  assert.equal(none.baseUrl, DEFAULT_BASE_URL, 'an unconfigured base URL falls back to the documented default')
+  assert.equal(none.baseUrl, '', 'an unconfigured transcription endpoint stays empty rather than naming a host')
+  assert.equal(none.endpointConfigured, false, 'no endpoint is reported as not configured')
   assert.equal(none.model, DEFAULT_MODEL)
   assert.equal(none.apiKeyEnv, API_KEY_ENV, 'the answer names the environment variable to set')
-  // Read-aloud, stated precisely: a browser fallback exists and is off by
-  // default; a real TTS is NOT integrated and would need its own key. Neither
-  // "no TTS at all" nor "TTS is ready" is acceptable.
-  assert.equal(none.tts.integrated, false, 'TTS is reported as not integrated rather than implied')
-  assert.equal(none.tts.fallback, 'browser-speech-synthesis', 'the browser fallback is named')
+  // Read-aloud: a real speech channel now exists, with its own key and the
+  // provider's public defaults, and the browser synthesizer remains the
+  // fallback. Both halves of that are stated, neither is implied.
+  assert.equal(none.tts.integrated, true, 'TTS is integrated, not a placeholder')
+  assert.equal(none.tts.fallback, 'browser-speech-synthesis', 'the browser fallback is still named')
   assert.equal(none.tts.fallbackDefaultOn, false, 'the fallback is off by default')
-  assert.equal(none.tts.needsOwnKey, true, 'a real TTS would need its own key')
-  assert.equal(none.tts.configurable, false, 'the TTS fields are placeholders, not a live form')
+  assert.equal(none.tts.needsOwnKey, true, 'the speech key is separate from the transcription key')
+  assert.equal(none.tts.hasApiKey, false, 'no speech key configured yet')
+  assert.equal(none.tts.keySource, KEY_SOURCES.none)
+  assert.equal(none.tts.apiKeyEnv, TTS_API_KEY_ENV, 'the speech key names its own environment variable')
+  assert.equal(none.tts.baseUrl, DEFAULT_TTS_BASE_URL, 'the speech endpoint falls back to the provider default')
+  assert.equal(none.tts.model, DEFAULT_TTS_MODEL)
+  assert.deepEqual(none.tts.formats, ['wav', 'mp3', 'pcm'])
+  assert.ok(none.tts.formats.includes(none.tts.format), 'the default format is one the backend serves')
   console.log('ok 3 — settings → environment → default, reported per field and per source')
 }
 
@@ -290,7 +299,7 @@ const get = (env = {}) => handler(env)(new Request(`http://dsh${VOICE_SETTINGS_R
   const voiceRoutes = []
   const voiceConnection = { fetch: { register: async (route) => { voiceRoutes.push(route); return async () => {} } } }
   await registerVoiceRoutes(voiceConnection, { env: {}, homeDir: home })
-  assert.deepEqual(voiceRoutes.map((route) => route.path).sort(), [VOICE_STATUS_ROUTE, '/api/discipline-whale/voice/transcribe'].sort())
+  assert.deepEqual(voiceRoutes.map((route) => route.path).sort(), [VOICE_STATUS_ROUTE, '/api/discipline-whale/voice/transcribe', '/api/discipline-whale/voice/speak'].sort())
   for (const route of routes) assert.equal(voiceRoutes.some((own) => own.path === route.path), false, `${route.path} registers once`)
   console.log('ok 8 — the settings and probe routes register on connection.fetch, beside the transcription routes')
 }
@@ -304,19 +313,19 @@ const get = (env = {}) => handler(env)(new Request(`http://dsh${VOICE_SETTINGS_R
     store: new Map(),
     env: { [API_KEY_ENV]: 'sk-from-env-0123456789' },
     async describe() {
-      const stored = this.store.get('SOCLAAS_API_KEY')
+      const stored = this.store.get('DW_STT_API_KEY')
       if (stored !== undefined) return { configured: true, source: 'file', writable: true }
       if (this.env[API_KEY_ENV] !== undefined) return { configured: true, source: 'env', writable: true }
       return { configured: false, writable: true }
     },
     async resolve() {
-      const stored = this.store.get('SOCLAAS_API_KEY')
+      const stored = this.store.get('DW_STT_API_KEY')
       if (stored !== undefined) return { value: stored, source: 'file' }
       if (this.env[API_KEY_ENV] !== undefined) return { value: this.env[API_KEY_ENV], source: 'env' }
       return undefined
     },
-    async set(_ref, value) { this.store.set('SOCLAAS_API_KEY', value) },
-    async unset() { this.store.delete('SOCLAAS_API_KEY') },
+    async set(_ref, value) { this.store.set('DW_STT_API_KEY', value) },
+    async unset() { this.store.delete('DW_STT_API_KEY') },
   }
 
   // Before saving: the environment layer of the seam is the source.
@@ -327,13 +336,13 @@ const get = (env = {}) => handler(env)(new Request(`http://dsh${VOICE_SETTINGS_R
   // Saving through this plugin goes to the seam's managed store, not the file.
   const saved = await applySettings({ apiKey: SECRET }, { env: {}, credentials: seam, homeDir: home })
   assert.equal(saved.settings.keySource, KEY_SOURCES.settings, 'the seam managed store reads as settings')
-  assert.equal(seam.store.get('SOCLAAS_API_KEY'), SECRET)
+  assert.equal(seam.store.get('DW_STT_API_KEY'), SECRET)
   const fileAfterSeam = await readStoredSettings(home)
   assert.equal(fileAfterSeam.apiKey, undefined, 'no second copy of the key is kept in the plugin file')
 
   // Clearing goes through the seam too, and the environment layer reappears.
   await applySettings({ apiKey: '' }, { env: {}, credentials: seam, homeDir: home })
-  assert.equal(seam.store.has('SOCLAAS_API_KEY'), false)
+  assert.equal(seam.store.has('DW_STT_API_KEY'), false)
   const afterClear = await describeVoice({ env: {}, credentials: seam, homeDir: home })
   assert.equal(afterClear.keySource, KEY_SOURCES.env, 'clearing the saved key falls back to the environment layer')
 
@@ -363,6 +372,121 @@ const get = (env = {}) => handler(env)(new Request(`http://dsh${VOICE_SETTINGS_R
   const text = await readFile(path, 'utf8')
   assert.equal(text.includes(SECRET), false, 'the key was cleared above, so the file holds no secret')
   console.log('ok 10 — the settings document lives only in the plugin data directory')
+}
+// --- 11. a hand-written key file beside the settings ----------------------
+
+{
+  // `$DSH_HOME/discipline-whale/mimo.json` is the file a person writes by hand
+  // (or that an operator drops in) so the speech key never has to pass through
+  // a chat or a form. It is deliberately NOT the settings document: keeping it
+  // separate means `applySettings` can never clobber a value someone typed
+  // into a file, and clearing the form never deletes it.
+  const key = 'sk-handwritten-0123456789'
+  await writeFile(join(home, 'discipline-whale', 'mimo.json'), JSON.stringify({ apiKey: key, voice: 'female-shaonv', format: 'wav' }), { mode: 0o600 })
+
+  const read = await describeVoice({ env: {}, homeDir: home })
+  assert.equal(read.tts.hasApiKey, true, 'a hand-written key file is found')
+  assert.equal(read.tts.keySource, KEY_SOURCES.settings, 'it reports the settings layer, which is where a file lives')
+  assert.equal(JSON.stringify(read).includes(key), false, 'the description may not echo it')
+  assert.equal((await resolveTtsKey({ env: {}, homeDir: home })).value, key)
+
+  // The environment still wins over nothing, and the file still wins over the
+  // environment — the same precedence as every other field.
+  assert.equal((await resolveTtsKey({ env: { [TTS_API_KEY_ENV]: 'sk-from-env-0123456789' }, homeDir: home })).value, key,
+    'a key written to the file beats the environment, as every stored value does')
+
+  // A form save must not delete the hand-written key, and a clear through the
+  // form must be explicit about the file it is leaving alone.
+  await applySettings({ ttsVoice: 'male-qn-qingse' }, { env: {}, homeDir: home })
+  assert.equal((await resolveTtsKey({ env: {}, homeDir: home })).value, key, 'saving another field does not touch the key file')
+
+  // A malformed key file is ignored rather than breaking speech: it falls back
+  // to the environment, and only then to "not configured".
+  await writeFile(join(home, 'discipline-whale', 'mimo.json'), 'not json at all', { mode: 0o600 })
+  assert.equal((await resolveTtsKey({ env: { [TTS_API_KEY_ENV]: 'sk-from-env-0123456789' }, homeDir: home })).value, 'sk-from-env-0123456789',
+    'a corrupt key file falls back to the environment')
+  assert.equal((await resolveTtsKey({ env: {}, homeDir: home })).source, KEY_SOURCES.none,
+    'with no environment either, a corrupt file means not configured, not a crash')
+
+  // A key file naming the wrong type is refused the same way.
+  await writeFile(join(home, 'discipline-whale', 'mimo.json'), JSON.stringify({ apiKey: 12345 }), { mode: 0o600 })
+  assert.equal((await resolveTtsKey({ env: {}, homeDir: home })).value, '', 'a non-string key is not a key')
+
+  // An earlier save in this file left a voice in the settings document, and the
+  // form wins over the file — so clear it first, then the file is what speaks.
+  await post({ ttsVoice: '' }, {})
+  assert.equal((await describeVoice({ env: {}, homeDir: home })).tts.voice, DEFAULT_TTS_VOICE)
+
+  // The file configures the WHOLE speech channel, not just the key: a person
+  // can drop one file on a machine and never open the UI.
+  await writeFile(join(home, 'discipline-whale', 'mimo.json'), JSON.stringify({
+    apiKey: key, baseUrl: 'https://file.test/v1/', voice: 'file-voice', format: 'MP3',
+  }), { mode: 0o600 })
+  const whole = await describeVoice({ env: {}, homeDir: home })
+  assert.equal(whole.tts.baseUrl, 'https://file.test/v1', 'the file sets the endpoint, trailing slash trimmed')
+  assert.equal(whole.tts.voice, 'file-voice', 'the file sets the voice')
+  assert.equal(whole.tts.format, 'mp3', 'the file sets the format, normalised to lower case')
+
+  // But the form still wins over the file for a field it holds, so a UI edit
+  // is never silently ignored.
+  await post({ ttsVoice: 'form-voice' }, {})
+  assert.equal((await describeVoice({ env: {}, homeDir: home })).tts.voice, 'form-voice',
+    'a value saved in the form beats the file')
+  await post({ ttsVoice: '' }, {})
+
+  // The nested shape is accepted too: a person should not have to guess.
+  await writeFile(join(home, 'discipline-whale', 'mimo.json'), JSON.stringify({
+    tts: { apiKey: key },
+  }), { mode: 0o600 })
+  assert.equal((await resolveTtsKey({ env: {}, homeDir: home })).value, key, 'a nested tts block is read as well')
+  console.log('ok 11 — a hand-written mimo.json is honoured, survives form saves, and degrades safely when broken')
+}
+
+// --- 12. a save never breaks a channel it found working -------------------
+
+{
+  // The reported data loss: the Base URL box starts empty (the server's answer
+  // is the placeholder), so a save that only typed an API key used to send
+  // `baseUrl: ""` and wipe a working transcriber. Two guards are proven here:
+  // the form omits an untouched field (test/dock.mjs), and the route refuses a
+  // patch that would leave a working channel unconfigured.
+  await post({ baseUrl: 'https://stt.example.test/v1' }, {})
+  const configured = await describeVoice({ env: {}, homeDir: home })
+  assert.equal(configured.endpointConfigured, true, 'precondition: the endpoint is configured')
+
+  // 1. Only the key changes: the endpoint must survive.
+  const keyOnly = await applySettings({ apiKey: 'sk-only-the-key-012345' }, { env: {}, homeDir: home })
+  assert.equal(keyOnly.problems, undefined, 'a key-only save is accepted')
+  assert.equal(keyOnly.settings.endpointConfigured, true, 'only the api key changed, so the endpoint survived')
+
+  // 2. A patch that WOULD clear the endpoint while it is in use is refused and
+  //    rolled back, rather than silently downgrading a working install to 503.
+  const breaking = await applySettings({ baseUrl: '' }, { env: {}, homeDir: home })
+  assert.ok(Array.isArray(breaking.problems), 'the route answers a problem instead of "saved"')
+  assert.equal(breaking.problems[0][0], SETTINGS_ERRORS.baseUrl)
+  assert.equal(breaking.rolledBack, true)
+  const survived = await describeVoice({ env: {}, homeDir: home })
+  assert.equal(survived.endpointConfigured, true, 'the endpoint was restored')
+  assert.equal(survived.baseUrl, 'https://stt.example.test/v1', 'the stored URL is byte-identical to before')
+
+  // 3. An endpoint that was never configured can be cleared (no false refusal),
+  //    and the deliberate clear still works once nothing depends on it.
+  await applySettings({ apiKey: '' }, { env: {}, homeDir: home })
+  assert.equal((await describeVoice({ env: {}, homeDir: home })).hasApiKey, false,
+    'clearing the key is a stated intention, not a break, so it is not rolled back')
+
+  // 4. A full reset is a stated intention, not a break: clearing the key too
+  //    lets the endpoint go.
+  const reset = await applySettings({ baseUrl: '', apiKey: '' }, { env: {}, homeDir: home })
+  assert.equal(reset.problems, undefined, 'clearing the key and the endpoint together is allowed')
+  assert.equal((await describeVoice({ env: {}, homeDir: home })).endpointConfigured, false)
+
+  // 5. Turning a channel ON is always allowed.
+  const reEnabled = await applySettings({ baseUrl: 'https://stt.example.test/v1', apiKey: 'sk-again-0123456789' }, { env: {}, homeDir: home })
+  assert.equal(reEnabled.problems, undefined)
+  assert.equal(reEnabled.settings.endpointConfigured, true)
+  await applySettings({ baseUrl: '', apiKey: '' }, { env: {}, homeDir: home })
+  console.log('ok 12 — a save cannot silently break a working channel: it is refused and rolled back')
 }
 
 await rm(home, { recursive: true, force: true })

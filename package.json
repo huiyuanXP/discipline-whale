@@ -1,6 +1,6 @@
 {
   "name": "discipline-whale",
-  "version": "0.6.0",
+  "version": "0.6.6",
   "description": "Discipline Whale for DeepSeek Harness: one main conversation routes work into workspaces, workers report back as pushed messages, and a turn-end check makes the report contract real.",
   "license": "MIT",
   "author": "huiyuanXP",
@@ -26,7 +26,8 @@
     "./voice-silence": "./voice-silence.js",
     "./prompt-probe": "./prompt-probe.mjs",
     "./voice-settings": "./voice-settings.js",
-    "./voice-assets": "./voice-assets.js"
+    "./voice-assets": "./voice-assets.js",
+    "./mimo-tts": "./mimo-tts.js"
   },
   "files": [
     "main.js",
@@ -36,6 +37,7 @@
     "voice.js",
     "voice-settings.js",
     "voice-assets.js",
+    "mimo-tts.js",
     "voice-silence.js",
     "store.js",
     "checkpoint.js",
@@ -86,9 +88,12 @@
   "scripts": {
     "test": "node test/contract.mjs",
     "test:voice": "node test/voice.mjs",
+    "test:tts": "node test/tts.mjs",
+    "test:speech": "node test/speech-output.mjs",
+    "test:decor": "node test/decor-contrast.mjs",
     "test:client": "node test/client.mjs",
     "test:guard": "node test/guard.mjs",
-    "test:all": "node test/contract.mjs && node test/guard.mjs && node test/adhd.mjs && node test/voice.mjs && node test/client.mjs && node test/dock.mjs && node test/settings.mjs && node test/report-head.mjs && npm run test:memory && node test/report-origin.mjs && node test/report-origin-client.mjs && node test/context-audit.mjs && node test/tool-whitelist.mjs && node test/questions.mjs",
+    "test:all": "node test/contract.mjs && node test/tts.mjs && node test/speech-output.mjs && node test/decor-contrast.mjs && node test/restart-recovery.mjs && node test/palette-morandi.mjs && node test/palette-migration.mjs && node test/guard.mjs && node test/adhd.mjs && node test/voice.mjs && node test/client.mjs && node test/dock.mjs && node test/settings.mjs && node test/report-head.mjs && npm run test:memory && node test/report-origin.mjs && node test/report-origin-client.mjs && node test/turn-tags.mjs && node test/context-audit.mjs && node test/tool-whitelist.mjs && node test/questions.mjs",
     "test:smoke": "node test/smoke-restart.mjs",
     "test:dock": "node test/dock.mjs",
     "test:settings": "node test/settings.mjs",
@@ -101,7 +106,9 @@
     "audit:restrict": "node scripts/tools-restrict-probe.mjs",
     "test:tool-whitelist": "node test/tool-whitelist.mjs",
     "audit:whitelist": "node scripts/whitelist-effect.mjs",
-    "test:questions": "node test/questions.mjs"
+    "test:questions": "node test/questions.mjs",
+    "test:restart-recovery": "node test/restart-recovery.mjs",
+    "test:turn-tags": "node test/turn-tags.mjs"
   },
   "dsh": {
     "bundle": {

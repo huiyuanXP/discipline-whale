@@ -351,7 +351,7 @@ worker 每次即将结束回合时，插件会检查本轮是否调用过 `repor
 
 **回落顺序（已定并实现）：设置界面 → 环境变量 → 未配置。**
 
-为什么设置优先于环境变量：与 Host 自己凭据面的既定语义一致（`dsh-credentials-local` 明确让「用户在产物里存的值」压过继承环境，注释原文是保证 `a credential the user explicitly saved in the product must take effect consistently`）。同时 `SOCLAAS_API_KEY` / `SOCLAAS_BASE_URL` 仍是可用的零配置路径，老部署不受影响；`/voice/status` 会**报告 key 来自哪一层**（`keySource`：`settings` / `env` / `none`），UI 直接显示「设置界面（已保存）」或「环境变量 SOCLAAS_API_KEY」。
+为什么设置优先于环境变量：与 Host 自己凭据面的既定语义一致（`dsh-credentials-local` 明确让「用户在产物里存的值」压过继承环境，注释原文是保证 `a credential the user explicitly saved in the product must take effect consistently`）。同时 `DW_STT_API_KEY` / `DW_STT_BASE_URL` 仍是可用的零配置路径；`/voice/status` 会**报告 key 来自哪一层**（`keySource`：`settings` / `env` / `none`），UI 直接显示「设置界面（已保存）」或「环境变量 DW_STT_API_KEY」。
 
 **测试连接**按钮打一次 `GET {baseUrl}/models`（轻量、不计费、不需要音频），把结果分成 `ok` / `invalid-key`(401/403) / `endpoint-not-found`(404) / `backend-unreachable` / `backend-timeout`(15s)，每条给可读原因。选 `/models` 而不是空音频探测的理由：空音频会被计费，而且可能因为容器格式失败——那会把「key 是好的」误报成「key 坏了」。
 
@@ -503,7 +503,7 @@ worker 每次即将结束回合时，插件会检查本轮是否调用过 `repor
 
 | 常量 | 值 | 含义 |
 | --- | --- | --- |
-| `SEGMENT_LIMITS.noSpeechProbMax` | 0.6 | 段的 `no_speech_prob` 达到它就丢。**单独判断**：Whisper 自带的跳过规则要求「`no_speech_prob > 0.6` 且 `avg_logprob < -1`」，拦不住实测的底噪幻觉（SoCLaaS 上 4 秒底噪识别成「由 Amara.org 社群提供的字幕」，`no_speech_prob` 0.83、`avg_logprob` -0.27） |
+| `SEGMENT_LIMITS.noSpeechProbMax` | 0.6 | 段的 `no_speech_prob` 达到它就丢。**单独判断**：Whisper 自带的跳过规则要求「`no_speech_prob > 0.6` 且 `avg_logprob < -1`」，拦不住实测的底噪幻觉（Whisper 后端上 4 秒底噪识别成「由 Amara.org 社群提供的字幕」，`no_speech_prob` 0.83、`avg_logprob` -0.27） |
 | `SEGMENT_LIMITS.avgLogprobMin` | -1.0 | 低于它的段丢弃 |
 | `SEGMENT_LIMITS.compressionRatioMax` | 2.4 | 高于它（大量重复）的段丢弃 |
 | `HALLUCINATIONS.markers` | 字幕致谢等 | 出现就整句丢弃（这些在对助手说的话里不会出现） |
@@ -511,9 +511,9 @@ worker 每次即将结束回合时，插件会检查本轮是否调用过 `repor
 
 ### 隐私（必须看得见）
 
-**音频会上传到 NUS SoCLaaS 云端转写服务**（OpenAI 兼容 `/v1/audio/transcriptions`，模型默认 `whisper-large-v3`，可在设置里改）。本地不落盘：录音只在浏览器内存里存在到上传结束，服务端转发后即丢弃，日志里不出现 key，也不出现完整音频。这条同时写在 UI 的浮层里和这里。
+**录音会上传到服务端配置的转写服务**（OpenAI 兼容 `/v1/audio/transcriptions`，模型默认 `whisper-large-v3`，可在设置里改）。本地不落盘：录音只在浏览器内存里存在到上传结束，服务端转发后即丢弃，日志里不出现 key，也不出现完整音频。这条同时写在 UI 的浮层里和这里。
 
-未配置 key 时，`/voice/status` 返回 `configured: false`、`keySource: "none"`，通话按钮点下去会明确显示「服务端没有配置 SOCLAAS_API_KEY，语音识别不可用」，设置面板显示「还没有可用的 key」。**不会静默变灰**。
+未配置 key 时，`/voice/status` 返回 `configured: false`、`keySource: "none"`，通话按钮点下去会明确显示「服务端没有配置语音识别的 key，语音识别不可用」，设置面板显示「还没有可用的 key」。**不会静默变灰**。
 
 ### 已知限制
 

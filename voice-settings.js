@@ -1,7 +1,24 @@
 /**
- * discipline-whale — the voice settings surface: where the transcription key,
- * the backend base URL, the model and the language come from, and how the
- * browser half learns that without ever seeing the key.
+ * discipline-whale — the voice settings surface: where the transcription key and
+ * endpoint, the text-to-speech key and endpoint, and the voices come from, and
+ * how the browser half learns that without ever seeing a key.
+ *
+ * ## Two independent services
+ *
+ * Speech IN (transcription) and speech OUT (text to speech) are configured
+ * separately, because they are separate services with separate keys:
+ *
+ *   | | transcription (in) | speech (out) |
+ *   |---|---|---|
+ *   | key | `DW_STT_API_KEY` | `MIMO_TOKEN_PLAN_KEY` |
+ *   | endpoint | `DW_STT_BASE_URL` | `MIMO_TTS_BASE_URL` |
+ *   | path | `/audio/transcriptions` | `/chat/completions` |
+ *   | default endpoint | none | the provider's public API host |
+ *
+ * Transcription has no default endpoint on purpose. This plugin is published,
+ * and a transcription backend is a deployment choice, not something to guess:
+ * without one configured the route answers "no transcription endpoint is
+ * configured" instead of reaching for a host the operator never named.
  *
  * ## Where a key can live
  *
@@ -14,28 +31,34 @@
  *     is `file` (managed store) or `env` (inherited environment). Reusing it is
  *     the point: this plugin does not invent a second secret store when the
  *     product already ships one.
- *  2. **The plugin's own data file** — `$DSH_HOME/discipline-whale/voice.json`,
- *     mode 0600, atomic replace. This is the fallback for compositions where
- *     the credentials seam is not mounted (headless / minimal profiles). The
- *     file also carries the non-secret fields (base URL, model, language),
- *     because those have no Host seam and are not secrets.
+ *  2. **The plugin's own data files** — `$DSH_HOME/discipline-whale/voice.json`
+ *     (mode 0600, atomic replace) is the settings document the form owns: the
+ *     fallback for compositions where the credentials seam is not mounted
+ *     (headless / minimal profiles), carrying the non-secret fields (base URLs,
+ *     models, voices) because those have no Host seam and are not secrets.
+ *     `$DSH_HOME/discipline-whale/mimo.json` (mode 0600) is read-only to the
+ *     plugin: it exists so a speech key can be dropped in by hand or by
+ *     provisioning without passing through a chat or a form, and it is never
+ *     rewritten, so a form save cannot clobber it.
+ *
+ * Neither file is in `package.json`'s `files` list, and both live under
+ * `$DSH_HOME`, so an installed plugin never ships a local configuration.
  *
  * ## Precedence (decision, not accident)
  *
- * `settings → environment → unconfigured`.
+ * `settings → environment → default`.
  *
  * The settings value wins because it is the value the user typed into this
  * plugin's own form, and because it matches the Host's own credential
  * precedence: `dsh-credentials-local` deliberately ranks its managed document
  * above the inherited environment so "a credential the user explicitly saved
- * in the product must take effect consistently". `SOCLAAS_API_KEY` /
- * `SOCLAAS_BASE_URL` remain a working zero-config path (existing deployments
- * keep working), and the status route reports which layer won so the UI can
- * say so instead of guessing.
+ * in the product must take effect consistently". The environment variables
+ * remain a working zero-config path, and the status route reports which layer
+ * won so the UI can say so instead of guessing.
  *
  * ## What never leaves this module
  *
- * The key value itself. `describeVoice()` is the only shape the HTTP layer
+ * The key values themselves. `describeVoice()` is the only shape the HTTP layer
  * returns, and it has no field a key could ride in: `hasApiKey`, `keySource`,
  * and for the needs-a-key error, the environment variable name to set.
  *
@@ -46,6 +69,15 @@ import { chmod, mkdir, readFile, rename, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 
 import { dataDir, storeRoot } from './store.js'
+import {
+  DEFAULT_TTS_FORMAT,
+  DEFAULT_TTS_MODEL,
+  DEFAULT_TTS_VOICE,
+  TTS_API_KEY_ENV,
+  TTS_BASE_URL_ENV,
+  TTS_FORMATS,
+  resolveBaseUrl as resolveTtsBaseUrl,
+} from './mimo-tts.js'
 
 /** Route the browser half reads and writes the non-secret voice settings on. */
 export const VOICE_SETTINGS_ROUTE = '/api/discipline-whale/voice/settings'
@@ -56,23 +88,47 @@ export const VOICE_TEST_ROUTE = '/api/discipline-whale/voice/test'
 /** File name inside the plugin data directory (never inside the repo). */
 export const SETTINGS_FILENAME = 'voice.json'
 
+/**
+ * A hand-written speech key file, beside the settings document.
+ *
+ * Kept separate from `voice.json` on purpose. The settings document belongs to
+ * the form: `applySettings` rewrites it wholesale, and clearing a key there
+ * deletes it. This file belongs to the person who wrote it — it is read, never
+ * written, and never removed, so a key dropped into a file by hand (or by an
+ * operator provisioning a machine) cannot be clobbered by a form save.
+ *
+ * Shape: `{ "apiKey": "...", "voice": "...", "format": "wav" }`; every field is
+ * optional and the file may also be nested under `tts`. A missing, unreadable
+ * or malformed file is simply absent — never an error.
+ */
+export const KEY_FILENAME = 'mimo.json'
+
 /** File mode for anything holding a secret. */
 export const SECRET_FILE_MODE = 0o600
 
 /** Environment variable holding the transcription key. Never echoed. */
-export const API_KEY_ENV = 'SOCLAAS_API_KEY'
+export const API_KEY_ENV = 'DW_STT_API_KEY'
 
-/** Environment variable overriding the base URL. */
-export const BASE_URL_ENV = 'SOCLAAS_BASE_URL'
+/** Environment variable holding the transcription base URL. */
+export const BASE_URL_ENV = 'DW_STT_BASE_URL'
 
-/** Default OpenAI-compatible endpoint root. */
-export const DEFAULT_BASE_URL = 'https://soclaas-api.comp.nus.edu.sg/v1'
+/**
+ * The transcription base URL when nothing is configured.
+ *
+ * Empty on purpose: a published plugin has no business naming a default
+ * transcription host. An unset endpoint is reported as unset, and the route
+ * refuses with "not configured" rather than reaching for a guessed host.
+ */
+export const DEFAULT_BASE_URL = ''
 
 /** Default transcription model id. */
 export const DEFAULT_MODEL = 'whisper-large-v3'
 
-/** The credential reference the Host's credential store is addressed by. */
-export const KEY_REF = 'SOCLAAS_API_KEY'
+/** The credential reference transcription is addressed by. */
+export const KEY_REF = 'DW_STT_API_KEY'
+
+/** The credential reference text to speech is addressed by. */
+export const TTS_KEY_REF = TTS_API_KEY_ENV
 
 /** Where the effective key came from, in the vocabulary the UI renders. */
 export const KEY_SOURCES = Object.freeze({
@@ -92,12 +148,19 @@ export const SETTINGS_ERRORS = Object.freeze({
   model: 'voice-settings/invalid-model',
   language: 'voice-settings/invalid-language',
   apiKey: 'voice-settings/invalid-api-key',
+  ttsBaseUrl: 'voice-settings/invalid-tts-base-url',
+  ttsVoice: 'voice-settings/invalid-tts-voice',
+  ttsFormat: 'voice-settings/invalid-tts-format',
+  ttsApiKey: 'voice-settings/invalid-tts-api-key',
   readOnly: 'voice-settings/read-only',
   unreadable: 'voice-settings/unreadable',
 })
 
 /** Fields a POST may change. Anything else in the body is ignored. */
-export const EDITABLE_FIELDS = Object.freeze(['baseUrl', 'apiKey', 'model', 'language'])
+export const EDITABLE_FIELDS = Object.freeze([
+  'baseUrl', 'apiKey', 'model', 'language',
+  'ttsBaseUrl', 'ttsApiKey', 'ttsVoice', 'ttsFormat',
+])
 
 /** Bound on the stored base URL, so a paste cannot grow the file without limit. */
 export const MAX_BASE_URL_CHARS = 500
@@ -108,9 +171,45 @@ export const MAX_API_KEY_CHARS = 4096
 /** Bound on the upstream probe, so a dead host cannot hold the request open. */
 export const TEST_TIMEOUT_MS = 15_000
 
+/** Bound on a stored voice id. */
+export const MAX_VOICE_CHARS = 120
+
 /** The plugin's settings file path. */
 export function settingsPath(homeDir = storeRoot()) {
   return join(dataDir(homeDir), SETTINGS_FILENAME)
+}
+
+/** The hand-written speech key file path. */
+export function keyFilePath(homeDir = storeRoot()) {
+  return join(dataDir(homeDir), KEY_FILENAME)
+}
+
+/**
+ * Read the hand-written speech key file.
+ *
+ * Accepts both `{ apiKey, voice, format }` and `{ tts: { apiKey, ... } }`,
+ * because a person writing this by hand should not have to guess the nesting.
+ * Anything unreadable, unparseable, or the wrong type answers `{}`.
+ */
+export async function readKeyFile(homeDir = storeRoot()) {
+  let value
+  try {
+    value = JSON.parse(await readFile(keyFilePath(homeDir), 'utf8'))
+  } catch {
+    return {}
+  }
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return {}
+  const nested = value.tts
+  const source = nested !== null && typeof nested === 'object' && !Array.isArray(nested)
+    ? { ...value, ...nested }
+    : value
+  const out = {}
+  if (typeof source.apiKey === 'string' && source.apiKey.trim() !== '') out.apiKey = source.apiKey.trim()
+  if (typeof source.baseUrl === 'string' && source.baseUrl.trim() !== '') out.baseUrl = source.baseUrl.trim()
+  if (typeof source.voice === 'string' && source.voice.trim() !== '') out.voice = source.voice.trim()
+  const format = typeof source.format === 'string' ? source.format.trim().toLowerCase() : ''
+  if (TTS_FORMATS.has(format)) out.format = format
+  return out
 }
 
 /** One structured refusal, in the shape the browser half reads. */
@@ -189,6 +288,29 @@ export function apiKeyProblem(value) {
   return undefined
 }
 
+/** Validate one speech voice id: letters, digits, dot, dash, underscore, colon. */
+export function voiceProblem(value) {
+  if (typeof value !== 'string') return 'voice must be a string'
+  const trimmed = value.trim()
+  if (trimmed === '') return undefined
+  if (trimmed.length > MAX_VOICE_CHARS) return `voice may not exceed ${MAX_VOICE_CHARS} characters`
+  if (!/^[A-Za-z0-9][A-Za-z0-9._:-]*$/.test(trimmed)) {
+    return 'voice may only contain letters, digits, dot, dash, underscore and colon'
+  }
+  return undefined
+}
+
+/** Validate one speech container name: the three the backend serves. */
+export function formatProblem(value) {
+  if (typeof value !== 'string') return 'format must be a string'
+  const trimmed = value.trim().toLowerCase()
+  if (trimmed === '') return undefined
+  if (!TTS_FORMATS.has(trimmed)) {
+    return `format must be one of ${[...TTS_FORMATS.keys()].join(', ')}`
+  }
+  return undefined
+}
+
 /** Read the stored settings file; a missing or unreadable file is an empty object. */
 export async function readStoredSettings(homeDir = storeRoot()) {
   try {
@@ -242,11 +364,32 @@ export function hasCredentialSeam(credentials) {
  * @returns `{ value, source }` where source is a {@link KEY_SOURCES} member.
  */
 export async function resolveKey({ env = process.env, credentials, homeDir = storeRoot() } = {}) {
+  return resolveNamedKey({
+    ref: KEY_REF,
+    envVar: API_KEY_ENV,
+    field: 'apiKey',
+    env,
+    credentials,
+    homeDir,
+  })
+}
+
+/**
+ * The same resolution for one named secret.
+ *
+ * Both keys go through this one path on purpose: the precedence question
+ * ("settings, then environment") has one answer, and two copies of it would
+ * eventually disagree.
+ *
+ * @param input ref (credential address), envVar, field (key in the settings
+ *   file), plus env / credentials / homeDir.
+ */
+export async function resolveNamedKey({ ref, envVar, field, env = process.env, credentials, homeDir = storeRoot(), beforeEnv }) {
   if (hasCredentialSeam(credentials)) {
     try {
-      const described = await credentials.describe(KEY_REF)
+      const described = await credentials.describe(ref)
       if (described?.configured === true) {
-        const resolved = await credentials.resolve(KEY_REF)
+        const resolved = await credentials.resolve(ref)
         const value = typeof resolved?.value === 'string' ? resolved.value : ''
         if (value !== '') {
           // `file` is the managed store the settings form writes; every other
@@ -260,14 +403,42 @@ export async function resolveKey({ env = process.env, credentials, homeDir = sto
     }
   }
   const stored = await readStoredSettings(homeDir)
-  if (typeof stored.apiKey === 'string' && stored.apiKey !== '') {
-    return { value: stored.apiKey, source: KEY_SOURCES.settings }
+  if (typeof stored[field] === 'string' && stored[field] !== '') {
+    return { value: stored[field], source: KEY_SOURCES.settings }
   }
-  const fromEnv = env[API_KEY_ENV]
+  if (typeof beforeEnv === 'function') {
+    const fromHook = await beforeEnv()
+    if (fromHook !== undefined && fromHook.value !== '') return fromHook
+  }
+  const fromEnv = env[envVar]
   if (typeof fromEnv === 'string' && fromEnv.trim() !== '') {
     return { value: fromEnv.trim(), source: KEY_SOURCES.env }
   }
   return { value: '', source: KEY_SOURCES.none }
+}
+
+/** The effective text-to-speech key. Same precedence, its own credential ref. */
+export async function resolveTtsKey({ env = process.env, credentials, homeDir = storeRoot() } = {}) {
+  // The settings layers first (the seam, then the form's document), then the
+  // hand-written key file, then the environment. The file sits above the
+  // environment because it is a deliberate local choice — someone wrote it and
+  // put it there — while an inherited variable may predate the file.
+  const named = await resolveNamedKey({
+    ref: TTS_KEY_REF,
+    envVar: TTS_API_KEY_ENV,
+    field: 'ttsApiKey',
+    env,
+    credentials,
+    homeDir,
+    // The file is consulted between the stored document and the environment.
+    beforeEnv: async () => {
+      const file = await readKeyFile(homeDir)
+      return typeof file.apiKey === 'string' && file.apiKey !== ''
+        ? { value: file.apiKey, source: KEY_SOURCES.settings }
+        : undefined
+    },
+  })
+  return named
 }
 
 /**
@@ -277,6 +448,10 @@ export async function resolveKey({ env = process.env, credentials, homeDir = sto
  * Precedence per field: stored settings → environment → default. A blank stored
  * field means "inherit", which is what makes clearing a field in the form fall
  * back to the environment instead of pinning an empty value.
+ *
+ * The `tts` block is described in full because the form renders a real control
+ * for each field. It carries no key: `hasApiKey` / `keySource` say whether one
+ * exists and where it came from, which is all the page is allowed to know.
  */
 export async function describeVoice({ env = process.env, credentials, homeDir = storeRoot() } = {}) {
   const stored = await readStoredSettings(homeDir)
@@ -286,6 +461,26 @@ export async function describeVoice({ env = process.env, credentials, homeDir = 
   const model = typeof stored.model === 'string' && stored.model.trim() !== '' ? stored.model.trim() : DEFAULT_MODEL
   const language = typeof stored.language === 'string' ? stored.language.trim() : ''
   const key = await resolveKey({ env, credentials, homeDir })
+
+  // The hand-written key file fills any speech field the form left blank, so a
+  // person can configure the whole channel in one file without touching the UI.
+  const keyFile = await readKeyFile(homeDir)
+  const storedTtsBaseUrl = normalizeBaseUrl(typeof stored.ttsBaseUrl === 'string' ? stored.ttsBaseUrl : '')
+  const fileTtsBaseUrl = normalizeBaseUrl(keyFile.baseUrl ?? '')
+  const envTtsBaseUrl = normalizeBaseUrl(typeof env[TTS_BASE_URL_ENV] === 'string' ? env[TTS_BASE_URL_ENV] : '')
+  const ttsBaseUrl = resolveTtsBaseUrl(
+    storedTtsBaseUrl !== '' ? storedTtsBaseUrl : fileTtsBaseUrl !== '' ? fileTtsBaseUrl : envTtsBaseUrl,
+    env,
+  )
+  const ttsKey = await resolveTtsKey({ env, credentials, homeDir })
+  const ttsVoice = typeof stored.ttsVoice === 'string' && stored.ttsVoice.trim() !== ''
+    ? stored.ttsVoice.trim()
+    : keyFile.voice ?? DEFAULT_TTS_VOICE
+  const storedFormat = typeof stored.ttsFormat === 'string' ? stored.ttsFormat.trim().toLowerCase() : ''
+  const ttsFormat = TTS_FORMATS.has(storedFormat)
+    ? storedFormat
+    : TTS_FORMATS.has(keyFile.format ?? '') ? keyFile.format : DEFAULT_TTS_FORMAT
+
   return {
     baseUrl,
     baseUrlSource: storedBaseUrl !== '' ? KEY_SOURCES.settings : envBaseUrl !== '' ? KEY_SOURCES.env : 'default',
@@ -295,20 +490,29 @@ export async function describeVoice({ env = process.env, credentials, homeDir = 
     keySource: key.source,
     apiKeyEnv: API_KEY_ENV,
     baseUrlEnv: BASE_URL_ENV,
-    // Read-aloud, stated precisely rather than as "no TTS" or "TTS ready":
-    // what exists today is the browser's own speech synthesis as a fallback
-    // (the dock's toggle, off by default); a real TTS backend is not integrated
-    // and would need its own key. The form renders these as disabled
-    // placeholders, and nothing here is ever wired to a request.
+    // Transcription without an endpoint is a stated refusal, not a silent
+    // attempt at a host nobody named.
+    endpointConfigured: baseUrl !== '',
+    // Read-aloud: the browser's own speech synthesis stays as the fallback
+    // (the dock's toggle, off by default) and is what plays when the speech
+    // backend refuses. Everything below it configures the real channel.
     tts: {
-      integrated: false,
+      integrated: true,
       fallback: 'browser-speech-synthesis',
       fallbackDefaultOn: false,
       needsOwnKey: true,
-      configurable: false,
-      model: '',
-      voice: '',
-      baseUrl: '',
+      baseUrl: ttsBaseUrl,
+      baseUrlSource: storedTtsBaseUrl !== '' || fileTtsBaseUrl !== ''
+        ? KEY_SOURCES.settings
+        : envTtsBaseUrl !== '' ? KEY_SOURCES.env : 'default',
+      baseUrlEnv: TTS_BASE_URL_ENV,
+      model: DEFAULT_TTS_MODEL,
+      voice: ttsVoice,
+      format: ttsFormat,
+      formats: [...TTS_FORMATS.keys()],
+      hasApiKey: ttsKey.value !== '',
+      keySource: ttsKey.source,
+      apiKeyEnv: TTS_API_KEY_ENV,
     },
   }
 }
@@ -341,49 +545,121 @@ export async function applySettings(patch, { env = process.env, credentials, hom
     const problem = apiKeyProblem(patch.apiKey)
     if (problem !== undefined) problems.push([SETTINGS_ERRORS.apiKey, problem])
   }
+  if (patch.ttsBaseUrl !== undefined) {
+    const problem = baseUrlProblem(patch.ttsBaseUrl)
+    if (problem !== undefined) problems.push([SETTINGS_ERRORS.ttsBaseUrl, problem])
+  }
+  if (patch.ttsVoice !== undefined) {
+    const problem = voiceProblem(patch.ttsVoice)
+    if (problem !== undefined) problems.push([SETTINGS_ERRORS.ttsVoice, problem])
+  }
+  if (patch.ttsFormat !== undefined) {
+    const problem = formatProblem(patch.ttsFormat)
+    if (problem !== undefined) problems.push([SETTINGS_ERRORS.ttsFormat, problem])
+  }
+  if (patch.ttsApiKey !== undefined) {
+    const problem = apiKeyProblem(patch.ttsApiKey)
+    if (problem !== undefined) problems.push([SETTINGS_ERRORS.ttsApiKey, problem])
+  }
   if (problems.length > 0) return { problems }
 
   const stored = await readStoredSettings(homeDir)
+  // The state before the write, measured the same way the form reads it: this
+  // is what the rollback below restores, and what decides whether the save is
+  // allowed to disable a working channel at all.
+  const before = await describeVoice({ env, credentials, homeDir })
   const next = { ...stored }
   if (patch.baseUrl !== undefined) next.baseUrl = normalizeBaseUrl(patch.baseUrl)
   if (patch.model !== undefined) next.model = String(patch.model).trim()
   if (patch.language !== undefined) next.language = String(patch.language).trim()
+  if (patch.ttsBaseUrl !== undefined) next.ttsBaseUrl = normalizeBaseUrl(patch.ttsBaseUrl)
+  if (patch.ttsVoice !== undefined) next.ttsVoice = String(patch.ttsVoice).trim()
+  if (patch.ttsFormat !== undefined) next.ttsFormat = String(patch.ttsFormat).trim().toLowerCase()
 
-  let cleared = false
-  let seamWrote = false
-  if (patch.apiKey !== undefined) {
-    const key = patch.apiKey
-    if (hasCredentialSeam(credentials)) {
-      try {
-        if (key === '') {
-          await credentials.unset(KEY_REF)
-        } else {
-          await credentials.set(KEY_REF, key)
-        }
-        seamWrote = true
-      } catch (error) {
-        // Falling back keeps the form usable on a read-only store; the caller
-        // still learns the key is stored, just not where it expected.
-        seamWrote = false
-        void error
-      }
-    }
-    if (!seamWrote) {
-      if (key === '') {
-        delete next.apiKey
-        cleared = true
-      } else {
-        next.apiKey = key
-      }
-    } else {
-      // The seam owns the key: never keep a second copy in the plugin file.
-      delete next.apiKey
-      if (key === '') cleared = true
-    }
-  }
+  // Two secrets, one routine: each may live in the Host seam or the 0600 file,
+  // and clearing one never disturbs the other.
+  const cleared = await storeSecret({
+    field: 'apiKey',
+    ref: KEY_REF,
+    value: patch.apiKey,
+    credentials,
+    next,
+  }) || await storeSecret({
+    field: 'ttsApiKey',
+    ref: TTS_KEY_REF,
+    value: patch.ttsApiKey,
+    credentials,
+    next,
+  })
 
   await writeStoredSettings(next, homeDir)
-  return { settings: await describeVoice({ env, credentials, homeDir }), cleared }
+  // Read the settings back and refuse a save that leaves the channel
+  // HALF-configured: no endpoint, but a key still stored and nowhere to send
+  // it. That is the exact shape of the reported bug — a form that sent an
+  // untouched Base URL as empty turned a working transcriber into a 503.
+  //
+  // A full reset is not this: a patch that clears the key too is a stated
+  // intention, and so is a patch that leaves no key behind at all. Turning a
+  // channel ON is always allowed; only the accidental half-state rolls back.
+  const after = await describeVoice({ env, credentials, homeDir })
+  const leftNoKey = patch.apiKey === '' || after.hasApiKey === false
+  const halfConfigured = before.endpointConfigured === true
+    && after.endpointConfigured === false
+    && leftNoKey !== true
+  const broke = []
+  if (halfConfigured) broke.push(SETTINGS_ERRORS.baseUrl)
+  if (before.tts?.hasApiKey === true && after.tts?.hasApiKey === false && patch.ttsApiKey === undefined) broke.push(SETTINGS_ERRORS.ttsApiKey)
+  if (broke.length > 0) {
+    // Roll back every field this call could have written, then the secrets it
+    // cleared. A rollback that itself fails leaves the refusal standing: the
+    // caller must never read "saved" for a save that broke the channel.
+    await writeStoredSettings(stored, homeDir).catch(() => undefined)
+    if (patch.apiKey !== undefined) {
+      await storeSecret({ field: 'apiKey', ref: KEY_REF, value: before.hasApiKey === true ? patch.apiKey : '', credentials, next: stored }).catch(() => undefined)
+    }
+    if (patch.ttsApiKey !== undefined) {
+      await storeSecret({ field: 'ttsApiKey', ref: TTS_KEY_REF, value: before.tts?.hasApiKey === true ? patch.ttsApiKey : '', credentials, next: stored }).catch(() => undefined)
+    }
+    return {
+      problems: [[broke[0], 'this save would leave a working channel unconfigured, so it was rolled back']],
+      rolledBack: true,
+      settings: await describeVoice({ env, credentials, homeDir }),
+    }
+  }
+  return { settings: after, cleared }
+}
+
+/**
+ * Store or clear one secret, in the Host seam when it is writable, otherwise in
+ * the plugin file.
+ *
+ * @returns true when the value was cleared.
+ */
+async function storeSecret({ field, ref, value, credentials, next }) {
+  if (value === undefined) return false
+  const key = String(value)
+  let seamWrote = false
+  if (hasCredentialSeam(credentials)) {
+    try {
+      if (key === '') {
+        await credentials.unset(ref)
+      } else {
+        await credentials.set(ref, key)
+      }
+      seamWrote = true
+    } catch {
+      // Falling back keeps the form usable on a read-only store; the caller
+      // still learns the key is stored, just not where it expected.
+      seamWrote = false
+    }
+  }
+  // The seam owns the key when it took it: never keep a second copy in the file.
+  if (seamWrote || key === '') {
+    delete next[field]
+    return key === ''
+  }
+  next[field] = key.trim()
+  return false
 }
 
 /**

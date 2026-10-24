@@ -51,6 +51,25 @@ import {
   writeQuestion,
 } from '../questions.js'
 
+/**
+ * The instant this file's fixtures are built at, and the whole reason it went
+ * red: the fixtures used to be stamped with a literal `2026-10-23T00:00:00Z`
+ * while `questions.js` expires a question after `DEFAULT_QUESTION_TTL_MS`
+ * (6 h). Every test that lists pending questions therefore started failing
+ * permanently at 2026-10-23T06:00Z — not flaky, a time bomb. The clock is now
+ * relative to the run, so the fixtures are always fresh, and every deadline
+ * below is expressed as an offset from it instead of as a fixed date.
+ */
+const NOW = Date.now()
+/** A time `offsetMs` away from `NOW`; negative offsets are in the past. */
+const at = (offsetMs) => new Date(NOW + offsetMs)
+/** The epoch milliseconds of `at(offsetMs)`. */
+const atMs = (offsetMs) => NOW + offsetMs
+/** Comfortably inside the 6 h TTL, so a pending question reads as pending. */
+const FRESH_MS = 60 * 60 * 1000
+/** Comfortably past the 6 h TTL, so the same question reads as expired. */
+const STALE_MS = -7 * 60 * 60 * 1000
+
 /** A throwaway store root; each test owns one so nothing leaks between them. */
 async function freshHome() {
   return mkdtemp(join(tmpdir(), 'dw-questions-'))
@@ -68,7 +87,7 @@ function question(overrides = {}) {
       options: [{ label: 'Drop it' }, { label: 'Keep it', description: 'safer' }],
       ...overrides,
     },
-    new Date('2026-10-23T00:00:00.000Z'),
+    at(-FRESH_MS),
   )
 }
 
@@ -88,7 +107,7 @@ test('a question round-trips through its own file', async () => {
   assert.deepEqual(back.options, value.options)
   // The deadline is a number, not a Date: it has to survive JSON unchanged.
   assert.equal(typeof back.expiresAt, 'number')
-  assert.equal(back.expiresAt, Date.parse('2026-10-23T00:00:00.000Z') + DEFAULT_QUESTION_TTL_MS)
+  assert.equal(back.expiresAt, atMs(-FRESH_MS) + DEFAULT_QUESTION_TTL_MS)
 })
 
 test('a question id cannot escape the queue directory', async () => {
@@ -104,7 +123,7 @@ test('a question id cannot escape the queue directory', async () => {
 test('question text and options are bounded, not rejected', async () => {
   const home = await freshHome()
   const long = 'x'.repeat(MAX_QUESTION_CHARS * 2)
-  const value = newQuestion({ workerSessionId: 'w', question: long }, new Date('2026-10-23T00:00:00.000Z'))
+  const value = newQuestion({ workerSessionId: 'w', question: long }, at(-FRESH_MS))
   assert.equal(value.question.length, MAX_QUESTION_CHARS, 'text is clipped to the bound, never stored whole')
   await writeQuestion(home, value)
   assert.equal((await readQuestion(home, value.id)).question.length, MAX_QUESTION_CHARS)
@@ -129,11 +148,11 @@ test('pending questions are listed oldest first and shaped for ask_user_question
   const home = await freshHome()
   const older = newQuestion(
     { workerSessionId: 'session-worker-1', question: 'older?' },
-    new Date('2026-10-22T23:00:00.000Z'),
+    at(-FRESH_MS - 60 * 60 * 1000),
   )
   const newer = newQuestion(
     { workerSessionId: 'session-worker-2', question: 'newer?', header: 'Confirm', options: [{ label: 'yes' }] },
-    new Date('2026-10-23T01:00:00.000Z'),
+    at(-FRESH_MS),
   )
   await writeQuestion(home, newer)
   await writeQuestion(home, older)
@@ -145,7 +164,7 @@ test('pending questions are listed oldest first and shaped for ask_user_question
     'listing is newest first, which is what a board read wants',
   )
 
-  const pending = pendingQuestions(listed, Date.parse('2026-10-23T02:00:00.000Z'))
+  const pending = pendingQuestions(listed, atMs(0))
   assert.deepEqual(
     pending.map((entry) => entry.id),
     [older.id, newer.id],
@@ -209,7 +228,7 @@ test('an answer needs content, and a non-pending question is not revived', async
   const value = question()
   await writeQuestion(home, value)
   await assert.rejects(() => answerQuestion(home, value.id, { selected: [] }), /at least one/)
-  await expireQuestion(home, value.id, new Date('2026-10-23T03:00:00.000Z'))
+  await expireQuestion(home, value.id, at(0))
   const late = await answerQuestion(home, value.id, { selected: ['Drop it'] })
   assert.equal(late.status, 'expired', 'a late answer must not reopen an expired question')
   assert.equal(late.answer, undefined)
@@ -224,7 +243,7 @@ test('a delivered answer is not deliverable again', async () => {
   assert.deepEqual(pairs.map((entry) => entry.id), [value.id], 'an answered question is deliverable once')
 
   const { markDelivered } = await import('../questions.js')
-  await markDelivered(home, value.id, new Date('2026-10-23T04:00:00.000Z'))
+  await markDelivered(home, value.id, at(0))
   pairs = deliverablePairs(await listQuestions(home))
   assert.deepEqual(pairs, [], 'a retried sweep must not steer the same answer twice')
 })
@@ -250,13 +269,17 @@ test('a retired question records why, and expired files are pruned later', async
   const home = await freshHome()
   const value = question()
   await writeQuestion(home, value)
-  const gone = await expireQuestion(home, value.id, new Date('2026-10-23T05:00:00.000Z'), 'session-gone')
+  const gone = await expireQuestion(home, value.id, at(0), 'session-gone')
   assert.equal(gone.status, 'expired')
   assert.equal(gone.expiredReason, 'session-gone')
 
   // Not pruned while fresh, pruned once past the retention window.
-  assert.equal(await pruneExpired(home, DEFAULT_QUESTION_TTL_MS, Date.parse('2026-10-23T06:00:00.000Z')), 0)
-  assert.equal(await pruneExpired(home, 60 * 1000, Date.parse('2026-10-23T06:00:00.000Z')), 1)
+  // One hour after the question expired: inside the default 6 h retention,
+  // outside a one-minute one. The sweep time has to be expressed relative to
+  // the expiry for this pair to mean anything.
+  const laterMs = atMs(60 * 60 * 1000)
+  assert.equal(await pruneExpired(home, DEFAULT_QUESTION_TTL_MS, laterMs), 0, 'not pruned inside the retention window')
+  assert.equal(await pruneExpired(home, 60 * 1000, laterMs), 1, 'pruned once past it')
   assert.equal(await readQuestion(home, value.id), undefined)
 })
 
@@ -652,7 +675,7 @@ test('the round trip costs what the report says it costs', async () => {
         { label: 'No, keep it' },
       ],
     },
-    new Date('2026-10-23T00:00:00.000Z'),
+    at(-FRESH_MS),
   )
   const listBody = JSON.stringify({
     pending: [{

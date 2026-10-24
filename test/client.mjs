@@ -135,8 +135,13 @@ delete globalThis.window
     assert.equal(typeof en[key], 'string', `en.${key} must exist`)
     assert.ok(zh[key].length > 0 && en[key].length > 0, `${key} may not be empty`)
   }
-  assert.match(zh.privacy, /SoCLaaS/)
-  assert.match(en.privacy, /SoCLaaS/)
+  // The privacy line names the KIND of destination ("the host's configured
+  // transcription service"), never a specific venue: the plugin is published
+  // and an installation's backend is its own business.
+  for (const [lang, copy] of [['zh', zh], ['en', en]]) {
+    assert.match(copy.privacy, /转写服务|transcription service/, `${lang}.privacy must say where the audio goes`)
+    assert.match(copy.privacy, /丢弃|dropped/i, `${lang}.privacy must say the recording is dropped`)
+  }
 
   // Read-aloud ships as a browser-synthesizer FALLBACK, and both languages must
   // describe it as exactly that: a fallback, not an integrated TTS channel.
@@ -322,10 +327,14 @@ delete globalThis.window
   // --- ASSERTION 2: OFF shows the reply without touching speech ----------
   const follow = codeOf('async function followReplies(', 'async function readAloud(')
   const shown = follow.indexOf('setReply(seen.reply)')
-  const gated = follow.indexOf('if (speakRef.current) await readAloud(')
-  assert.ok(shown > 0 && gated > shown, 'the reply is shown first, and read aloud only when the switch is on')
+  const gated = follow.indexOf('if (speakRef.current) offerReply(')
+  assert.ok(shown > 0 && gated > shown, 'the reply is shown first, and offered to the reader only when the switch is on')
   assert.equal(/speakReply|speechSynthesis|SpeechSynthesisUtterance|hold\(\)|mute\(\)/.test(follow), false,
     'following replies never touches speech or the microphone itself')
+  // The reader is not awaited here: waiting on a 20-second read is what let
+  // replies pile up and be read as a backlog afterwards.
+  assert.equal(/await readAloud|await offerReply/.test(follow), false,
+    'the follower never waits for a read: a reply that arrives meanwhile replaces it instead of queueing')
   const reading = codeOf('async function readAloud(', 'async function stopTalking(')
   assert.match(reading, /userSpeakingRef\.current/, 'reading aloud waits while the person is mid-sentence')
   assert.match(reading, /mute\(\)[\s\S]*speakReply[\s\S]*void listen\(\)/, 'detection pauses for the reading and resumes after it')
@@ -517,8 +526,11 @@ delete globalThis.window
   delete globalThis.document
   // The turn-tail seat is gone on purpose: a turn's workspace tags now sit on
   // the user row that caused the dispatch (see test/report-origin-client.mjs),
-  // so no assistant-reply footer registers a slot.
-  assert.deepEqual(injected.sort(), ['conversation.session.header.actions', 'main', 'shell.overlay', 'sidebar.panellist', 'sidebar.session.row.leading'])
+  // so no assistant-reply footer registers a slot. `sidebar.session.row.leading`
+  // is gone for the same kind of reason: that seat is the session's status dot,
+  // so the workspace color moved to the folder row and the whale logo to the row
+  // paint (see test/client-memory.mjs, checks 11/12/14).
+  assert.deepEqual(injected.sort(), ['conversation.session.header.actions', 'main', 'shell.overlay', 'sidebar.panellist'])
   const overlay = registered.find((entry) => entry.options.name === 'shell.overlay')
   assert.ok(overlay, 'the voice dock lives in shell.overlay so it survives navigation')
   assert.equal(overlay.options.id, 'discipline-whale-voice')
@@ -589,6 +601,106 @@ delete globalThis.window
   assert.equal(Boolean(control("mute").props.disabled), false, "mute is available while the device is on")
   delete globalThis.document
   console.log("ok 6 — the open dock shows status, transcript, reply, hang-up, privacy, the read-aloud fallback and two separate controls")
+}
+
+// --- 7. reading a reply aloud: the backend first, the browser as fallback ---
+
+{
+  // `speakViaBackend` is the browser side of the speech route. What matters is
+  // that every failure answers `ok: false` with a code instead of throwing, so
+  // the caller can fall back and say so — a silent downgrade is the bug this
+  // guards against.
+
+  // 1. The happy path: one POST of the text alone, then playback.
+  const seen = []
+  let played = null
+  // A player that ends: `done` must settle on the element's own `onended`,
+  // not only on the bounded timer.
+  const fakeAudio = class {
+    constructor(url) { played = { url }; fakeAudio.instance = this }
+    play() {
+      played.playing = true
+      // Fired asynchronously, the way a real element fires it.
+      queueMicrotask(() => { if (typeof this.onended === "function") this.onended() })
+      return Promise.resolve()
+    }
+  }
+  const urls = { created: [], createObjectURL: (blob) => { urls.created.push(blob); return "blob:fake" }, revokeObjectURL: () => {} }
+  const backend = module.exports.speakViaBackend("你好，**鲸鱼**", {
+    fetch: async (url, init) => {
+      seen.push({ url, init })
+      return new Response(new Uint8Array([1, 2, 3, 4]), {
+        status: 200,
+        headers: { "content-type": "audio/wav", "x-dw-tts-seconds": "1.5" },
+      })
+    },
+    Audio: fakeAudio,
+    URL: urls,
+    Blob: class { constructor(parts, opts) { this.parts = parts; this.type = opts?.type } },
+    setTimeout: () => 0,
+  })
+  assert.equal(backend.ok, true)
+  const played1 = await backend.done
+  assert.equal(played1.ok, true, "a served audio body reports success")
+  assert.equal(played1.seconds, 1.5, "the declared duration comes back for the call's own bookkeeping")
+  assert.equal(seen.length, 1)
+  assert.equal(seen[0].url, "/api/discipline-whale/voice/speak", "the page talks to the plugin route, never a provider URL")
+  // Only the text is sent: the key stays on the server.
+  assert.deepEqual(JSON.parse(seen[0].init.body), { text: "你好，鲸鱼" })
+  assert.equal(Object.keys(JSON.parse(seen[0].init.body)).includes("apiKey"), false)
+  assert.equal(played.playing, true, "the audio element is asked to play")
+
+  // 2. Server refusals map to a code, never a throw.
+  const refusals = [
+    { status: 503, body: { error: { code: "tts/missing-key" } }, code: "tts/missing-key" },
+    { status: 502, body: { error: { code: "tts/no-audio-in-answer" } }, code: "tts/no-audio-in-answer" },
+    { status: 504, body: { error: { code: "tts/backend-timeout" } }, code: "tts/backend-timeout" },
+    { status: 500, body: "not json", code: "http-500" },
+  ]
+  for (const item of refusals) {
+    const result = await module.exports.speakViaBackend("hi", {
+      fetch: async () => new Response(typeof item.body === "string" ? item.body : JSON.stringify(item.body), { status: item.status }),
+      Audio: fakeAudio,
+      URL: urls,
+      Blob: class {},
+      setTimeout: () => 0,
+    }).done
+    assert.equal(result.ok, false, `a ${item.status} refusal is a failure, not a success`)
+    assert.equal(result.code, item.code)
+  }
+
+  // 3. Transport failure, empty audio and no player are all failures.
+  const unreachable = await module.exports.speakViaBackend("hi", {
+    fetch: async () => { throw new Error("net down") },
+    Audio: fakeAudio, URL: urls, Blob: class {}, setTimeout: () => 0,
+  }).done
+  assert.equal(unreachable.code, "unreachable")
+  const empty = await module.exports.speakViaBackend("hi", {
+    fetch: async () => new Response(new Uint8Array(0), { status: 200 }), Audio: fakeAudio, URL: urls, Blob: class {}, setTimeout: () => 0,
+  }).done
+  assert.equal(empty.code, "empty")
+  const unsupported = await module.exports.speakViaBackend("hi", { fetch: async () => new Response(""), setTimeout: () => 0 })
+  assert.equal(unsupported.ok, false, "a host without Audio falls back instead of throwing")
+
+  // 4. The fallback reason becomes one short dock line, and an unknown code
+  //    still says something true rather than showing a raw server code.
+  const notice = module.exports.ttsFallbackNotice
+  assert.equal(notice("tts/missing-key"), "ttsMissingKey")
+  assert.equal(notice("tts/invalid-key"), "ttsInvalidKey")
+  assert.equal(notice("tts/backend-timeout"), "ttsTimeout")
+  assert.equal(notice("tts/no-audio-in-answer"), "ttsBadAudio")
+  assert.equal(notice("tts/undecodable-audio"), "ttsBadAudio")
+  assert.equal(notice("tts/backend-unreachable"), "ttsUnreachable")
+  assert.equal(notice("tts/text-too-long"), "ttsTooLong")
+  assert.equal(notice("something unexpected"), "ttsFallbackGeneric")
+  assert.equal(notice(undefined), "ttsFallbackGeneric")
+  // Every mapped line exists in both dictionaries, so no raw key reaches the UI.
+  const { zh, en } = module.exports.DICTIONARIES
+  for (const key of [notice("tts/missing-key"), notice("tts/bad"), notice(undefined)]) {
+    assert.equal(typeof zh[key], "string", `zh.${key} must exist`)
+    assert.equal(typeof en[key], "string", `en.${key} must exist`)
+  }
+  console.log("ok 7 — read-aloud prefers the backend, and every failure falls back with a named reason")
 }
 
 // The shared guard is the same contract the browser mirrors.

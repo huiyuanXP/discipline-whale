@@ -13,9 +13,10 @@
 // transcribed, and queued into the main session. The whale's reply is shown as
 // text; reading it aloud is an OPT-IN FALLBACK that uses the browser/OS speech
 // synthesizer and is off by default — it is not an integrated TTS channel, and
-// the dock says so rather than implying otherwise. The audio goes to the NUS
-// SoCLaaS cloud transcriber, which is why the dock states that in its own copy
-// and in the README.
+// the dock says so rather than implying otherwise. Speech IN goes to whichever
+// OpenAI-compatible transcription backend the operator configured, and speech
+// OUT to the configured speech backend; the transcript never leaves the host,
+// and the dock states both facts in its own copy.
 //
 // The memory system shows up in three places: colored workspace chips under
 // each tagged turn of the main session (click one to open the session that
@@ -49,6 +50,7 @@ window.__ModuleLoader__.load({
     const VOICE_SAY_ROUTE = "/api/discipline-whale/voice/say";
     const VOICE_SETTINGS_ROUTE = "/api/discipline-whale/voice/settings";
     const VOICE_TEST_ROUTE = "/api/discipline-whale/voice/test";
+    const VOICE_SPEAK_ROUTE = "/api/discipline-whale/voice/speak";
     // Built-in panels: Plugins 0, Automations 10, Context Insights 20.
     const PANEL_ORDER = 15;
     // The dock is an overlay, so it keeps working while the whale's conversation
@@ -86,6 +88,9 @@ window.__ModuleLoader__.load({
       sentGraceMs: 10000,
       // Reply polling cadence; a real turn-end event is not available here.
       pollMs: 700,
+      // How long a burst of replies is merged before reading: the newest one
+      // wins, so three messages in a second are read once, not three times.
+      speakCoalesceMs: 350,
     };
 
     const DICTIONARIES = {
@@ -98,6 +103,8 @@ window.__ModuleLoader__.load({
         callStart: "开始通话",
         callHangup: "挂断",
         callStop: "说完了",
+        stopReading: "挂断朗读",
+        stopReadingHint: "立刻停止朗读（同时取消还没回来的语音请求）",
         callMinimise: "收起",
         callExpand: "展开",
         callClose: "关闭",
@@ -108,6 +115,13 @@ window.__ModuleLoader__.load({
         statusListeningBusy: "鲸鱼在想 · 接着说，会在它这次工具调用结束后插进去",
         statusThinking: "鲸鱼思考中…",
         statusSpeaking: "朗读中…",
+        ttsMissingKey: "服务端朗读没有配置 key，已改用浏览器语音合成。",
+        ttsInvalidKey: "服务端朗读的 key 被拒绝，已改用浏览器语音合成。",
+        ttsUnreachable: "连不上朗读服务，已改用浏览器语音合成。",
+        ttsTimeout: "朗读服务超时，已改用浏览器语音合成。",
+        ttsBadAudio: "朗读服务返回的音频无法播放，已改用浏览器语音合成。",
+        ttsTooLong: "这条回复太长，朗读服务拒绝了，已改用浏览器语音合成。",
+        ttsFallbackGeneric: "服务端朗读失败，已改用浏览器语音合成。",
         statusError: "出错",
         speakOn: "朗读回复：开",
         speakOff: "朗读回复：关（默认）",
@@ -115,14 +129,15 @@ window.__ModuleLoader__.load({
         speakNote: "朗读用浏览器语音合成（fallback，非真实 TTS），声音取决于设备，默认关闭。",
         heard: "识别结果",
         reply: "鲸鱼回复",
-        privacy: "音频会上传到 NUS SoCLaaS 云端转写；本地只保留本次通话的临时录音，发送后即丢弃。",
-        privacyShort: "音频会上传到 NUS SoCLaaS 云端转写",
+        privacy: "录音会上传到服务端配置的转写服务；本地只保留本次通话的临时录音，发送后即丢弃。",
+        privacyShort: "录音会上传到服务端配置的转写服务",
         errPermission: "麦克风权限被拒绝，请在浏览器地址栏允许后重试。",
         errUnsupported: "这个浏览器不支持录音或 Web Audio。",
-        errMissingKey: "服务端没有配置 SOCLAAS_API_KEY，语音识别不可用。",
-        errInvalidKey: "SoCLaaS 拒绝了当前的 key（无效或过期）。",
-        errNoModel: "SoCLaaS 上没有 whisper-large-v3 这个模型。",
-        errUnreachable: "连不上 SoCLaaS，请检查网络。",
+        errMissingKey: "服务端没有配置语音识别的 key，语音识别不可用。",
+        errMissingEndpoint: "服务端没有配置语音识别的地址，语音识别不可用。",
+        errInvalidKey: "转写服务拒绝了当前的 key（无效或过期）。",
+        errNoModel: "转写服务上没有配置的转写模型。",
+        errUnreachable: "连不上转写服务，请检查网络。",
         errTimeout: "转写超时，请再说一次。",
         errTooLarge: "录音太大或太长，已拒绝上传。",
         errEmptyTranscript: "没有识别出内容，请再说一次。",
@@ -187,14 +202,22 @@ window.__ModuleLoader__.load({
         settingsKeySourceEnv: "环境变量 {env}",
         settingsKeySourceNone: "尚未配置",
         settingsKeyMissing: "还没有可用的 key：在「服务与密钥」里保存一个，或在启动 dsh web 的 shell 里设置 {env}。",
-        settingsTtsTitle: "真实 TTS（未接入）",
-        settingsTtsNote: "当前只有浏览器内置语音合成作为 fallback（通话条上的「朗读回复」，默认关闭）；它没有独立凭据、音色与配额，声音取决于设备。真实 TTS（如 MiniMax）尚未接入，需要单独一把 key——下面四个字段留作将来，现在不可编辑。",
-        settingsTtsModel: "真实 TTS 模型（未接入，留作将来）",
-        settingsTtsVoice: "真实 TTS 音色（未接入，留作将来）",
-        settingsTtsBaseUrl: "真实 TTS Base URL（未接入，留作将来）",
-        settingsTtsApiKey: "真实 TTS API Key（未接入，留作将来）",
-        settingsTtsKeyHint: "真实 TTS 需要它自己的那把 key，与「服务与密钥」里的转写 key 不是同一个。",
-        settingsNotIntegrated: "未接入",
+        settingsTtsTitle: "朗读（语音合成）",
+        settingsTtsNote: "朗读回复优先用这里配置的语音合成；它失败时自动退回浏览器内置语音合成（通话条上的「朗读回复」，默认关闭），并给出提示。这里需要它自己的一把 key，与「服务与密钥」里的转写 key 不是同一个。",
+        settingsTtsModel: "语音模型",
+        settingsTtsVoice: "音色",
+        settingsTtsBaseUrl: "Base URL",
+        settingsTtsApiKey: "API Key",
+        settingsTtsFormat: "音频格式",
+        settingsTtsKeyHint: "与转写 key 分开：保存后下一次朗读就生效，不需要重启。",
+        settingsTtsVoiceHint: "音色 id 由服务商提供；留空使用默认音色。",
+        settingsTtsBaseUrlHint: "OpenAI 兼容的 /v1 根地址，留空使用服务商默认值。",
+        settingsTtsSwitch: "优先用服务端朗读",
+        settingsTtsSwitchHint: "关闭后只用浏览器内置语音合成。服务端朗读失败时会自动退回浏览器合成。",
+        settingsTtsKeyMissing: "还没有配置朗读的 key：保存一个，或在启动 dsh web 的 shell 里设置 {env}。",
+        settingsTtsFallback: "退回浏览器语音合成",
+        settingsTtsReady: "服务端朗读可用",
+        settingsNotIntegrated: "未配置",
         settingsClose: "关闭设置",
         testOk: "连接成功：{message}",
         testFailed: "连接失败：{message}",
@@ -212,7 +235,11 @@ window.__ModuleLoader__.load({
         workspacePaletteColor: "改成 {color}",
         workspaceCustomColor: "自定义颜色",
         workspaceColorFailed: "改颜色失败：{reason}",
-        workspaceDot: "工作区：{title}",
+        workspaceSetColor: "设置颜色",
+        workspaceColorPicker: "{title} 的颜色",
+        workspaceColorDone: "完成",
+        workspaceCustomColorTitle: "自定义颜色",
+        whaleSession: "自律鲸鱼开启的会话",
         tagOpen: "打开 {title} 的会话",
         tagNoSession: "{title}（这个 turn 没有对应的会话）",
         reportOrigin: "来源工作区：{title}",
@@ -222,6 +249,11 @@ window.__ModuleLoader__.load({
         newMain: "新建主会话",
         newMainBusy: "正在新建…",
         newMainFailed: "新建主会话失败：{reason}",
+        authLost: "页面与重启后的服务端失去了认证。这不是数据丢失：重启会生成新的访问令牌。",
+        authReopen: "重新认证并刷新",
+        authPasteHint: "如果没有自动恢复，把 dsh web 启动时打印的 ?token= 链接粘贴到地址栏，回车即可。",
+        authBusy: "正在重新认证…",
+        staleBundle: "页面用的是升级前的旧插件版本，刷新一次即可。",
       },
       en: {
         panel: "Discipline Whale",
@@ -232,6 +264,8 @@ window.__ModuleLoader__.load({
         callStart: "Start call",
         callHangup: "Hang up",
         callStop: "Done talking",
+        stopReading: "Stop reading",
+        stopReadingHint: "Stop the voice now, and cancel any speech request still in flight",
         callMinimise: "Collapse",
         callExpand: "Expand",
         callClose: "Close",
@@ -242,6 +276,13 @@ window.__ModuleLoader__.load({
         statusListeningBusy: "The whale is working · keep talking; it cuts in after the current tool call",
         statusThinking: "The whale is thinking…",
         statusSpeaking: "Speaking…",
+        ttsMissingKey: "The speech backend has no key configured, so the browser synthesizer read it instead.",
+        ttsInvalidKey: "The speech backend rejected the key, so the browser synthesizer read it instead.",
+        ttsUnreachable: "Could not reach the speech backend, so the browser synthesizer read it instead.",
+        ttsTimeout: "The speech backend timed out, so the browser synthesizer read it instead.",
+        ttsBadAudio: "The speech backend returned audio that would not play, so the browser synthesizer read it instead.",
+        ttsTooLong: "This reply is too long for the speech backend, so the browser synthesizer read it instead.",
+        ttsFallbackGeneric: "Read-aloud from the speech backend failed, so the browser synthesizer read it instead.",
         statusError: "Error",
         speakOn: "Read replies: on",
         speakOff: "Read replies: off (default)",
@@ -249,14 +290,15 @@ window.__ModuleLoader__.load({
         speakNote: "Read-aloud uses the browser's speech synthesis (fallback, not a real TTS); the voice depends on the device. Off by default.",
         heard: "Heard",
         reply: "Reply",
-        privacy: "Audio is uploaded to the NUS SoCLaaS cloud transcriber. Locally only this call's temporary recording is kept, and dropped once sent.",
-        privacyShort: "Audio goes to the NUS SoCLaaS cloud transcriber",
+        privacy: "The recording is uploaded to the transcription service the host is configured with. Locally only this call's temporary recording is kept, and dropped once sent.",
+        privacyShort: "Audio goes to the host's configured transcription service",
         errPermission: "Microphone permission was refused. Allow it in the address bar and retry.",
         errUnsupported: "This browser has no recording or Web Audio support.",
-        errMissingKey: "The host has no SOCLAAS_API_KEY, so transcription is unavailable.",
-        errInvalidKey: "SoCLaaS rejected the configured key (invalid or expired).",
-        errNoModel: "SoCLaaS does not serve whisper-large-v3.",
-        errUnreachable: "Could not reach SoCLaaS. Check the network.",
+        errMissingKey: "The host has no transcription key, so transcription is unavailable.",
+        errMissingEndpoint: "The host has no transcription endpoint, so transcription is unavailable.",
+        errInvalidKey: "The transcription service rejected the configured key (invalid or expired).",
+        errNoModel: "The transcription service does not serve the configured model.",
+        errUnreachable: "Could not reach the transcription service. Check the network.",
         errTimeout: "Transcription timed out; please say it again.",
         errTooLarge: "The recording is too large or too long, so it was not uploaded.",
         errEmptyTranscript: "Nothing recognizable was said; please retry.",
@@ -321,14 +363,22 @@ window.__ModuleLoader__.load({
         settingsKeySourceEnv: "environment variable {env}",
         settingsKeySourceNone: "not configured",
         settingsKeyMissing: "No usable key yet: save one under \"Service and key\", or set {env} in the shell that starts dsh web.",
-        settingsTtsTitle: "Real TTS (not integrated)",
-        settingsTtsNote: "Today the only read-aloud is the browser's built-in speech synthesis, as a fallback (the dock's \"Read replies\" toggle, off by default); it has no separate credentials, voices or quota, and the voice depends on the device. A real TTS (MiniMax and the like) is not integrated and needs its own separate key — the fields below are placeholders kept for later and are not editable yet.",
-        settingsTtsModel: "Real TTS model (not integrated, placeholder)",
-        settingsTtsVoice: "Real TTS voice (not integrated, placeholder)",
-        settingsTtsBaseUrl: "Real TTS base URL (not integrated, placeholder)",
-        settingsTtsApiKey: "Real TTS API key (not integrated, placeholder)",
-        settingsTtsKeyHint: "A real TTS needs its own key, separate from the transcription key under \"Service and key\".",
-        settingsNotIntegrated: "not integrated",
+        settingsTtsTitle: "Read aloud (speech synthesis)",
+        settingsTtsNote: "Reading a reply aloud prefers the speech backend configured here. When it fails, read-aloud falls back to the browser's built-in speech synthesis (the dock's \"Read replies\" toggle, off by default) and says so. This needs its own key, separate from the transcription key under \"Service and key\".",
+        settingsTtsModel: "Speech model",
+        settingsTtsVoice: "Voice",
+        settingsTtsBaseUrl: "Base URL",
+        settingsTtsApiKey: "API key",
+        settingsTtsFormat: "Audio format",
+        settingsTtsKeyHint: "Separate from the transcription key: saving takes effect on the next reply, with no restart.",
+        settingsTtsVoiceHint: "A voice id from the provider; leave it empty for the default voice.",
+        settingsTtsBaseUrlHint: "An OpenAI-compatible /v1 root; leave it empty for the provider's default.",
+        settingsTtsSwitch: "Prefer the speech backend",
+        settingsTtsSwitchHint: "Off uses only the browser's synthesizer. A backend failure falls back to it automatically.",
+        settingsTtsKeyMissing: "No speech key configured yet: save one, or set {env} in the shell that starts dsh web.",
+        settingsTtsFallback: "browser synthesis fallback",
+        settingsTtsReady: "speech backend ready",
+        settingsNotIntegrated: "not configured",
         settingsClose: "Close settings",
         testOk: "Connected: {message}",
         testFailed: "Connection failed: {message}",
@@ -346,7 +396,11 @@ window.__ModuleLoader__.load({
         workspacePaletteColor: "Use {color}",
         workspaceCustomColor: "Custom color",
         workspaceColorFailed: "Could not change the color: {reason}",
-        workspaceDot: "Workspace: {title}",
+        workspaceSetColor: "Set color",
+        workspaceColorPicker: "Color for {title}",
+        workspaceColorDone: "Done",
+        workspaceCustomColorTitle: "Custom color",
+        whaleSession: "Session opened by the whale",
         tagOpen: "Open the {title} session",
         tagNoSession: "{title} (no session found for this turn)",
         reportOrigin: "From workspace: {title}",
@@ -356,15 +410,186 @@ window.__ModuleLoader__.load({
         newMain: "New main session",
         newMainBusy: "Creating…",
         newMainFailed: "Could not create a main session: {reason}",
+        authLost: "This page lost its credential to the restarted server. Nothing was lost: a restart mints a new launch token.",
+        authReopen: "Re-authenticate and reload",
+        authPasteHint: "If it does not come back by itself, paste the ?token= URL that dsh web printed into the address bar.",
+        authBusy: "Re-authenticating…",
+        staleBundle: "This page is running the plugin build from before the upgrade; one reload fixes it.",
       },
     };
+
+    // ---- surviving a restart ----------------------------------------------
+
+    // A `dsh web` restart is invisible to everything the page already holds
+    // except two things, and both were measured against a real restarted
+    // server running on a spare port:
+    //
+    //   1. HTTP 401. The launch token is minted per process
+    //      (`randomBytes(32)`), and `/` mints the browser cookie only for a
+    //      request that carries `?token=`. A tab whose cookie the new process
+    //      will not accept gets a flat `401 unauthorized` on /api and on /.
+    //      Measured with the cookie dropped in a live tab: clicking the
+    //      sidebar's "新建会话" produced a silent 401, and the whale panel
+    //      rendered "打开主会话失败：the host recorded no main session" — a
+    //      data-loss message for what is really "authenticate again". Nothing
+    //      reloaded, so a manual browser refresh was the only cure.
+    //   2. A stale bundle revision. Plugin bundles are addressed by
+    //      `?rev=<sha1 over mtime, ctime, size>` and client-modules answers 404
+    //      to every other rev ("versioned code is immutable; mismatched
+    //      revisions are rejected instead of serving newer bytes"). A tab open
+    //      across a plugin REINSTALL keeps asking for the rev it booted with.
+    //      Measured on ONE process with ONE cookie: old rev 6c8d60a2e141 → 404,
+    //      new rev 57e4614df9bb → 200. That is why a plain restart recovers by
+    //      itself (verified: 75 s of downtime, the WebSocket reconnected and
+    //      every API call answered 200) while an upgrade does not.
+    //
+    // These four functions are deliberately pure so `test/restart-recovery.mjs`
+    // can prove the rule instead of hoping: what did the failure look like, and
+    // what should the page do about it?
+
+    /** The query key the launch token travels under. */
+    const TOKEN_QUERY = "token";
+
+    /**
+     * Decide what a failed request means for a page that outlived a restart.
+     *
+     * `401`/`403` are authentication, never data loss: only the URL the running
+     * process printed can turn its new token into a cookie. `404` is the
+     * stale-rev case. A dropped socket or a 5xx during the restart window is
+     * neither — the connection layer already retries those, and reloading there
+     * would interrupt a session that is fine.
+     *
+     * @param {number|string} status - HTTP status, or "network" for a throw.
+     * @returns {"reauthenticate"|"stale-bundle"|"retry"|"ignore"}
+     */
+    function restartActionFor(status) {
+      if (status === 401 || status === 403) return "reauthenticate";
+      if (status === 404) return "stale-bundle";
+      if (status === "network" || status === 0 || status >= 500) return "retry";
+      return "ignore";
+    }
+
+    /**
+     * The URL a 401 page should load to repair itself.
+     *
+     * MEASURED, and the reason this is a plain reload rather than a token
+     * replay: `/` answers the token exchange with `303 → ./`, so after the
+     * first visit the token is GONE from the browser — `location.href` is
+     * clean, `document.referrer` is empty, and no global or storage entry
+     * holds it (the plugin's script has not run yet when the 303 lands). What
+     * survives is the cookie: its signing secret lives in
+     * `$DSH_HOME/.credentials.yaml` and is created once, not per process.
+     * Measured: a cookie signed with that stored secret, stamped an hour
+     * BEFORE the running process started, is accepted by it (GET / → 200), and
+     * a plain reload of a dead tab comes back authenticated while the old
+     * credentials no longer authenticate it. That is exactly why "refresh the
+     * browser" was the workaround the user found by hand — this makes it
+     * automatic.
+     *
+     * A token in the address bar is preserved when present: that is the first
+     * visit and the URL the restarter opens, where `/` needs it to mint the
+     * cookie. A known token is replayed if one was ever captured. The fragment
+     * is dropped, because a reload cannot use it and the server never sees it.
+     *
+     * @param {string} href - the current location.
+     * @param {string} storedToken - a token captured earlier, or "".
+     * @returns {string|null} a URL to load, or null when even that is unusable.
+     */
+    function reauthUrl(href, storedToken) {
+      let url;
+      try {
+        url = new URL(href);
+      } catch (_error) {
+        return null;
+      }
+      url.hash = "";
+      const fromBar = url.searchParams.get(TOKEN_QUERY);
+      const token = typeof fromBar === "string" && fromBar !== "" ? fromBar : storedToken;
+      if (typeof token === "string" && token !== "") url.searchParams.set(TOKEN_QUERY, token);
+      return url.href;
+    }
+
+    /**
+     * True when a bundle URL names a revision other than the one this page
+     * booted with — the reinstall case, where only a reload helps.
+     *
+     * @param {string} url - a request URL.
+     * @param {string} bootRev - the rev recorded at boot.
+     * @returns {boolean}
+     */
+    function isStaleBundleUrl(url, bootRev) {
+      if (typeof url !== "string" || typeof bootRev !== "string" || bootRev === "") return false;
+      // Boot URLs are document-relative (`plugins/??<id>/client.js&rev=...`),
+      // so the marker is the `plugins/` segment, never a leading slash.
+      if (!url.includes("plugins/")) return false;
+      const match = /[?&]rev=([0-9a-z]+)/i.exec(url);
+      return match !== null && match[1] !== bootRev;
+    }
+
+    /**
+     * The one-shot repair a live page performs when it notices it outlived a
+     * restart. It acts AT MOST ONCE per page: a reload that lands on another
+     * 401 must not reload again, or a broken token would become an endless
+     * refresh loop. When no token is available it does not reload at all — it
+     * reports, so the UI can ask for the URL `dsh web` printed.
+     *
+     * Nothing here touches a healthy page: every observation that is not a
+     * restart symptom returns without side effects, which is the "do not
+     * interrupt a running session" half of the requirement.
+     *
+     * @param {object} options - boot rev, token source, location, and effects.
+     * @returns {{observe: (input: {status: number|string, url: string}) => string}}
+     */
+    function createRestartWatch(options) {
+      const reload = typeof options.reload === "function" ? options.reload : () => {};
+      const notify = typeof options.notify === "function" ? options.notify : () => {};
+      const location = typeof options.location === "function" ? options.location : () => ({ href: "" });
+      const storedToken = typeof options.storedToken === "function" ? options.storedToken : () => "";
+      const bootRev = options.bootRev;
+      // "already acted" is a latch, not a counter: one repair per page load.
+      let acted = false;
+
+      return {
+        /**
+         * Classify one failure and, at most once, repair the page.
+         * @param {{status: number|string, url: string}} input - the failure.
+         * @returns {"reauthenticate"|"stale-bundle"|"retry"|"ignore"}
+         */
+        observe(input) {
+          const status = input === undefined ? "network" : input.status;
+          const url = input === undefined ? "" : input.url;
+          let action = restartActionFor(status);
+          // A 404 is only the stale-rev case when it landed on a plugin
+          // bundle; any other 404 is the host's own answer and means nothing
+          // about the restart.
+          if (action === "stale-bundle" && !isStaleBundleUrl(url, bootRev)) action = "ignore";
+          if (action === "ignore" || action === "retry") return action;
+          if (acted) return action;
+          acted = true;
+          const href = typeof location()?.href === "string" ? location().href : "";
+          const target = reauthUrl(href, typeof storedToken() === "string" ? storedToken() : "");
+          if (target === null) {
+            // Only an unparseable location reaches this: the page cannot reload
+            // itself, so it asks the person for the URL `dsh web` printed.
+            notify(action);
+            return action;
+          }
+          reload(target);
+          return action;
+        },
+      };
+    }
 
     // ---- the home and its main session ------------------------------------
 
     async function homeRoute(method, fetchImpl) {
       const request = typeof fetchImpl === "function" ? fetchImpl : fetch;
       const response = await request(HOME_ROUTE, { method, cache: "no-store" });
-      if (!response.ok) throw new Error(`${HOME_ROUTE} answered HTTP ${response.status}`);
+      if (!response.ok) {
+        const error = new Error(`${HOME_ROUTE} answered HTTP ${response.status}`);
+        error.status = response.status;
+        throw error;
+      }
       return response.json();
     }
 
@@ -491,6 +716,25 @@ window.__ModuleLoader__.load({
     // script in the shell's wrapper, so it cannot import it. These rules are
     // therefore mirrored here verbatim and `test/client.mjs` proves both copies
     // decide identically.
+
+    /**
+     * The dock line for a speech-backend fallback.
+     *
+     * The server answers a code (`tts/missing-key`, `tts/backend-timeout`, …);
+     * this maps it to one short line, because "the voice changed" should never
+     * be a mystery. An unknown code still says something true: the backend
+     * failed and the browser spoke instead.
+     */
+    function ttsFallbackNotice(code) {
+      const text = String(code ?? "");
+      if (text === "tts/missing-key") return "ttsMissingKey";
+      if (text === "tts/invalid-key") return "ttsInvalidKey";
+      if (text === "tts/backend-unreachable") return "ttsUnreachable";
+      if (text === "tts/backend-timeout" || text === "timeout") return "ttsTimeout";
+      if (text === "tts/no-audio-in-answer" || text === "tts/undecodable-audio") return "ttsBadAudio";
+      if (text === "tts/text-too-long") return "ttsTooLong";
+      return "ttsFallbackGeneric";
+    }
 
     /** The 90th-percentile level of an utterance's 30 ms frames, in dBFS. */
     function speechLevelDbfs(samples, sampleRate) {
@@ -1078,22 +1322,124 @@ window.__ModuleLoader__.load({
     }
 
     /**
+     * A blank settings draft.
+     *
+     * Every text field starts empty because the server's answer IS the
+     * placeholder: base URLs, model and voice show what is in effect, and an
+     * empty box means "inherit". `dirty` records which of those boxes the
+     * person actually typed in — the only fields a save may send.
+     *
+     * The two key boxes are write-only and carry their own "touched" flags,
+     * which is what separates "leave it alone" from "erase it".
+     */
+    const EMPTY_SETTINGS_DRAFT = Object.freeze({
+      baseUrl: "",
+      model: "",
+      language: "",
+      apiKey: "",
+      apiKeyTouched: false,
+      clearKey: false,
+      ttsBaseUrl: "",
+      ttsApiKey: "",
+      ttsApiKeyTouched: false,
+      clearTtsKey: false,
+      ttsVoice: "",
+      ttsFormat: "",
+      dirty: {},
+    });
+
+    /** The text fields the form collects, one list so "was it edited?" has one answer each. */
+    const SETTINGS_TEXT_FIELDS = Object.freeze(["baseUrl", "model", "language", "ttsBaseUrl", "ttsVoice", "ttsFormat"]);
+
+    /** A run of mask glyphs: what a browser or a Host paints over a stored secret. */
+    const SECRET_MASK_PATTERN = /^[\s•*·\u2022\u00b7]+$/;
+
+    /**
+     * Whether a key box holds the *display* of a secret rather than a typed one.
+     *
+     * The form never receives the stored key, so a mask can only come from a
+     * browser autofill or a Host that renders one. Writing it back would store
+     * the mask itself as the key — the same class of bug as the empty Base URL,
+     * one field over.
+     */
+    function isSecretMask(value) {
+      if (typeof value !== "string" || value === "") return false;
+      if (SECRET_MASK_PATTERN.test(value)) return true;
+      // A prefix followed by a placeholder run (`sk-••••`), never a real key.
+      return /^[\w-]{0,12}[•*·\u2022\u00b7…]{2,}$/.test(value);
+    }
+
+    /**
      * The settings form's request body, built from the draft.
      *
-     * The key field is write-only: the server never returns the value, so the
-     * form cannot prefill it. That leaves one ambiguity to resolve explicitly —
-     * an empty box could mean "leave it alone" or "erase it". `apiKeyTouched`
-     * decides: untouched omits the field entirely (a page reload cannot wipe a
-     * stored key by submitting an empty password box), touched-and-empty sends
-     * `""`, which the route reads as "unset".
+     * Two ambiguities, one rule: a field the person did not actually edit must
+     * not be in the patch at all.
+     *
+     *  1. Text fields show the server's value as a PLACEHOLDER and start empty,
+     *     so an empty box normally means "inherit", not "erase". Only a field
+     *     marked in `draft.dirty` is sent; a dirty field that is now empty sends
+     *     `""`, which is the deliberate clear.
+     *  2. The key fields are write-only, so `apiKeyTouched` /
+     *     `ttsApiKeyTouched` decide — and a mask is never sent even when the box
+     *     was touched.
+     *
+     * A draft with no `dirty` map is a caller stating its fields explicitly
+     * (the original contract, kept so older callers keep working): there a
+     * non-empty value is sent and an empty one is omitted, which is the same
+     * "never erase by accident" guarantee.
+     *
+     * @param {object} draft the form state
+     * @returns {Record<string, string>} the request body
      */
     function settingsDraftPatch(draft) {
       const patch = {};
-      if (typeof draft.baseUrl === "string") patch.baseUrl = draft.baseUrl.trim();
-      if (typeof draft.model === "string") patch.model = draft.model.trim();
-      if (typeof draft.language === "string") patch.language = draft.language.trim();
-      if (draft.apiKeyTouched === true && typeof draft.apiKey === "string") patch.apiKey = draft.apiKey;
+      const dirty = draft.dirty !== null && typeof draft.dirty === "object" ? draft.dirty : undefined;
+      for (const field of SETTINGS_TEXT_FIELDS) {
+        const value = draft[field];
+        if (typeof value !== "string") continue;
+        const trimmed = value.trim();
+        if (dirty === undefined) {
+          // Legacy explicit draft: an empty box is still "leave it alone".
+          if (trimmed !== "") patch[field] = trimmed;
+          continue;
+        }
+        if (dirty[field] !== true) continue;
+        patch[field] = trimmed;
+      }
+      // Two independent secrets, one rule each: an untouched box means "leave
+      // the stored key alone", touched-and-empty means "erase it". A masked
+      // display value is not a key, so it counts as untouched.
+      if (draft.apiKeyTouched === true && typeof draft.apiKey === "string" && !isSecretMask(draft.apiKey)) {
+        patch.apiKey = draft.apiKey;
+      }
+      if (draft.ttsApiKeyTouched === true && typeof draft.ttsApiKey === "string" && !isSecretMask(draft.ttsApiKey)) {
+        patch.ttsApiKey = draft.ttsApiKey;
+      }
       return patch;
+    }
+
+    /**
+     * Record an edit in the draft: the value *and* the fact that this field is
+     * now the person's own, not the placeholder.
+     *
+     * Every settings input routes through here, so "dirty" can never drift from
+     * what the form shows.
+     *
+     * @param {object} current the draft before the edit
+     * @param {Record<string, unknown>} patch the fields to write
+     * @returns {object} the next draft
+     */
+    function settingsDraftEdit(current, patch) {
+      const next = { ...current, ...patch };
+      const dirty = { ...(current.dirty ?? {}) };
+      for (const field of Object.keys(patch)) {
+        if (field === "dirty") continue;
+        // A secret's "touched" flag is its own dirty marker.
+        if (field === "apiKeyTouched" || field === "ttsApiKeyTouched") continue;
+        dirty[field] = true;
+      }
+      next.dirty = dirty;
+      return next;
     }
 
     // ---- keeping the main session readable --------------------------------
@@ -1295,6 +1641,257 @@ window.__ModuleLoader__.load({
     }
 
     /**
+     * Read one reply with the configured speech backend.
+     *
+     * The server answers audio bytes; this turns them into an object URL and
+     * plays them through an `Audio` element. It settles on end, error and a
+     * bounded timer, so a stalled player cannot wedge the call — the same
+     * never-rejects contract `speakReply` keeps for the browser synthesizer.
+     *
+     * Every failure path answers `{ ok: false, code }` rather than throwing, so
+     * the caller can decide to fall back to the browser synthesizer and say
+     * which one it used.
+     *
+     * @param text reply text, shaped by `speakable`.
+     * @param env fetch, the Audio constructor, URL, and a timer.
+     * @returns `{ done, ok, code, seconds }` — `ok` false means "not spoken".
+     */
+    function speakViaBackend(text, env) {
+      const spoken = speakable(text);
+      const schedule = env.setTimeout ?? ((fn, ms) => window.setTimeout(fn, ms));
+      const AudioCtor = env.Audio;
+      const fetchImpl = env.fetch;
+      const urlOf = env.URL;
+      let settled = false;
+      let resolveDone;
+      const done = new Promise((resolve) => { resolveDone = resolve; });
+      const settle = (result) => {
+        if (settled) return;
+        settled = true;
+        resolveDone(result);
+      };
+      if (spoken === "") { settle({ ok: false, code: "empty" }); return { done, ok: false } }
+      if (AudioCtor === undefined || fetchImpl === undefined || urlOf === undefined) {
+        settle({ ok: false, code: "unsupported" });
+        return { done, ok: false };
+      }
+      // One request per reply. The text is the only thing sent; the key stays
+      // on the server.
+      //
+      // The player is kept in a variable the caller can reach, because stopping
+      // is part of the contract: pausing an `Audio` element is the ONLY thing
+      // that actually silences it. `speechSynthesis.cancel()` — what hangup
+      // used to call — cancels the browser synthesizer's queue and leaves a
+      // playing `Audio` element untouched, which is exactly the reported
+      // "I hung up and it kept talking".
+      let controller = env.controller ?? null;
+      const ownsController = env.controller === undefined && typeof env.AbortController === "function";
+      if (controller === null && ownsController) controller = new env.AbortController();
+      let objectUrl = null;
+      let audio = null;
+      let timer = null;
+      // Whether this playback was stopped by the user rather than finishing.
+      let stopped = false;
+      /**
+       * Silence the reply now, and drop everything that could restart it.
+       *
+       * Order matters: pause first (audio in the speakers is the thing the
+       * person hears), then detach the source and re-load so the element
+       * releases the decoded buffer, then revoke the blob URL, and finally
+       * abort the in-flight request so paid-for audio cannot arrive later and
+       * start playing on its own.
+       */
+      const stop = (reason) => {
+        stopped = true;
+        if (timer !== null) { try { clearTimeout(timer); } catch (_error) { /* gone */ } timer = null; }
+        const player = audio;
+        if (player !== null) {
+          try { player.onended = null; } catch (_error) { /* detached */ }
+          try { player.onerror = null; } catch (_error) { /* detached */ }
+          try { player.pause(); } catch (_error) { /* already paused */ }
+          try {
+            // Clearing `src` + `load()` is what frees the element; without it a
+            // paused element can still be resumed by the browser's media keys.
+            player.removeAttribute?.("src");
+            player.src = "";
+            player.load?.();
+          } catch (_error) { /* older players */ }
+          try { player.currentTime = 0; } catch (_error) { /* not seekable */ }
+          audio = null;
+        }
+        try { if (objectUrl !== null) urlOf.revokeObjectURL(objectUrl); } catch (_error) { /* already gone */ }
+        objectUrl = null;
+        try { controller?.abort?.(); } catch (_error) { /* already aborted */ }
+        settle({ ok: false, code: reason ?? "stopped" });
+      };
+      const play = (bytes, mime, seconds) => {
+        if (stopped === true) return;
+        try {
+          objectUrl = urlOf.createObjectURL(new env.Blob([bytes], { type: mime }));
+        } catch (_error) {
+          settle({ ok: false, code: "undecodable" });
+          return;
+        }
+        let element;
+        try {
+          element = new AudioCtor(objectUrl);
+        } catch (_error) {
+          urlOf.revokeObjectURL(objectUrl);
+          objectUrl = null;
+          settle({ ok: false, code: "undecodable" });
+          return;
+        }
+        const release = () => {
+          if (objectUrl === null) return;
+          try { urlOf.revokeObjectURL(objectUrl); } catch (_error) { /* already gone */ }
+          objectUrl = null;
+        };
+        // Published to the outer binding, which is the one `stop()` reaches:
+        // a block-local `let` here would leave `stop` looking at null forever.
+        audio = element;
+        element.onended = () => { if (stopped === true) return; audio = null; release(); settle({ ok: true, code: "played", seconds }) };
+        element.onerror = () => { if (stopped === true) return; audio = null; release(); settle({ ok: false, code: "playback" }) };
+        try {
+          const started = element.play();
+          if (started !== undefined && typeof started.catch === "function") {
+            started.catch(() => { release(); settle({ ok: false, code: "playback" }) });
+          }
+        } catch (_error) {
+          release();
+          settle({ ok: false, code: "playback" });
+          return;
+        }
+        // Backstop: a player that fires neither event must not hold the call.
+        const limit = Number.isFinite(seconds) && seconds > 0
+          ? Math.min(180000, seconds * 1000 + 4000)
+          : Math.min(180000, 4000 + spoken.length * 220);
+        timer = schedule(() => { if (stopped === true) return; release(); settle({ ok: false, code: "timeout" }) }, limit);
+      };
+      fetchImpl(VOICE_SPEAK_ROUTE, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ text: spoken }),
+        signal: controller?.signal,
+      }).then(async (response) => {
+        if (!response.ok) {
+          let code = `http-${response.status}`;
+          try {
+            const payload = await response.json();
+            if (typeof payload?.error?.code === "string") code = payload.error.code;
+          } catch (_error) {
+            // A non-JSON refusal keeps the HTTP status as its code.
+          }
+          settle({ ok: false, code });
+          return;
+        }
+        const mime = response.headers?.get?.("content-type") ?? "audio/wav";
+        const declared = Number(response.headers?.get?.("x-dw-tts-seconds"));
+        const bytes = new Uint8Array(await response.arrayBuffer());
+        if (bytes.byteLength === 0) {
+          settle({ ok: false, code: "empty" });
+          return;
+        }
+        play(bytes, mime, Number.isFinite(declared) ? declared : undefined);
+      }).catch((error) => {
+        settle({ ok: false, code: error?.name === "AbortError" ? "aborted" : "unreachable" });
+      });
+      // `stop` is the whole point: a caller that cannot reach the element
+      // cannot silence it.
+      return { done, ok: true, stop, stopped: () => stopped === true };
+    }
+
+    /**
+     * A read-aloud queue of depth one.
+     *
+     * The person's rule, in their words: "read only the newest message, never
+     * start reading the ones I missed" and "if a new message arrives, read that
+     * one instead". A queue that appends would read three stale replies in a
+     * row after a burst; this keeps ONE slot — the newest text — and a burst
+     * inside `coalesceMs` collapses to its last value.
+     *
+     * Two independent states, because they fail differently:
+     *   - `pending`  what should be read, overwritten by every newer arrival
+     *   - `speaking` the player currently making sound, stopped on replacement
+     *
+     * `interrupted` records that the person hung up: an interruption is not
+     * "catch up later", so nothing plays until a genuinely new reply arrives.
+     * That is why `offer` clears the flag and `observe` never re-offers old text.
+     *
+     * @param options `coalesceMs` (default 350), `now`, `setTimeout`, `clearTimeout`
+     * @returns `{ offer, take, idle, interrupted, counts }`
+     */
+    function createLatestOnlySlot(options = {}) {
+      const coalesceMs = Number.isFinite(options.coalesceMs) ? options.coalesceMs : VOICE_CONSTANTS.speakCoalesceMs;
+      const now = options.now ?? (() => Date.now());
+      const schedule = options.setTimeout ?? ((fn, ms) => setTimeout(fn, ms));
+      const cancelTimer = options.clearTimeout ?? ((id) => clearTimeout(id));
+      // The one slot. A newer offer overwrites it; the older text is dropped,
+      // never appended.
+      let pending = null;
+      let timer = null;
+      // Spoken-read counters, so "three messages, one read" is measurable.
+      let offered = 0;
+      let dropped = 0;
+      let spoken = 0;
+      let interrupted = false;
+      return {
+        /**
+         * A reply arrived. Overwrite the slot; the newest text always wins.
+         * @param {string} text the reply to read
+         * @param {{ immediate?: boolean }} [opts] `immediate` skips the window
+         * @returns {{ replaced: boolean }} whether an unread text was dropped
+         */
+        offer(text, opts = {}) {
+          if (typeof text !== "string" || text.trim() === "") return { replaced: false };
+          offered += 1;
+          const replaced = pending !== null;
+          if (replaced) dropped += 1;
+          pending = { text, at: now() };
+          interrupted = false;
+          if (timer !== null) { cancelTimer(timer); timer = null; }
+          if (opts.immediate === true) return { replaced };
+          // A short merge window: a burst of messages read as its last one.
+          timer = schedule(() => { timer = null; }, coalesceMs);
+          return { replaced };
+        },
+        /**
+         * Take the slot, if the merge window has closed.
+         * @returns {{ text: string } | null} the text to read now, or null
+         */
+        take() {
+          if (pending === null || timer !== null || interrupted) return null;
+          const taken = pending;
+          pending = null;
+          spoken += 1;
+          return taken;
+        },
+        /** The slot's current text without consuming it (for a re-render). */
+        peek() {
+          return pending === null ? null : pending.text;
+        },
+        /** The person hung up: drop the slot and stay quiet until a new reply. */
+        interrupt() {
+          if (pending !== null) dropped += 1;
+          pending = null;
+          interrupted = true;
+          if (timer !== null) { cancelTimer(timer); timer = null; }
+        },
+        /** Whether the person interrupted and nothing new has arrived since. */
+        interrupted() {
+          return interrupted === true;
+        },
+        /** Nothing waiting and no window open. */
+        idle() {
+          return pending === null && timer === null;
+        },
+        /** Counters, for a test or a status line. */
+        counts() {
+          return { offered, dropped, spoken };
+        },
+      };
+    }
+
+    /**
      * The BCP-47 tag for the browser's speech synthesizer.
      *
      * This is the fallback read-aloud voice, not an integrated TTS channel.
@@ -1326,6 +1923,28 @@ window.__ModuleLoader__.load({
       );
     }
 
+    /**
+     * Choose the whale panel's copy from the failure, not from the exception
+     * text. A 401 is "authenticate again"; everything else keeps the ordinary
+     * "opening failed" wording with its retry.
+     *
+     * Kept pure so the words the person actually reads are asserted in
+     * test/restart-recovery.mjs: rendering an auth failure as "the host
+     * recorded no main session" is the bug as it was experienced.
+     *
+     * @param {object} strings - the four resolved copy strings plus retry.
+     * @param {object} failure - the thrown value, optionally carrying a status.
+     * @returns {{kind: "auth"|"failed", message: string, action: string, hint?: string}}
+     */
+    function whaleFailureCopy(strings, failure) {
+      const status = failure?.status;
+      const reason = String(failure?.message ?? failure ?? "");
+      if (status === 401 || status === 403) {
+        return { kind: "auth", message: strings.authLost, action: strings.authReopen, hint: strings.authPasteHint };
+      }
+      return { kind: "failed", message: strings.failed.replace("{reason}", reason), action: strings.retry };
+    }
+
     function makeWhalePage(ctx, t) {
       return function WhalePage() {
         const [error, setError] = React.useState(null);
@@ -1334,19 +1953,49 @@ window.__ModuleLoader__.load({
         React.useEffect(() => {
           let alive = true;
           openMainSession(ctx).catch((reason) => {
-            if (alive) setError(String(reason?.message ?? reason));
+            if (alive) setError(reason);
           });
           return () => {
             alive = false;
           };
         }, [attempt]);
 
-        const body = error === null
-          ? h("p", null, t("opening"))
-          : [
-              h("p", { key: "msg" }, t("failed", { reason: error })),
-              h("button", { key: "retry", type: "button", className: "dw-retry", onClick: () => { setError(null); setAttempt((n) => n + 1); } }, t("retry")),
-            ];
+        if (error === null) {
+          return h("section", { className: "dw-page", "aria-label": t("panel") }, h("p", null, t("opening")));
+        }
+        // The panel must not report an auth failure as data loss. Measured:
+        // a 401 from a restarted server used to render "打开主会话失败：the host
+        // recorded no main session", which reads as a broken whale.
+        const copy = whaleFailureCopy(
+          {
+            authLost: t("authLost"),
+            authReopen: t("authReopen"),
+            authPasteHint: t("authPasteHint"),
+            failed: t("failed"),
+            retry: t("retry"),
+          },
+          error,
+        );
+        const body = [h("p", { key: "msg" }, copy.message)];
+        if (copy.hint !== undefined) body.push(h("p", { key: "hint", className: "dw-hint" }, copy.hint));
+        body.push(h("button", {
+          key: "retry",
+          type: "button",
+          className: "dw-retry",
+          onClick: () => {
+            if (copy.kind === "auth") {
+              // A reload is what mints the cookie; retrying the same request
+              // against the same dead credential would only fail again.
+              const target = reauthUrl(window.location.href, readStoredToken());
+              if (target !== null) {
+                window.location.replace(target);
+                return;
+              }
+            }
+            setError(null);
+            setAttempt((n) => n + 1);
+          },
+        }, copy.action));
         return h("section", { className: "dw-page", "aria-label": t("panel") }, body);
       };
     }
@@ -1514,6 +2163,10 @@ window.__ModuleLoader__.load({
       // "Done talking" ends the segment in progress, so it shows only while one
       // can be recording: muting drops the segment, a closed microphone has none.
       const listening = visual === "listening" || visual === "calibrating";
+      // Speaking: the panel offers the one action that matters right now — stop
+      // the voice. It is shown only while something is being read, so its
+      // presence is honest rather than decorative.
+      const speaking = visual === "speaking";
       const speakLabel = input.speak === true ? t("speakOn") : t("speakOff");
       const hasTranscript = input.heard !== "" || input.reply !== "";
       const card = h("div", { className: "dw-card" },
@@ -1528,6 +2181,16 @@ window.__ModuleLoader__.load({
             h("span", { className: "dw-status-text" }, t(statusKey))),
           input.busy === true ? h("span", { className: "dw-busy", "aria-hidden": true }, h("i"), h("i"), h("i")) : null,
           listening ? h("button", { type: "button", className: "dw-chip", onClick: input.actions.stopTalking }, t("callStop")) : null,
+          speaking
+            ? h("button", {
+              type: "button",
+              className: "dw-chip dw-stop-voice",
+              "data-dw-stop-voice": "",
+              title: t("stopReadingHint"),
+              "aria-label": t("stopReading"),
+              onClick: input.actions.stopReading,
+            }, h(HangupGlyph, { size: 12 }), t("stopReading"))
+            : null,
           input.detach?.available === true
             ? h("button", {
               type: "button",
@@ -1672,7 +2335,7 @@ window.__ModuleLoader__.load({
       const actions = input.actions;
       const page = input.page === "service" || input.page === "tts" ? input.page : "main";
       const navigate = typeof actions.navigate === "function" ? actions.navigate : () => {};
-      const apiKeyEnv = info?.apiKeyEnv ?? "SOCLAAS_API_KEY";
+      const apiKeyEnv = info?.apiKeyEnv ?? "";
       const sourceText = info === null
         ? t("settingsKeySourceNone")
         : info.keySource === "settings"
@@ -1778,17 +2441,104 @@ window.__ModuleLoader__.load({
         ];
       } else if (page === "tts") {
         title = t("settingsTtsTitle");
-        // Real TTS is not integrated. The four fields are placeholders kept for
-        // a future integration (the user asked for them to stay and be labelled):
-        // each one is disabled and says so, and the key field is explicit that a
-        // real TTS needs its OWN key. Nothing here is wired to anything.
-        body = h("div", { className: "dw-tts-block", "data-dw-tts": "not-integrated" },
+        // The real speech form. Every field is live: saving goes through the
+        // same settings route as the transcription fields, and the next reply
+        // read aloud uses it — no restart, no placeholder.
+        //
+        // The key is a write-only password box, exactly like the transcription
+        // key: the server never returns a value, so an empty box means
+        // "unchanged" until touched, and "clear" is an explicit switch.
+        const tts = info?.tts ?? null;
+        const ttsSourceText = tts === null
+          ? t("settingsKeySourceNone")
+          : tts.keySource === "settings"
+            ? t("settingsKeySourceSettings")
+            : tts.keySource === "env"
+              ? t("settingsKeySourceEnv", { env: tts.apiKeyEnv ?? "" })
+              : t("settingsKeySourceNone");
+        body = h("div", { className: "dw-tts-block", "data-dw-tts": "configured" },
+          errorLine,
           h("p", { className: "dw-tts-note" }, t("settingsTtsNote")),
-          disabledField("ttsBaseUrl", t("settingsTtsBaseUrl"), "url"),
-          disabledField("ttsModel", t("settingsTtsModel"), "text"),
-          disabledField("ttsVoice", t("settingsTtsVoice"), "text"),
-          disabledField("ttsApiKey", t("settingsTtsApiKey"), "password"),
-          h("p", { className: "dw-tts-note" }, t("settingsTtsKeyHint")));
+          h("div", { className: "dw-row", key: "tts-enabled" },
+            h("span", { className: "dw-row-text" },
+              h("span", { className: "dw-row-title" }, t("settingsTtsSwitch")),
+              h("span", { className: "dw-row-sub" }, t("settingsTtsSwitchHint"))),
+            switchControl({
+              checked: input.ttsEnabled !== false,
+              label: t("settingsTtsSwitch"),
+              onToggle: () => { if (typeof actions.toggleTtsBackend === "function") actions.toggleTtsBackend(); },
+            })),
+          // Where the key comes from, in the same vocabulary as the ASR page.
+          h("div", { className: "dw-row dw-source", key: "tts-source", "data-dw-tts-source": tts?.keySource ?? "unknown" },
+            h("i", { className: "dw-dot" }),
+            h("span", { className: "dw-row-text" }, tts?.hasApiKey === true
+              ? t("settingsKeySource", { source: ttsSourceText })
+              : t("settingsTtsKeyMissing", { env: tts?.apiKeyEnv ?? "" }))),
+          field("ttsBaseUrl", t("settingsTtsBaseUrl"), t("settingsTtsBaseUrlHint"),
+            h("input", {
+              type: "url",
+              inputMode: "url",
+              className: "dw-input",
+              value: draft.ttsBaseUrl,
+              placeholder: tts?.baseUrl ?? "",
+              spellCheck: false,
+              autoComplete: "off",
+              onChange: (event) => set({ ttsBaseUrl: event.target.value }),
+            })),
+          field("ttsApiKey", t("settingsTtsApiKey"), t("settingsTtsKeyHint"),
+            h("input", {
+              type: "password",
+              className: "dw-input",
+              value: draft.ttsApiKey,
+              placeholder: tts?.hasApiKey === true ? "••••••••" : "",
+              autoComplete: "new-password",
+              spellCheck: false,
+              disabled: draft.clearTtsKey === true,
+              onChange: (event) => set({ ttsApiKey: event.target.value, ttsApiKeyTouched: true }),
+            })),
+          tts?.keySource === "settings"
+            ? h("div", { className: "dw-row dw-row-plain dw-row-danger", key: "clear-tts" },
+              h("span", { className: "dw-row-text" },
+                h("span", { className: "dw-row-title" }, t("settingsApiKeyClear")),
+                h("span", { className: "dw-row-sub" }, t("settingsApiKeyClearHint"))),
+              switchControl({
+                checked: draft.clearTtsKey === true,
+                label: t("settingsApiKeyClear"),
+                onToggle: () => set(draft.clearTtsKey === true
+                  ? { clearTtsKey: false, ttsApiKeyTouched: false, ttsApiKey: "" }
+                  : { clearTtsKey: true, ttsApiKeyTouched: true, ttsApiKey: "" }),
+              }))
+            : null,
+          field("ttsVoice", t("settingsTtsVoice"), t("settingsTtsVoiceHint"),
+            h("input", {
+              type: "text",
+              className: "dw-input",
+              value: draft.ttsVoice,
+              placeholder: tts?.voice ?? "",
+              spellCheck: false,
+              autoComplete: "off",
+              onChange: (event) => set({ ttsVoice: event.target.value }),
+            })),
+          field("ttsFormat", t("settingsTtsFormat"), null,
+            h("select", {
+              className: "dw-select",
+              value: draft.ttsFormat === "" ? (tts?.format ?? "wav") : draft.ttsFormat,
+              onChange: (event) => set({ ttsFormat: event.target.value }),
+            }, (tts?.formats ?? ["wav", "mp3", "pcm"]).map((format) => h("option", { key: format, value: format }, format)))),
+          field("ttsModel", t("settingsTtsModel"), null,
+            h("input", {
+              type: "text",
+              className: "dw-input",
+              value: tts?.model ?? "",
+              readOnly: true,
+              autoComplete: "off",
+              onChange: () => {},
+            })),
+          h("div", { className: "dw-settings-actions", key: "tts-actions" },
+            h("button", { type: "button", className: "dw-primary", disabled: input.busy === true, onClick: actions.save },
+              input.busy === true ? t("settingsSaving") : t("settingsSave")),
+            input.saved === true ? h("span", { className: "dw-saved", role: "status" }, t("settingsSaved")) : null),
+          h("p", { className: "dw-settings-note", key: "tts-restart" }, t("settingsRestartHint")));
       } else {
         title = t("settingsOpen");
         const language = info === null ? "" : info.language || t("settingsLanguageAuto");
@@ -1820,7 +2570,10 @@ window.__ModuleLoader__.load({
             navRow("service", "service", t("settingsService"), h("span", { className: "dw-row-value" }, summary)),
           ]),
           section("tts", t("settingsSectionTts"), [
-            navRow("tts", "tts", t("settingsTtsEntry"), h("span", { className: "dw-badge" }, t("settingsNotIntegrated"))),
+            navRow("tts", "tts", t("settingsTtsEntry"),
+              h("span", { className: "dw-row-value" }, info?.tts?.hasApiKey === true
+                ? [hostOf(info?.tts?.baseUrl ?? ""), info?.tts?.voice].filter((part) => part).join(" · ")
+                : t("settingsTtsFallback"))),
           ]),
           h("p", { className: "dw-settings-note", key: "intro" }, t("settingsIntro")),
           // Workspace colors, when the panel is wired to the memory store.
@@ -1974,12 +2727,12 @@ window.__ModuleLoader__.load({
       };
       if (env.enabled !== true || synth === undefined || Utterance === undefined) {
         finish();
-        return { done, speech: null };
+        return { done, speech: null, stop: () => {} };
       }
       const spoken = speakable(text);
       if (spoken === "") {
         finish();
-        return { done, speech: null };
+        return { done, speech: null, stop: () => {} };
       }
       try { synth.cancel(); } catch (_error) { /* no queue */ }
       const speech = new Utterance(spoken);
@@ -1995,17 +2748,26 @@ window.__ModuleLoader__.load({
       // fire neither.
       speech.onend = finish;
       speech.onerror = finish;
+      // The one way to silence this engine: `cancel()` drops the queue, and
+      // repeated calls cover the engines that swallow the first one.
+      const stop = () => {
+        try { synth.cancel(); } catch (_error) { /* no queue */ }
+        try { synth.cancel(); } catch (_error) { /* no queue */ }
+        try { if (typeof synth.pause === "function") synth.pause(); } catch (_error) { /* not supported */ }
+        try { if (typeof synth.resume === "function") synth.resume(); } catch (_error) { /* not supported */ }
+        finish();
+      };
       try {
         synth.speak(speech);
       } catch (_error) {
         // An engine refusal is not a call failure: show the text and move on.
         finish();
-        return { done, speech };
+        return { done, speech, stop };
       }
       // speechSynthesis can silently never fire onend. The call must not depend
       // on it: this bounded timer releases the promise on its own.
       schedule(finish, Math.min(120000, 2000 + spoken.length * 220));
-      return { done, speech };
+      return { done, speech, stop };
     }
 
     /**
@@ -2034,7 +2796,7 @@ window.__ModuleLoader__.load({
         // draft, and the last test result.
         const [settingsOpen, setSettingsOpen] = React.useState(false);
         const [settingsInfo, setSettingsInfo] = React.useState(null);
-        const [settingsDraft, setSettingsDraft] = React.useState({ baseUrl: "", model: "", language: "", apiKey: "", apiKeyTouched: false, clearKey: false });
+        const [settingsDraft, setSettingsDraft] = React.useState({ ...EMPTY_SETTINGS_DRAFT });
         const [settingsBusy, setSettingsBusy] = React.useState(false);
         const [settingsSaved, setSettingsSaved] = React.useState(false);
         const [settingsTesting, setSettingsTesting] = React.useState(false);
@@ -2082,7 +2844,21 @@ window.__ModuleLoader__.load({
         const sessionRef = React.useRef(null);
         const disposedRef = React.useRef(false);
         const speakRef = React.useRef(false);
+        // Whether read-aloud should try the speech backend first. On unless the
+        // user turns it off; the browser synthesizer stays the fallback either
+        // way, so turning this off is never "no read-aloud".
+        const ttsEnabledRef = React.useRef(true);
+        const [ttsEnabled, setTtsEnabled] = React.useState(true);
+        const [ttsNotice, setTtsNotice] = React.useState(null);
         const watcherRef = React.useRef(null);
+        // Read-aloud state: the depth-one slot of texts waiting to be read, the
+        // player making sound right now, and whether a reader is running. Split
+        // so a stop can reach the element instead of only the synthesizer.
+        const slotRef = React.useRef(null);
+        if (slotRef.current === null) slotRef.current = createLatestOnlySlot();
+        const playerRef = React.useRef(null);
+        const speechPlayerRef = React.useRef(null);
+        const speakingRef = React.useRef(false);
         const statusRef = React.useRef("ready");
         const controlsRef = React.useRef(null);
         if (controlsRef.current === null) controlsRef.current = createCallControls();
@@ -2597,14 +3373,7 @@ window.__ModuleLoader__.load({
             setSettingsInfo(info);
             // The draft starts from what the server holds; the key is never part
             // of it, so an empty password box means "unchanged" until touched.
-            setSettingsDraft({
-              baseUrl: "",
-              model: "",
-              language: "",
-              apiKey: "",
-              apiKeyTouched: false,
-              clearKey: false,
-            });
+            setSettingsDraft({ ...EMPTY_SETTINGS_DRAFT });
             return info;
           } catch (_error) {
             setSettingsError("errUnreachable");
@@ -2648,7 +3417,7 @@ window.__ModuleLoader__.load({
               return;
             }
             setSettingsInfo(payload);
-            setSettingsDraft({ baseUrl: "", model: "", language: "", apiKey: "", apiKeyTouched: false, clearKey: false });
+            setSettingsDraft({ ...EMPTY_SETTINGS_DRAFT });
             setSettingsSaved(true);
           } catch (_error) {
             setSettingsError("errUnreachable");
@@ -2877,6 +3646,12 @@ window.__ModuleLoader__.load({
         async function followReplies(call, sessionId) {
           const follower = createReplyFollower();
           followerRef.current = follower;
+          // Reading a reply no longer blocks the follower. Waiting on it was
+          // how replies piled up: a 20-second read held the loop, and every
+          // reply that arrived meanwhile was read in turn afterwards — the
+          // "it reads the backlog" complaint. The loop now offers each reply to
+          // a depth-one slot and returns to watching at once, so a burst
+          // collapses to its newest text and an interruption is never queued.
           while (callIsLive(call) && !disposedRef.current) {
             const now = Date.now();
             const seen = follower.observe({
@@ -2891,11 +3666,125 @@ window.__ModuleLoader__.load({
             else if (listeningRef.current) awayRef.current.resume(now);
             if (seen.reply !== null) {
               setReply(seen.reply);
-              if (speakRef.current) await readAloud(seen.reply, call);
+              if (speakRef.current) offerReply(seen.reply, call);
             }
+            // Take a text whose merge window has closed and play it beside the
+            // watcher; a playing reply never holds this loop.
+            pumpSpeech(call);
             await sleep(VOICE_CONSTANTS.pollMs);
           }
           if (followerRef.current === follower) followerRef.current = null;
+        }
+
+        async function readAloud(text, call) {
+          if (speakingRef.current === true) return;
+          while (userSpeakingRef.current && callIsLive(call) && !disposedRef.current) {
+            await sleep(VOICE_CONSTANTS.pollMs);
+          }
+          if (!callIsLive(call) || disposedRef.current || !speakRef.current) return;
+          speakingRef.current = true;
+          listeningRef.current = false;
+          awayRef.current.suspend(Date.now());
+          await takerRef.current?.mute();
+          setPhase("speaking");
+          // The configured speech backend first, the browser synthesizer as the
+          // fallback. The fallback is not silent: the dock says which one spoke,
+          // so "the voice changed" is never mistaken for "the setting stopped
+          // working".
+          let spokeWithBackend = false;
+          if (ttsEnabledRef.current) {
+            // A controller per read: hangup aborts it, so a reply whose audio
+            // was already paid for never arrives and starts playing on its own.
+            const controller = typeof AbortController === "function" ? new AbortController() : undefined;
+            const backend = speakViaBackend(text, {
+              fetch,
+              Audio: typeof Audio === "undefined" ? undefined : Audio,
+              URL: typeof URL === "undefined" ? undefined : URL,
+              Blob: typeof Blob === "undefined" ? undefined : Blob,
+              controller,
+              AbortController: typeof AbortController === "undefined" ? undefined : AbortController,
+            });
+            if (backend.ok) {
+              // Reachable from `stopSpeaking`, so a hangup or a newer reply can
+              // actually silence the element rather than only the synthesizer.
+              playerRef.current = backend;
+              const result = await backend.done;
+              if (playerRef.current === backend) playerRef.current = null;
+              spokeWithBackend = result?.ok === true;
+              if (!spokeWithBackend && result?.code !== "stopped" && result?.code !== "superseded"
+                && result?.code !== "hangup" && callIsLive(call) && !disposedRef.current) {
+                // A clear reason, then the fallback: never a silent downgrade.
+                setTtsNotice(ttsFallbackNotice(result?.code));
+              }
+            }
+          }
+          // The fallback is skipped while a stop is in progress: a hangup must
+          // not hand the same text to the synthesizer on the way out.
+          const stoppedMeanwhile = playerRef.current !== null && speakingRef.current === false;
+          if (!spokeWithBackend && !stoppedMeanwhile && callIsLive(call) && !disposedRef.current) {
+            const speech = speakReply(text, {
+              enabled: speakRef.current,
+              synth: typeof speechSynthesis === "undefined" ? undefined : speechSynthesis,
+              Utterance: typeof SpeechSynthesisUtterance === "undefined" ? undefined : SpeechSynthesisUtterance,
+            });
+            speechPlayerRef.current = speech;
+            await speech.done;
+            if (speechPlayerRef.current === speech) speechPlayerRef.current = null;
+          }
+          speakingRef.current = false;
+          if (!callIsLive(call) || disposedRef.current) return;
+          setPhase("ready");
+          if (controlsRef.current.state().device) void listen();
+        }
+
+        /**
+         * Offer one reply to the depth-one slot.
+         *
+         * A reply that arrives while another is being read REPLACES it: the
+         * slot's newest text wins and the reader is stopped, per the person's
+         * rule ("read only the newest one"). Nothing is appended, so a backlog
+         * cannot exist.
+         */
+        function offerReply(text, call) {
+          if (slotRef.current === null) slotRef.current = createLatestOnlySlot();
+          const { replaced } = slotRef.current.offer(text);
+          // A replacement silences the reply in progress, so the newest one is
+          // heard once instead of after the stale one finishes.
+          if (replaced) stopSpeaking("superseded");
+          if (callIsLive(call)) pumpSpeech(call);
+        }
+
+        /** Start the reader for the slot's text, if one is ready and none runs. */
+        function pumpSpeech(call) {
+          const slot = slotRef.current;
+          if (slot === null || speakingRef.current === true) return;
+          const taken = slot.take();
+          if (taken === null) return;
+          void readAloud(taken.text, call);
+        }
+
+        /**
+         * Stop whatever is making sound right now, and release the device state
+         * the reader set. This is the one place that knows all three players:
+         * the backend's `<audio>` element, the browser synthesizer, and the
+         * in-flight request whose audio would otherwise start on arrival.
+         *
+         * @param {string} reason `hangup`, `superseded`, or `toggle`
+         * @returns {void}
+         */
+        function stopSpeaking(reason) {
+          const player = playerRef.current;
+          playerRef.current = null;
+          if (player !== null) {
+            try { player.stop?.(reason); } catch (_error) { /* already stopped */ }
+          }
+          // The synthesizer is a separate player, stopped on its own terms.
+          try { speechPlayerRef.current?.stop?.(); } catch (_error) { /* no queue */ }
+          speechPlayerRef.current = null;
+          if (typeof speechSynthesis !== "undefined") {
+            try { speechSynthesis.cancel(); } catch (_error) { /* no queue */ }
+          }
+          speakingRef.current = false;
         }
 
         /**
@@ -2905,26 +3794,6 @@ window.__ModuleLoader__.load({
          * its own (end, error, refusal or a bounded timer), so this never
          * wedges the call.
          */
-        async function readAloud(text, call) {
-          while (userSpeakingRef.current && callIsLive(call) && !disposedRef.current) {
-            await sleep(VOICE_CONSTANTS.pollMs);
-          }
-          if (!callIsLive(call) || disposedRef.current || !speakRef.current) return;
-          listeningRef.current = false;
-          awayRef.current.suspend(Date.now());
-          await takerRef.current?.mute();
-          setPhase("speaking");
-          const speech = speakReply(text, {
-            enabled: speakRef.current,
-            synth: typeof speechSynthesis === "undefined" ? undefined : speechSynthesis,
-            Utterance: typeof SpeechSynthesisUtterance === "undefined" ? undefined : SpeechSynthesisUtterance,
-          });
-          await speech.done;
-          if (!callIsLive(call) || disposedRef.current) return;
-          setPhase("ready");
-          if (controlsRef.current.state().device) void listen();
-        }
-
         /** "Done talking": end the segment now; with nothing said, say so. Listening goes on either way. */
         async function stopTalking() {
           awayRef.current.present(Date.now());
@@ -2989,6 +3858,12 @@ window.__ModuleLoader__.load({
           controlsRef.current.setDevice(false);
           publishControls();
           closeDetached();
+          // Hangup is a stop, not a pause: silence the element (the only thing
+          // that reaches the speakers), abort the request in flight, and empty
+          // the slot so no backlog is read afterwards. The slot stays
+          // "interrupted" until a genuinely new reply arrives.
+          stopSpeaking("hangup");
+          slotRef.current?.interrupt?.();
           if (typeof speechSynthesis !== "undefined") speechSynthesis.cancel();
           if (!disposedRef.current) {
             setOpen(false);
@@ -2998,12 +3873,43 @@ window.__ModuleLoader__.load({
           }
         }
 
+        /** "Prefer the speech backend", shared by the settings page. */
+        function toggleTtsBackend() {
+          const next = !ttsEnabledRef.current;
+          setTtsEnabled(next);
+          ttsEnabledRef.current = next;
+          if (!next) setTtsNotice(null);
+        }
+
         /** The read-aloud fallback switch, shared by the dock bar and the settings page. */
         function toggleSpeak() {
           const next = !speakRef.current;
           setSpeak(next);
           speakRef.current = next;
-          if (!next && typeof speechSynthesis !== "undefined") speechSynthesis.cancel();
+          if (next) return;
+          // Turning read-aloud off is an instruction to be quiet now, across
+          // every player, not just the browser synthesizer.
+          stopSpeaking("toggle");
+          slotRef.current?.interrupt?.();
+          if (typeof speechSynthesis !== "undefined") speechSynthesis.cancel();
+        }
+
+        /**
+         * The explicit "hang up the voice" action.
+         *
+         * A call can be alive with read-aloud still talking; this stops the
+         * speech without dropping the microphone, which is what the panel's
+         * stop button is for. It is the same stop the hangup uses, so there is
+         * one implementation to trust.
+         */
+        function stopReading() {
+          stopSpeaking("hangup");
+          slotRef.current?.interrupt?.();
+          if (typeof speechSynthesis !== "undefined") speechSynthesis.cancel();
+          if (disposedRef.current) return;
+          setPhase(listeningRef.current ? "listening" : "ready");
+          // Reading paused detection; with the microphone still on, resume it.
+          if (controlsRef.current.state().device) void listen();
         }
 
         const busy = sending > 0 || whaleBusy;
@@ -3043,7 +3949,9 @@ window.__ModuleLoader__.load({
             set: (patch) => {
               // An edit after a save makes "Saved" stale; it reappears on the next save.
               setSettingsSaved(false);
-              setSettingsDraft((current) => ({ ...current, ...patch }));
+              // `settingsDraftEdit` records which boxes the person actually
+              // typed in, so a save can never send a placeholder as a value.
+              setSettingsDraft((current) => settingsDraftEdit(current, patch));
             },
             busy: settingsBusy,
             testing: settingsTesting,
@@ -3052,6 +3960,8 @@ window.__ModuleLoader__.load({
             error: settingsError,
             page: settingsPage,
             speak,
+            ttsEnabled,
+            ttsNotice,
             redemptionMs,
             workspaces: memorySnapshot === null
               ? undefined
@@ -3062,6 +3972,7 @@ window.__ModuleLoader__.load({
               close: () => setSettingsOpen(false),
               navigate: setSettingsPage,
               toggleSpeak,
+              toggleTtsBackend,
               chooseRedemptionMs,
               chooseWorkspaceColor: (workspaceId, color, delayMs) => {
                 if (memory !== undefined && memory !== null) void memory.setColor(workspaceId, color, delayMs);
@@ -3109,6 +4020,7 @@ window.__ModuleLoader__.load({
                 openSettings: openSettingsPanel,
                 detach: () => { void detachDock(); },
                 stopTalking: () => { void stopTalking(); },
+                stopReading,
                 toggleSpeak,
               },
             });
@@ -3426,9 +4338,11 @@ window.__ModuleLoader__.load({
         ".dw-tag:focus-visible{outline:2px solid var(--dw-tag,var(--dsw-alias-state-business-primary,#4176e6));outline-offset:2px}",
         ".dw-tag-text{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}",
 
-        // ---- the workspace dot before a dispatched session's sidebar row ----
-        ".dw-ws-dot-cell{display:inline-flex;align-items:center;justify-content:center;width:16px;height:16px;flex:none}",
-        ".dw-ws-dot{display:block;width:8px;height:8px;border-radius:50%;corner-shape:round;background:var(--dw-tag);box-shadow:0 0 0 1px color-mix(in srgb,var(--dw-tag) 70%,#000)}",
+        // ---- the workspace folder's own color ----
+        // The color rides `--dw-ws-folder` on the Host's folder row, so the
+        // sidebar keeps one palette: `color-mix` pulls the workspace hue into
+        // the theme's own label color, which keeps the title readable on the
+        // light and the dark surface alike. No literal color is written here.
 
         // ---- settings: workspace colors ----
         ".dw-ws-row{display:flex;flex-direction:column;gap:8px;padding:10px 14px}",
@@ -3452,7 +4366,7 @@ window.__ModuleLoader__.load({
     function installStyles() {
       const style = document.createElement("style");
       style.dataset.dshPlugin = "discipline-whale";
-      style.textContent = [dockStyles(), reportRowStyles()].join("\n");
+      style.textContent = [dockStyles(), reportRowStyles(), folderStyles()].join("\n");
       document.head.appendChild(style);
       return () => style.remove();
     }
@@ -3472,7 +4386,13 @@ window.__ModuleLoader__.load({
     const MEMORY_REPORTS_ROUTE = "/api/discipline-whale/memory/reports";
     // Copied from activity.js PALETTE (the server's default workspace colors);
     // the browser half is a plain script and cannot import it.
-    const WORKSPACE_PALETTE = ["#3B82F6", "#10B981", "#F59E0B", "#EF4444", "#8B5CF6", "#EC4899", "#14B8A6", "#F97316"];
+    // Morandi: low saturation, greyed, and never red or orange — red is the
+    // harness's warning color, so it cannot double as a workspace tint. Each
+    // value clears 3:1 as a raw swatch on the light and the dark sidebar (the
+    // menu chips and the whale logo paint the raw color) and 4.5:1 once mixed
+    // into the theme label at 60% (the folder title). Measured in Chromium;
+    // test/palette-morandi.mjs pins the hue ban and those ratios.
+    const WORKSPACE_PALETTE = ["#6E7E91", "#678187", "#63827E", "#648371", "#668364", "#748162", "#8F7398", "#81779D"];
     const WORKSPACE_COLOR_PATTERN = /^#[0-9a-fA-F]{6}$/;
     // Turn tails of one page load mount together; one tags request serves them.
     const TAGS_COALESCE_MS = 300;
@@ -3483,7 +4403,6 @@ window.__ModuleLoader__.load({
     // for the pointer to rest. Palette clicks post at once.
     const COLOR_POST_DELAY_MS = 250;
     const TAG_TAIL_ORDER = 30;
-    const SESSION_DOT_ORDER = 20;
     const NEW_MAIN_ORDER = 40;
 
     /** The error text of a failed JSON answer: `{ error }` as a string or as `{ message | code }`. */
@@ -3894,8 +4813,8 @@ window.__ModuleLoader__.load({
         // The bubble paint. A row without an origin carries no attribute, so
         // it keeps exactly the background the Host drew.
         "[data-dw-report-origin] [class*=_bubble]{",
-        "background:color-mix(in srgb,var(--dw-msg-ws,transparent) 14%,var(--dsw-specific-bubble,var(--dsw-alias-bg-base,transparent)));",
-        "box-shadow:inset 0 0 0 1px color-mix(in srgb,var(--dw-msg-ws,transparent) 38%,transparent);",
+        "background:color-mix(in srgb,var(--dw-msg-ws,transparent) var(--dw-bubble-tint,20%),var(--dsw-specific-bubble,var(--dsw-alias-bg-base,transparent)));",
+        "box-shadow:inset 0 0 0 1px color-mix(in srgb,var(--dw-msg-ws,transparent) var(--dw-bubble-ring,55%),transparent);",
         "}",
         // An unknown origin: a neutral tag and no tint at all.
         "[data-dw-report-origin][data-dw-ws-unknown]::before{",
@@ -3903,6 +4822,12 @@ window.__ModuleLoader__.load({
         "}",
         "[data-dw-report-origin][data-dw-ws-unknown] [class*=_bubble]{background:revert;box-shadow:revert}",
         // A user turn that dispatched: the same tag, on the row that caused it.
+        // The tint rides `data-dw-turn-bubble`, an attribute this package puts
+        // on the bubble itself, so a renamed CSS module cannot silently turn
+        // the paint off: `markRowBubble` is the one place that knows the class
+        // convention, and the fallback descendant selector below keeps the
+        // paint working for a row whose bubble was not marked (an older pass, or
+        // a bubble the row grew after the mark).
         "[data-dw-turn-ws]{position:relative}",
         "[data-dw-turn-ws]::before{",
         "content:attr(data-dw-ws-tag);",
@@ -3911,10 +4836,25 @@ window.__ModuleLoader__.load({
         "color:var(--dsw-alias-label-tertiary,var(--dw-fg-3));",
         "background-image:radial-gradient(circle at calc(100% - 3.5px) 50%,var(--dw-msg-ws,currentColor) 0 3.5px,transparent 3.5px);",
         "}",
-        "[data-dw-turn-ws] [class*=_bubble]{",
-        "background:color-mix(in srgb,var(--dw-msg-ws,transparent) 14%,var(--dsw-specific-bubble,var(--dsw-alias-bg-base,transparent)));",
-        "box-shadow:inset 0 0 0 1px color-mix(in srgb,var(--dw-msg-ws,transparent) 38%,transparent);",
+        "[data-dw-turn-bubble],[data-dw-turn-ws] [class*=_bubble]{",
+        "background:color-mix(in srgb,var(--dw-msg-ws,transparent) var(--dw-bubble-tint,20%),var(--dsw-specific-bubble,var(--dsw-alias-bg-base,transparent)));",
+        "box-shadow:inset 0 0 0 1px color-mix(in srgb,var(--dw-msg-ws,transparent) var(--dw-bubble-ring,55%),transparent);",
         "}",
+        // The clickable tag. The `::before` label above says which workspace a
+        // turn went to; these buttons are what a reader clicks to go there. The
+        // label stays even when the buttons are missing, so nothing regresses
+        // on a Host where the mount finds no place to put them.
+        "[data-dw-turn-chips]{display:flex;flex-wrap:wrap;gap:6px;justify-content:flex-end;margin:0 0 4px;padding-right:2px}",
+        "[data-dw-turn-chip]{display:inline-flex;align-items:center;height:20px;padding:0 8px;border-radius:999px;corner-shape:round;",
+        "font:inherit;font-size:11px;line-height:1;font-weight:600;cursor:pointer;",
+        "color:var(--dw-tag-fg,var(--dsw-alias-label-primary,var(--dw-fg)));",
+        "background:color-mix(in srgb,var(--dw-tag,transparent) 18%,transparent);",
+        "border:1px solid color-mix(in srgb,var(--dw-tag,currentColor) 45%,transparent);",
+        "}",
+        "[data-dw-turn-chip]:hover{background:color-mix(in srgb,var(--dw-tag,transparent) 30%,transparent)}",
+        "[data-dw-turn-chip]:focus-visible{outline:2px solid var(--dw-tag,var(--dw-accent));outline-offset:1px}",
+        "[data-dw-turn-chip][data-dw-inert]{cursor:default;opacity:.55;border-style:dashed}",
+        "@media (prefers-reduced-motion:no-preference){[data-dw-turn-chip]{transition:background-color .12s ease}}",
       ].join("\n");
     }
 
@@ -3928,7 +4868,7 @@ window.__ModuleLoader__.load({
      *
      * @returns {() => void} teardown
      */
-    function watchReportRows({ t, store, reports } = {}) {
+    function watchReportRows({ t, store, reports, open } = {}) {
       if (typeof document === "undefined") return () => {};
       const decorate = (scope) => {
         // Both passes are decoration: a failed one must never break the
@@ -3939,7 +4879,7 @@ window.__ModuleLoader__.load({
           // ignore: a row that fails to paint keeps the Host's own styling
         }
         try {
-          decorateTurnTags(scope, { t, store });
+          decorateTurnTags(scope, { t, store, open });
         } catch (_error) {
           // ignore: same
         }
@@ -4015,7 +4955,7 @@ window.__ModuleLoader__.load({
      *
      * @returns {number} how many rows this pass claimed
      */
-    function decorateTurnTags(scope, { t, store } = {}) {
+    function decorateTurnTags(scope, { t, store, open } = {}) {
       if (scope === null || typeof scope.querySelectorAll !== "function") return 0;
       const snapshot = store === undefined ? undefined : store.getSnapshot();
       // The tags of a turn are read once the turn closes, so the store is the
@@ -4025,8 +4965,15 @@ window.__ModuleLoader__.load({
       const rows = scope.querySelectorAll('[data-chat-flow-kind="user"]:not([data-dw-turn-ws])');
       let claimed = 0;
       for (const row of rows) {
-        const turn = Number.parseInt(row.getAttribute?.("data-chat-turn") ?? "", 10);
-        if (!Number.isInteger(turn)) continue;
+        const turn = turnOfUserRow(row);
+        // Nothing on the row identified its turn: the Host renamed or removed
+        // the anchor this pass knows about. Skip the row — the transcript must
+        // keep rendering — but say so once per page, because a silence here is
+        // exactly how this feature died the first time.
+        if (!Number.isInteger(turn)) {
+          noteUnplacedRow(row);
+          continue;
+        }
         const record = snapshot?.tags?.[snapshot?.mainSessionId]?.[turn];
         // Ask for this turn's tags: a pass that runs before they land paints
         // nothing, and the store's next publish repaints the row.
@@ -4047,11 +4994,441 @@ window.__ModuleLoader__.load({
         row.setAttribute("data-dw-turn-ws", "");
         if (first !== undefined && WORKSPACE_COLOR_PATTERN.test(String(first.color))) {
           row.style.setProperty("--dw-msg-ws", first.color);
+          // The tint share is per hue: a pale one needs more of itself before
+          // the eye sees it, which is why a fixed 14% read as "no color".
+          const paint = turnBubblePaint(first.color, themePaintOf(row));
+          row.style.setProperty("--dw-bubble-tint", `${paint.tint}%`);
+          row.style.setProperty("--dw-bubble-ring", `${paint.ring}%`);
         }
         row.setAttribute("data-dw-ws-tag", t === undefined ? named.join(" · ") : t("tagTurnOrigin", { titles: named.join(" · ") }));
+        // The bubble the stylesheet has to tint, marked rather than assumed:
+        // the tint used to ride a `[class*=_bubble]` descendant selector, which
+        // a renamed CSS module silently stops matching.
+        markRowBubble(row);
+        // The clickable tag. `::before` alone was a label with no way to act on
+        // it; this is a real button, mounted beside the bubble.
+        mountTurnChip(row, { t, snapshot, record, ids, open });
         claimed += 1;
       }
       return claimed;
+    }
+
+    /**
+     * The turn a user row belongs to, from whatever identity the Host exposes.
+     *
+     * This used to read `data-chat-turn` and nothing else. The Host stopped
+     * writing that attribute in the better-display era, `Number.parseInt(null)`
+     * returned NaN, and every row fell out of the pass — the feature was
+     * completely dead while looking installed. The anchors below are tried in
+     * order of reliability, and each was read off a live page (2026-10-24,
+     * DSH 0.6.x + better-display 0.3.11):
+     *
+     *   1. `data-chat-turn`                   — the original marker, if present
+     *   2. `data-reader-turn` on the nearest
+     *      enclosing `[data-reader-turn]`     — the turn section, e.g. "54"
+     *   3. `data-chat-flow-key` / `-node-key` /
+     *      `-anchor-key` / `data-reader-key`  — `"<turn>:<kind><id>"`
+     *
+     * The section is deliberately tried BEFORE the flow key, against the
+     * obvious reading of the key. Measured on a live page: every user row's
+     * key starts with `13:` — `13` is a flow format number, not a turn — while
+     * the enclosing sections read 54, 55, 56, 60 … 65. Ranking the key first
+     * gave every row `turn 13`, so all chips pointed at the one session turn 13
+     * dispatched to, and the Host answered "Session reference is released" when
+     * one was clicked. The key remains as a fallback for a Host that writes no
+     * turn section, and the prefix is only trusted when no section disagrees.
+     *
+     * A row none of these can place returns `null`; callers skip it.
+     *
+     * @returns {number | null}
+     */
+    function turnOfUserRow(row) {
+      const read = (name) => {
+        const value = typeof row?.getAttribute === "function" ? row.getAttribute(name) : null;
+        return typeof value === "string" && value !== "" ? value : null;
+      };
+      const direct = Number.parseInt(read("data-chat-turn") ?? "", 10);
+      if (Number.isInteger(direct) && direct > 0) return direct;
+      // The turn section around the row: the one anchor the Host keeps in sync
+      // with what it is actually rendering.
+      const section = typeof row?.closest === "function" ? row.closest("[data-reader-turn]") : null;
+      const fromSection = Number.parseInt(section?.getAttribute?.("data-reader-turn") ?? "", 10);
+      if (Number.isInteger(fromSection) && fromSection > 0) return fromSection;
+      // No section: fall back to the row's own key, `"<turn>:<kind><id>"`.
+      for (const name of ["data-chat-flow-key", "data-chat-node-key", "data-chat-anchor-key", "data-reader-key"]) {
+        const value = read(name);
+        if (value === null) continue;
+        const match = /^(\d+):/.exec(value);
+        if (match !== null) {
+          const turn = Number.parseInt(match[1], 10);
+          if (Number.isInteger(turn) && turn > 0) return turn;
+        }
+      }
+      return null;
+    }
+
+    /**
+     * Say once, on the console, that the turn anchors were not found.
+     *
+     * Silence is how the previous breakage survived four releases. One warning
+     * per page is enough to make the next one visible without flooding a
+     * transcript that re-renders constantly; it names the attributes that were
+     * looked for so the next reader knows what to re-anchor on.
+     */
+    let unplacedRowWarned = false;
+    function noteUnplacedRow(row) {
+      if (unplacedRowWarned || typeof console === "undefined") return;
+      unplacedRowWarned = true;
+      const cls = typeof row?.className === "string" && row.className !== "" ? row.className : "(no class)";
+      console.warn(
+        "[discipline-whale] turn tag skipped: no turn identity on a user row. Looked for data-chat-turn, " +
+        "data-chat-flow-key/data-chat-node-key/data-chat-anchor-key/data-reader-key (\"<turn>:\" prefix), " +
+        `and an enclosing [data-reader-turn]. Row class: ${cls}`,
+      );
+    }
+
+    /** The bubble element of one user row, by the CSS-modules class convention. */
+    function bubbleOfRow(row) {
+      if (typeof row?.querySelector !== "function") return null;
+      return row.querySelector('[class*="_bubble"]');
+    }
+
+    /**
+     * The two theme colors a bubble tint is mixed against, read from the row.
+     *
+     * Reading them instead of hard-coding is what keeps the tint correct in the
+     * light and the dark theme: the same workspace hue has to read on a white
+     * bubble and on a `#2c2c2e` one.
+     *
+     * @param {Element} row the decorated row
+     * @returns {{ bubble?: string, surface?: string }}
+     */
+    function themePaintOf(row) {
+      if (typeof getComputedStyle !== "function" || row === null || row === undefined) return {};
+      const read = (property) => {
+        try {
+          const value = getComputedStyle(row).getPropertyValue(property).trim();
+          return WORKSPACE_COLOR_PATTERN.test(value) ? value : undefined;
+        } catch (_error) {
+          return undefined;
+        }
+      };
+      return {
+        bubble: read("--dsw-specific-bubble") ?? read("--dsw-alias-bg-base"),
+        surface: read("--dsw-alias-bg-base") ?? read("--dsw-alias-bg-layout"),
+      };
+    }
+
+    /** WCAG relative luminance of a #RRGGBB color. */
+    function luminanceOf(hex) {
+      const channel = (offset) => {
+        const value = Number.parseInt(String(hex).slice(offset, offset + 2), 16) / 255;
+        return value <= 0.03928 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4;
+      };
+      return 0.2126 * channel(1) + 0.7152 * channel(3) + 0.0722 * channel(5);
+    }
+
+    /** WCAG contrast ratio between two #RRGGBB colors. */
+    function contrastOf(a, b) {
+      const [high, low] = [luminanceOf(a), luminanceOf(b)].sort((x, y) => y - x);
+      return (high + 0.05) / (low + 0.05);
+    }
+
+    /**
+     * The theme's label color as the page actually paints it.
+     *
+     * Read rather than assumed: the folder title is mixed toward this value, so
+     * a hard-coded dark ink would be wrong on the dark theme.
+     *
+     * @param {Element} row any element on the page
+     * @returns {string} a `#RRGGBB` label color
+     */
+    function themeLabelOf(row) {
+      if (typeof getComputedStyle !== "function" || row === null || row === undefined) return "#0F1115";
+      for (const property of ["--dsw-alias-label-primary", "color"]) {
+        try {
+          const value = property === "color" ? getComputedStyle(row).color : getComputedStyle(row).getPropertyValue(property).trim();
+          const rgb = String(value).match(/^rgba?\((\d+),\s*(\d+),\s*(\d+)/);
+          if (rgb !== null) {
+            const hex = `#${[rgb[1], rgb[2], rgb[3]].map((part) => Number(part).toString(16).padStart(2, "0")).join("")}`.toUpperCase();
+            if (WORKSPACE_COLOR_PATTERN.test(hex)) return hex;
+          }
+        } catch (_error) {
+          // Try the next source.
+        }
+      }
+      return "#0F1115";
+    }
+
+    /**
+     * The sidebar surface behind a row: the first painted background above it.
+     *
+     * The logo's contrast is against what is actually behind it, not against a
+     * theme constant, so this walks up until it finds an opaque color.
+     *
+     * @param {Element} row a sidebar row
+     * @returns {string} a `#RRGGBB` surface, or the page background
+     */
+    function sidebarSurfaceOf(row) {
+      if (typeof getComputedStyle !== "function" || row === null || row === undefined) return "#FFFFFF";
+      let element = row;
+      while (element !== null && element !== undefined) {
+        try {
+          const value = getComputedStyle(element).backgroundColor;
+          const rgb = String(value).match(/^rgba?\((\d+),\s*(\d+),\s*(\d+)(?:,\s*([\d.]+))?\)$/);
+          if (rgb !== null && (rgb[4] === undefined || Number(rgb[4]) > 0.9)) {
+            const hex = `#${[rgb[1], rgb[2], rgb[3]].map((part) => Number(part).toString(16).padStart(2, "0")).join("")}`;
+            if (WORKSPACE_COLOR_PATTERN.test(hex)) return hex.toUpperCase();
+          }
+        } catch (_error) {
+          // A detached node: keep walking, the root still has a color.
+        }
+        element = element.parentElement;
+      }
+      try {
+        const page = getComputedStyle(document.body).backgroundColor;
+        const rgb = String(page).match(/^rgba?\((\d+),\s*(\d+),\s*(\d+)/);
+        if (rgb !== null) {
+          return `#${[rgb[1], rgb[2], rgb[3]].map((part) => Number(part).toString(16).padStart(2, "0")).join("")}`.toUpperCase();
+        }
+      } catch (_error) { /* no document */ }
+      return "#FFFFFF";
+    }
+
+    /**
+     * The folder title's ink: the workspace hue mixed toward the theme label.
+     *
+     * The stylesheet has always mixed 60% of the hue into
+     * `--dsw-alias-label-primary`, which is correct on a LIGHT sidebar (the
+     * label is dark ink, so the mix darkens) and wrong on a DARK one: there the
+     * label is light, the mix lightens, and 60% toward a light label produced
+     * `color(srgb 0.633 0.696 0.711)` on `#1B1B1C` — measured 1.22:1, which is
+     * unreadable, on a page whose decoration otherwise worked.
+     *
+     * So the share is a search, not a constant: start at 60% and walk toward
+     * the label and back toward the raw hue until the AA 4.5:1 floor is met,
+     * preferring the value closest to 60% because that is the look that was
+     * designed. A hue that cannot reach AA at any share falls back to the label
+     * itself: a readable title in the theme's own ink beats a colored one
+     * nobody can read.
+     *
+     * @param {string} color the workspace hue, `#RRGGBB`
+     * @param {string} surface the sidebar background, `#RRGGBB`
+     * @param {string} [label] the theme's label color
+     * @returns {{ color: string, share: number, ratio: number, fallback: boolean }}
+     */
+    function folderTitlePaint(color, surface, label = '#0F1115') {
+      const hue = WORKSPACE_COLOR_PATTERN.test(String(color)) ? String(color).toUpperCase() : null;
+      const back = WORKSPACE_COLOR_PATTERN.test(String(surface)) ? String(surface).toUpperCase() : null;
+      const ink = WORKSPACE_COLOR_PATTERN.test(String(label)) ? String(label).toUpperCase() : '#0F1115';
+      if (hue === null || back === null) return { color: color ?? 'currentColor', share: 60, ratio: null, fallback: true };
+      const floor = 4.5;
+      let best = null;
+      // The designed look first, then outward in both directions.
+      for (let step = 0; step <= 9; step += 1) {
+        for (const share of step === 0 ? [60] : [60 + step * 4, 60 - step * 4]) {
+          if (share < 0 || share > 96) continue;
+          const mixed = mixHex(hue, ink, share / 100);
+          const ratio = contrastOf(mixed, back);
+          if (ratio >= floor) return { color: mixed, share, ratio: Number(ratio.toFixed(2)), fallback: false };
+          if (best === null || ratio > best.ratio) best = { color: mixed, share, ratio };
+        }
+      }
+      return {
+        color: ink,
+        share: 100,
+        ratio: Number(contrastOf(ink, back).toFixed(2)),
+        fallback: true,
+      };
+    }
+
+    /**
+     * The color the whale logo is painted in, for a sidebar of a given surface.
+     *
+     * The logo is a MASK painted with `background-color`, so the value used
+     * here *is* the visible ink. A workspace hue that is too close to the
+     * sidebar surface disappears (a grey-green on a near-black dark sidebar is
+     * a smudge), so the hue is mixed toward the theme's label color until it
+     * clears the 3:1 graphic floor. The hue is kept recognisable: the mix starts
+     * at the raw color and only moves as far as the floor requires.
+     *
+     * @param {string} color the workspace hue, `#RRGGBB`
+     * @param {string} surface the sidebar's own background, `#RRGGBB`
+     * @param {string} [label] the theme's label color to mix toward
+     * @returns {{ color: string, ratio: number, mixed: boolean }}
+     */
+    function whaleLogoPaint(color, surface, label = "#0f1115") {
+      const hue = WORKSPACE_COLOR_PATTERN.test(String(color)) ? String(color).toUpperCase() : null;
+      const back = WORKSPACE_COLOR_PATTERN.test(String(surface)) ? String(surface).toUpperCase() : null;
+      const ink = WORKSPACE_COLOR_PATTERN.test(String(label)) ? String(label).toUpperCase() : "#0F1115";
+      if (hue === null || back === null) return { color: color ?? "currentColor", ratio: null, mixed: false };
+      const raw = contrastOf(hue, back);
+      if (raw >= 3) return { color: hue, ratio: Number(raw.toFixed(2)), mixed: false };
+      // Walk the hue toward the label color until it clears the floor. 6 steps
+      // of 10% is plenty: the floor is a small distance, not a different color.
+      let mixedColor = hue;
+      let ratio = raw;
+      for (let share = 10; share <= 90; share += 10) {
+        mixedColor = mixHex(hue, ink, share / 100);
+        ratio = contrastOf(mixedColor, back);
+        if (ratio >= 3) return { color: mixedColor, ratio: Number(ratio.toFixed(2)), mixed: true };
+      }
+      // A surface the whole palette is invisible on: use the label color and be
+      // readable rather than colorful-but-unreadable.
+      return { color: ink, ratio: Number(contrastOf(ink, back).toFixed(2)), mixed: true };
+    }
+
+    /** Linear blend of two #RRGGBB colors, `share` of `b`. */
+    function mixHex(a, b, share) {
+      const parse = (hex, offset) => Number.parseInt(String(hex).slice(offset, offset + 2), 16);
+      const channel = (offset) => {
+        const value = Math.round(parse(a, offset) * (1 - share) + parse(b, offset) * share);
+        return Math.max(0, Math.min(255, value)).toString(16).padStart(2, "0");
+      };
+      return `#${channel(1)}${channel(3)}${channel(5)}`.toUpperCase();
+    }
+
+    /**
+     * How strongly a workspace hue tints its bubble.
+     *
+     * The tint is what makes "this went to that workspace" readable at a
+     * glance. It used to be a flat 14%, which measured as `#dce3e8` on the
+     * Host's default blue bubble — a two-point shift the eye reads as "no
+     * color at all", which is exactly how the feature was reported as broken
+     * while the code was demonstrably running.
+     *
+     * The share is therefore chosen per hue, not fixed: a pale hue needs more
+     * of itself to be visible, a dark one less, and the result must keep the
+     * bubble distinguishable from BOTH the Host's own bubble and the page.
+     * The floor is a measured perceptible difference; the ceiling is where a
+     * hue stops reading as a tint and starts reading as a fill.
+     *
+     * @param {string} color the workspace hue, `#RRGGBB`
+     * @param {object} [theme] `bubble` and `surface`, both `#RRGGBB`
+     * @returns {{ tint: number, ring: number, border: string }} a percentage,
+     *   the ring share, and the border color for the stylesheet
+     */
+    function turnBubblePaint(color, theme = {}) {
+      const hue = WORKSPACE_COLOR_PATTERN.test(String(color)) ? String(color) : null;
+      if (hue === null) return { tint: 0, ring: 0, border: "transparent" };
+      const bubble = WORKSPACE_COLOR_PATTERN.test(String(theme.bubble)) ? String(theme.bubble) : "#edf3fe";
+      const surface = WORKSPACE_COLOR_PATTERN.test(String(theme.surface)) ? String(theme.surface) : "#ffffff";
+      // How far the hue already is from the bubble decides how much is needed:
+      // a hue close to the Host's blue needs more of itself to separate.
+      const distance = Math.abs(luminanceOf(hue) - luminanceOf(bubble));
+      const tint = Math.round(Math.min(30, Math.max(18, 18 + distance * 90)));
+      // The border is the affordance that survives a very pale tint, so it is
+      // always stronger than the fill.
+      const ring = Math.round(Math.min(70, tint + 25));
+      // A hue used as a 1px line must clear the 3:1 graphic floor against the
+      // surface; a palette color that cannot is not used as a border at all.
+      const border = contrastOf(hue, surface) >= 1.6 ? hue : "currentColor";
+      return { tint, ring, border };
+    }
+
+    /**
+     * Mark the bubble so the stylesheet paints it.
+     *
+     * The old rule reached the bubble through `[data-dw-turn-ws] [class*=_bubble]`,
+     * which couples the paint to the Host's class naming. Marking the element
+     * itself means the rule is `[data-dw-turn-bubble]` — one attribute the Host
+     * never diffs — and the class convention is consulted in one place only.
+     */
+    function markRowBubble(row) {
+      const bubble = bubbleOfRow(row);
+      if (bubble === null || typeof bubble.setAttribute !== "function") return null;
+      if (bubble.hasAttribute?.("data-dw-turn-bubble") !== true) bubble.setAttribute("data-dw-turn-bubble", "");
+      return bubble;
+    }
+
+    /**
+     * Mount the clickable tag of one claimed row.
+     *
+     * The `::before` tag is a label with no DOM behind it, so it cannot be
+     * clicked, focused, or read by a screen reader. This mounts a real button
+     * next to the bubble that names the workspace and opens its session for
+     * this turn. It is plain DOM, not React: the transcript belongs to the
+     * Host, and a node React did not create must not appear in its tree — the
+     * chip therefore mounts into the row's own cluster cell, marked
+     * `data-dw-turn-chip`, and is skipped once present.
+     *
+     * A destructive re-render can drop it; the next observer pass mounts a new
+     * one, because the marker attribute went with the old node.
+     *
+     * Failure modes: no `document` (a non-browser pass) mounts nothing; a row
+     * with no session for the workspace still gets a chip, marked inert, so
+     * the reader learns the workspace without a dead-looking button.
+     *
+     * @returns {number} how many chips this row now has
+     */
+    function mountTurnChip(row, { t, snapshot, record, ids, open } = {}) {
+      if (typeof document === "undefined" || typeof row?.appendChild !== "function") return 0;
+      const list = Array.isArray(ids) ? ids : [];
+      if (list.length === 0) return 0;
+      // Idempotent: the attribute is the claim, and it dies with the node.
+      if (typeof row.querySelector === "function" && row.querySelector("[data-dw-turn-chip]") !== null) return list.length;
+      const host = document.createElement("div");
+      host.setAttribute("data-dw-turn-chips", "");
+      for (const workspaceId of list) {
+        const workspace = workspaceOf(snapshot, workspaceId);
+        const title = typeof workspace?.title === "string" && workspace.title !== "" ? workspace.title : workspaceId;
+        const sessions = Array.isArray(record?.sessions?.[workspaceId])
+          ? record.sessions[workspaceId].filter((sessionId) => typeof sessionId === "string" && sessionId !== "")
+          : [];
+        // The latest session this turn sent to the workspace.
+        const target = sessions.length > 0 ? sessions[sessions.length - 1] : null;
+        const label = target === null
+          ? (t === undefined ? `${title} (no session)` : t("tagNoSession", { title }))
+          : (t === undefined ? `Open the ${title} session` : t("tagOpen", { title }));
+        const chip = document.createElement("button");
+        chip.setAttribute("type", "button");
+        chip.setAttribute("data-dw-turn-chip", "");
+        chip.setAttribute("data-dw-workspace", workspaceId);
+        chip.className = "dw-tag";
+        chip.textContent = title;
+        chip.title = label;
+        chip.setAttribute("aria-label", label);
+        if (workspace !== undefined && WORKSPACE_COLOR_PATTERN.test(String(workspace.color))) {
+          chip.style.setProperty("--dw-tag", workspace.color);
+          chip.style.setProperty("--dw-tag-fg", readableTextOn(workspace.color));
+        }
+        if (target === null) {
+          chip.setAttribute("data-dw-inert", "");
+          chip.disabled = true;
+          chip.setAttribute("aria-disabled", "true");
+        } else {
+          chip.setAttribute("data-dw-session", target);
+          chip.addEventListener("click", () => {
+            if (typeof open === "function") {
+              open(target);
+              return;
+            }
+            // No opener handed in: leave the id on the clipboard rather than
+            // pretend the click navigated somewhere.
+            copySessionId(target);
+          });
+        }
+        host.appendChild(chip);
+      }
+      row.appendChild(host);
+      return list.length;
+    }
+
+    /**
+     * The fallback action of a chip with no opener: put the session id where a
+     * person can paste it.
+     *
+     * Used only when `ctx.uiWorkspace.openSession` is not on the context (an
+     * older Host, or a page whose workspace capability did not mount). Nothing
+     * here claims a navigation happened.
+     */
+    function copySessionId(sessionId) {
+      try {
+        const clipboard = typeof navigator === "undefined" ? undefined : navigator.clipboard;
+        if (typeof clipboard?.writeText === "function") void clipboard.writeText(sessionId);
+      } catch (_error) {
+        // A refused clipboard write leaves the id in the chip's own tooltip.
+      }
     }
 
     /**
@@ -4093,16 +5470,86 @@ window.__ModuleLoader__.load({
       return h("div", { className: "dw-tags", "data-dw-turn": turn.turn }, chips);
     }
 
-    /** The sidebar dot of one session: present only for a session the whale dispatched to a known workspace. */
-    function sessionDotView(input) {
-      const workspaceId = input.snapshot.dispatched?.[input.sessionId];
-      if (typeof workspaceId !== "string") return null;
-      const workspace = workspaceOf(input.snapshot, workspaceId);
-      if (workspace === undefined) return null;
-      const title = typeof workspace.title === "string" && workspace.title !== "" ? workspace.title : workspaceId;
-      const label = input.t("workspaceDot", { title });
-      return h("span", { className: "dw-ws-dot-cell", "data-dw-workspace": workspaceId, title: label },
-        h("i", { className: "dw-ws-dot", role: "img", "aria-label": label, style: tagStyle(workspace.color) }));
+    /**
+     * The custom properties that paint a workspace's folder row.
+     *
+     * The color goes out as `--dw-ws-folder` rather than as a background: the
+     * Host owns that row's geometry, and the sidebar's own label color is what
+     * stays readable, so the workspace hue only has to tint it. An unreadable
+     * value paints nothing, which leaves the row exactly as the Host drew it.
+     *
+     * @param {{ color?: string } | undefined} workspace
+     * @returns {Record<string, string> | undefined}
+     */
+    function folderPaint(workspace) {
+      const color = workspace?.color;
+      if (typeof color !== "string" || !WORKSPACE_COLOR_PATTERN.test(color)) return undefined;
+      return { "--dw-ws-folder": color };
+    }
+
+    /**
+     * The stylesheet half of the folder color, installed beside the dock so a
+     * color change is one custom property away from repainting.
+     *
+     * Each rule waits for `--dw-ws-folder`, so a folder without a color keeps
+     * the Host's own text color. `color-mix` blends the workspace hue into the
+     * theme's label color: 60% of the hue keeps the workspace recognizable
+     * while every palette color still clears WCAG AA (4.5:1) as body text on
+     * the light and the dark surface — measured in Chromium, the worst case is
+     * #F59E0B on white at 4.93:1. A higher share reads more strongly but drops
+     * that pair to 3.74:1, so 60% is the ceiling for a title.
+     *
+     * @returns {string} CSS
+     */
+    function folderStyles() {
+      return [
+        // The folder glyph and the workspace title, in the workspace color.
+        '[data-row-key^="workspace:"][data-dw-ws-folder] [class*=_title]{',
+        // `--dw-folder-ink` is the AA-checked mix (60% toward the label when
+        // that reads, adjusted when it does not); the color-mix stays as the
+        // fallback for a row an older pass painted.
+        "color:var(--dw-folder-ink,color-mix(in srgb,var(--dw-ws-folder) 60%,var(--dsw-alias-label-primary,var(--dw-fg))));",
+        "}",
+        '[data-row-key^="workspace:"][data-dw-ws-folder] [class*=_folder] svg{',
+        "color:color-mix(in srgb,var(--dw-ws-folder) 78%,var(--dsw-alias-label-primary,var(--dw-fg)));",
+        "}",
+        // A quiet underline in the same hue, so the row reads as "this color"
+        // even where the title is clipped short.
+        '[data-row-key^="workspace:"][data-dw-ws-folder] [class*=_projectText]{',
+        "background-image:linear-gradient(var(--dw-ws-folder),var(--dw-ws-folder));",
+        "background-repeat:no-repeat;background-position:0 100%;background-size:14px 2px;",
+        "padding-bottom:1px;",
+        "}",
+        // The "set color" row the folder menu gains: the Host's own menu row
+        // look, with a swatch of the workspace's current color.
+        // The stop-reading chip: the hanging-up glyph, in the warning hue, so
+        // "be quiet now" never reads as the neutral "done talking" chip beside it.
+        ".dw-chip.dw-stop-voice{display:inline-flex;align-items:center;gap:4px;",
+        // Theme variables only: a literal hex here would be wrong on one of the
+        // two themes, which is the rule this stylesheet already keeps.
+        "color:var(--dsw-alias-state-warning-primary,var(--dw-fg));",
+        "border-color:color-mix(in srgb,var(--dsw-alias-state-warning-primary,var(--dw-fg)) 45%,transparent);",
+        "background:color-mix(in srgb,var(--dsw-alias-state-warning-primary,var(--dw-fg)) 12%,transparent)}",
+        ".dw-chip.dw-stop-voice:hover{background:color-mix(in srgb,var(--dsw-alias-state-warning-primary,var(--dw-fg)) 22%,transparent)}",
+        ".dw-menu-item{display:flex;align-items:center;gap:8px;width:100%;padding:0 12px;height:28px;",
+        "font:inherit;font-size:13px;text-align:left;color:inherit;background:transparent;border:none;cursor:pointer}",
+        ".dw-menu-item:hover,.dw-menu-item:focus-visible{background:var(--dsw-alias-interactive-bg-hover,var(--dw-line))}",
+        ".dw-menu-item:focus-visible{outline:2px solid var(--dw-accent);outline-offset:-2px}",
+        ".dw-menu-swatch{flex:none;width:10px;height:10px;border-radius:50%;corner-shape:round;background:var(--dw-ws-folder,var(--dw-line))}",
+        // The picker the row opens: the palette, a custom color, and Done.
+        ".dw-color-pop{display:flex;flex-direction:column;gap:8px;padding:10px 12px;min-width:186px}",
+        ".dw-color-pop-title{font:inherit;font-size:12px;color:var(--dsw-alias-label-secondary,var(--dw-fg-2))}",
+        // The whale logo before a dispatched session's title.
+        "[data-row-key^=\"session:\"][data-dw-whale] [class*=_title]{display:flex;align-items:center;gap:6px}",
+        "[data-row-key^=\"session:\"][data-dw-whale] [class*=_title]::before{",
+        "content:'';flex:none;width:12px;height:12px;",
+        // `--dw-whale-ink` is the contrast-checked paint (raw hue when it clears
+        // 3:1, the hue mixed toward the label when it does not); the folder
+        // color stays the fallback so an older pass still shows something.
+        "background-color:var(--dw-whale-ink,var(--dw-ws-folder,var(--dsw-alias-state-business-primary,var(--dw-fg))));",
+        "-webkit-mask:var(--dw-whale-mask) center/contain no-repeat;mask:var(--dw-whale-mask) center/contain no-repeat;",
+        "}",
+      ].join("\n");
     }
 
     /**
@@ -4178,28 +5625,466 @@ window.__ModuleLoader__.load({
       };
     }
 
-    /** The `sidebar.session.row.leading` entry; `props.sessionId` is the row's session. */
-    function makeSessionDot(store, t) {
-      return function DisciplineWhaleSessionDot(props) {
-        const snapshot = React.useSyncExternalStore(store.subscribe, store.getSnapshot);
-        React.useEffect(() => {
-          store.requestDispatched(props.sessionId);
-          void store.loadWorkspaces(false);
-        }, [props.sessionId]);
-        return sessionDotView({ t, snapshot, sessionId: props.sessionId });
-      };
+    /**
+     * The third row of a folder's "..." menu: "set color".
+     *
+     * The Host owns that menu — it composes the rename and delete rows itself
+     * and offers no slot for a third — so this row is mounted into the open
+     * menu by `watchFolderMenus`. It is a plain button with the Host's own
+     * menu-row shape, marked so a re-render never doubles it.
+     *
+     * @param {{ t: (key: string, vars?: object) => string, color?: string }} input
+     */
+    function setColorMenuItem(input) {
+      const t = input.t;
+      return h("button", {
+        type: "button",
+        role: "menuitem",
+        className: "dw-menu-item",
+        "data-dw-menu-item": "color",
+        style: typeof input.color === "string" ? { "--dw-ws-folder": input.color } : undefined,
+      }, h("i", { className: "dw-menu-swatch", "aria-hidden": "true" }), h("span", null, t("workspaceSetColor")));
     }
 
-    // The page's one memory store, shared by the chips, the dots and the
-    // settings panel. `resolveMainSession` keeps its main session current.
+    /**
+     * The color picker a folder's "设置颜色" opens: the eight palette colors,
+     * a custom color input, and Done.
+     *
+     * `choose` is the store's own `setColor`, so a pick lands on the route and
+     * the `{ id, color }` field the settings section already writes. A palette
+     * click posts at once; the custom input is dragged, so it waits for the
+     * pointer to rest.
+     */
+    function workspaceColorPicker(input) {
+      const t = input.t;
+      const workspace = input.workspace;
+      const choose = typeof input.choose === "function" ? input.choose : () => {};
+      const close = typeof input.onClose === "function" ? input.onClose : () => {};
+      const current = typeof workspace?.color === "string" ? workspace.color.toUpperCase() : "";
+      const title = typeof workspace?.title === "string" && workspace.title !== "" ? workspace.title : String(workspace?.id ?? "");
+      const id = workspace?.id;
+      return h("div", { className: "dw-color-pop", role: "group", "aria-label": t("workspaceColorPicker", { title }), "data-dw-color-picker": String(id) },
+        h("span", { className: "dw-color-pop-title" }, t("workspaceColorPicker", { title })),
+        h("div", { className: "dw-ws-palette", role: "group", "aria-label": t("workspacePalette", { title }) },
+          WORKSPACE_PALETTE.map((color) => h("button", {
+            key: color,
+            type: "button",
+            className: "dw-ws-choice",
+            "data-dw-color": color,
+            "aria-pressed": color === current,
+            title: color,
+            "aria-label": t("workspacePaletteColor", { color }),
+            style: tagStyle(color),
+            onClick: () => choose(id, color, 0),
+          })),
+          h("input", {
+            type: "color",
+            className: "dw-ws-custom",
+            value: typeof workspace?.color === "string" ? workspace.color.toLowerCase() : "#000000",
+            title: t("workspaceCustomColorTitle"),
+            "aria-label": t("workspaceCustomColorTitle"),
+            onChange: (event) => choose(id, event.target.value, COLOR_POST_DELAY_MS),
+          })),
+        h("button", { type: "button", className: "dw-menu-item", "data-dw-color-done": "", onClick: close },
+          h("span", null, t("workspaceColorDone"))));
+    }
+
+    /**
+     * The logo and the workspace color before a whale-opened session's title.
+     *
+     * Rendered as the sidebar row's own leading content is not available to a
+     * plugin (that seat is the status dot), so this view is what the DOM paint
+     * mirrors: the whale glyph, tinted by the session's workspace. A session
+     * the whale did not dispatch gets `null` — the user's own sessions stay
+     * exactly as the Host drew them.
+     *
+     * @returns the prefix node, or null
+     */
+    function whalePrefix(input) {
+      const dispatched = input.snapshot?.dispatched;
+      const workspaceId = dispatched === null || dispatched === undefined ? undefined : dispatched[input.sessionId];
+      if (typeof workspaceId !== "string") return null;
+      const workspace = workspaceOf(input.snapshot, workspaceId);
+      if (workspace === undefined || !WORKSPACE_COLOR_PATTERN.test(workspace.color)) return null;
+      const label = input.t("whaleSession");
+      return h("span", {
+        className: "dw-whale",
+        "data-dw-whale": "",
+        role: "img",
+        title: label,
+        "aria-label": label,
+        style: { "--dw-ws-folder": workspace.color, "--dw-whale-mask": WHALE_MASK },
+      });
+    }
+
+    /**
+     * The whale glyph, as a mask so the logo takes the workspace color.
+     *
+     * The Host's sidebar rows are not a slot the plugin owns — a folder row
+     * has no extension seat, and the session's leading seat belongs to the
+     * status dot — so the two paints below are decoration, like the report
+     * rows: attributes and custom properties only, never nodes, which leaves
+     * the Host's reconciliation of that subtree untouched.
+     *
+     * @returns {string} a CSS `mask-image` value
+     */
+    const WHALE_MASK =
+      "url(\"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E" +
+      "%3Cpath d='M16 30c0-5 4-9 9-9h12c4 0 7 2 9 5l4-4v10l-4-4c-2 3-5 5-9 5H25c-5 0-9-4-9-9z' fill='%23000'/%3E" +
+      "%3Ccircle cx='24' cy='28' r='1.8' fill='%23fff'/%3E" +
+      "%3Cpath d='M30 39h16c2.5 0 4.5 2 4.5 4.5S48.5 48 46 48H30' fill='none' stroke='%23000' stroke-width='2.4' stroke-linecap='round'/%3E" +
+      "%3C/svg%3E\")";
+
+    /**
+     * The workspace a session row belongs to, by the Host's own row marker.
+     *
+     * A dispatched session is one the whale opened: the index the `dispatched`
+     * route serves is built from dispatch checkpoints and written reports, and
+     * those are written by the whale's dispatch tool, never by the user's own
+     * "new session". A session the user opened has no entry, so it stays
+     * unmarked — that is the whole rule.
+     *
+     * Failure modes: a dispatch whose checkpoint and report are both missing
+     * (an abandoned dispatch before the first checkpoint) is not marked; a
+     * session dispatched twice to different workspaces keeps the last one the
+     * index lists; and the mark appears only once the map has loaded.
+     *
+     * @returns {number} how many elements this pass painted
+     */
+    function decorateSidebarRows(scope, { store } = {}) {
+      if (scope === null || typeof scope.querySelectorAll !== "function") return 0;
+      const snapshot = store?.getSnapshot?.() ?? {};
+      const workspaces = Array.isArray(snapshot.workspaces) ? snapshot.workspaces : [];
+      // A folder row cannot be painted without the workspace list, and nothing
+      // else on this page loads it: a turn tag asks for it, but the sidebar is
+      // the first thing on screen and a reader may never open a tagged turn.
+      // Without this request `snapshot.workspaces` stayed `null` for the life
+      // of the page, every folder row fell through, and `data-dw-ws-folder`
+      // measured 0 on a live page — the second half of the same
+      // "installed but dead" bug as the turn tags.
+      if (snapshot.workspaces === null && typeof store?.loadWorkspaces === "function") void store.loadWorkspaces(true);
+      const byTitle = new Map();
+      for (const workspace of workspaces) {
+        const title = typeof workspace.title === "string" && workspace.title !== "" ? workspace.title : null;
+        if (title !== null) byTitle.set(title, workspace);
+      }
+      let painted = 0;
+      // Folder rows: the Host marks each one `workspace:<workspaceId>`, so the
+      // id comes from the DOM and the color from the store.
+      for (const row of scope.querySelectorAll('[data-row-key^="workspace:"]')) {
+        const key = row.getAttribute("data-row-key");
+        const workspaceId = typeof key === "string" ? key.slice("workspace:".length) : "";
+        const workspace = workspaces.find((candidate) => candidate.id === workspaceId);
+        const paint = folderPaint(workspace);
+        // A row the whale cannot color is left exactly as the Host drew it,
+        // including one that used to carry a color.
+        if (paint === undefined) {
+          if (row.hasAttribute?.("data-dw-ws-folder") === true) {
+            row.removeAttribute("data-dw-ws-folder");
+            row.style?.removeProperty?.("--dw-ws-folder");
+          }
+          continue;
+        }
+        if (row.getAttribute("data-dw-ws-folder") === workspace.color) continue;
+        row.setAttribute("data-dw-ws-folder", workspace.color);
+        row.style?.setProperty?.("--dw-ws-folder", workspace.color);
+        // The title's ink is resolved, not fixed: the 60% mix reads on a light
+        // sidebar and measured 1.22:1 on a dark one, so the share (and, when no
+        // share clears AA, the ink itself) comes from the row's own surface.
+        const title = folderTitlePaint(workspace.color, sidebarSurfaceOf(row), themeLabelOf(row));
+        row.style?.setProperty?.("--dw-folder-ink", title.color);
+        row.setAttribute("title", workspace.title ?? workspaceId);
+        painted += 1;
+      }
+      // Session rows of a whale dispatch: the logo and the workspace color.
+      const dispatched = snapshot.dispatched;
+      for (const row of scope.querySelectorAll('[data-row-key^="session:"]')) {
+        const key = row.getAttribute("data-row-key");
+        const sessionId = typeof key === "string" ? key.slice("session:".length) : "";
+        const workspaceId = dispatched === null || dispatched === undefined ? undefined : dispatched[sessionId];
+        const workspace = typeof workspaceId === "string" ? workspaces.find((candidate) => candidate.id === workspaceId) : undefined;
+        if (workspace === undefined || !WORKSPACE_COLOR_PATTERN.test(workspace.color)) {
+          if (row.hasAttribute?.("data-dw-whale") === true) {
+            row.removeAttribute("data-dw-whale");
+            row.style?.removeProperty?.("--dw-ws-folder");
+            row.style?.removeProperty?.("--dw-whale-mask");
+          }
+          continue;
+        }
+        // The logo is a mask painted with `background-color`, so the hue IS the
+        // ink: on a dark sidebar a grey-green hue can vanish. The paint is
+        // resolved against the row's real surface and keeps the hue only as far
+        // as the 3:1 graphic floor allows.
+        const paint = whaleLogoPaint(workspace.color, sidebarSurfaceOf(row));
+        if (row.getAttribute("data-dw-whale") === paint.color) continue;
+        row.setAttribute("data-dw-whale", paint.color);
+        row.style?.setProperty?.("--dw-ws-folder", workspace.color);
+        row.style?.setProperty?.("--dw-whale-ink", paint.color);
+        row.style?.setProperty?.("--dw-whale-mask", WHALE_MASK);
+        const title = typeof workspace.title === "string" && workspace.title !== "" ? workspace.title : workspaceId;
+        row.setAttribute("data-dw-whale-label", title);
+        painted += 1;
+      }
+      return painted;
+    }
+
+    /**
+     * Keep the sidebar rows painted as the Host renders them.
+     *
+     * The browser streams rows in and re-renders them freely, so a one-shot
+     * pass would miss anything that mounts later. The observer walks only
+     * added subtrees, and `decorateSidebarRows` skips a row already carrying
+     * the color it would write, so a re-render costs a selector query.
+     *
+     * @returns {() => void} teardown
+     */
+    function watchSidebarRows({ store } = {}) {
+      if (typeof document === "undefined") return () => {};
+      const decorate = (scope) => {
+        try {
+          decorateSidebarRows(scope, { store });
+        } catch (_error) {
+          // ignore: a row that fails to paint keeps the Host's own styling
+        }
+      };
+      decorate(document);
+      // A color change repaints the rows already on screen.
+      if (typeof store?.subscribe === "function") store.subscribe(() => decorate(document));
+      if (typeof MutationObserver !== "function") return () => {};
+      const observer = new MutationObserver((records) => {
+        for (const record of records) {
+          for (const node of record.addedNodes) {
+            if (node?.nodeType === 1) decorate(node);
+          }
+        }
+      });
+      observer.observe(document.body, { childList: true, subtree: true });
+      return () => observer.disconnect();
+    }
+
+    /**
+     * Mount "set color" into a folder's open "..." menu.
+     *
+     * The Host's folder menu is a portal with its own rows — rename, delete —
+     * and no slot for a third, so the row is added beside them once the menu
+     * is in the DOM. The marker attribute on the menu is the claim; a menu
+     * that closes takes the row with it, so the next open mounts one again,
+     * and React never reconciles a subtree it did not create here.
+     *
+     * @returns {() => void} teardown
+     */
+    function watchFolderMenus({ store, t } = {}) {
+      if (typeof document === "undefined") return () => {};
+      const decorate = () => {
+        try {
+          for (const menu of document.querySelectorAll('[role="menu"]')) {
+            if (menu.getAttribute("data-dw-menu") === "workspace") continue;
+            const row = folderRowOfMenu(menu);
+            if (row === null) continue;
+            const workspaceId = row.getAttribute("data-row-key").slice("workspace:".length);
+            menu.setAttribute("data-dw-menu", "workspace");
+            const item = mountInto(menu, setColorMenuItem({ t, color: workspaceOf({ workspaces: store?.getSnapshot?.().workspaces }, workspaceId)?.color }));
+            item?.addEventListener("click", () => {
+              const current = workspaceOf({ workspaces: store?.getSnapshot?.().workspaces }, workspaceId)
+                ?? { id: workspaceId, title: workspaceId, color: WORKSPACE_PALETTE[0] };
+              const pop = mountInto(menu, workspaceColorPicker({
+                t,
+                workspace: current,
+                choose: (id, color, delay) => { void store?.setColor?.(id, color, delay); },
+                onClose: () => pop?.remove?.(),
+              }));
+              pop?.setAttribute("data-dw-color-pop", "");
+            });
+          }
+        } catch (_error) {
+          // ignore: a menu that cannot take the row keeps the Host's two rows
+        }
+      };
+      decorate();
+      if (typeof store?.subscribe === "function") store.subscribe(() => decorate());
+      if (typeof MutationObserver !== "function") return () => {};
+      const observer = new MutationObserver(() => decorate());
+      observer.observe(document.body, { childList: true, subtree: true });
+      return () => observer.disconnect();
+    }
+
+    /**
+     * The folder row a portal menu belongs to, or null.
+     *
+     * The Host portals the menu onto `document.body`, so it is not a descendant
+     * of its row. One folder menu is open at a time and the Host marks its row
+     * expanded while it is, which is the anchor; a document with a single
+     * folder row has only that candidate. Anything else mounts nothing, so an
+     * unrecognized menu keeps exactly the rows the Host gave it.
+     */
+    function folderRowOfMenu(menu) {
+      const doc = menu?.ownerDocument ?? (typeof document === "undefined" ? null : document);
+      if (doc === null || typeof doc.querySelectorAll !== "function") return null;
+      const rows = [...doc.querySelectorAll('[data-row-key^="workspace:"]')];
+      const expanded = rows.filter((row) => row.getAttribute("aria-expanded") === "true"
+        || row.querySelector?.('[aria-expanded="true"]') !== null);
+      if (expanded.length === 1) return expanded[0];
+      if (rows.length === 1) return rows[0];
+      return null;
+    }
+
+    /**
+     * Mount one `h()` view into a Host-owned node, returning the element.
+     *
+     * The folder menu is the Host's tree, so the row is built with plain DOM
+     * rather than React: React must never be asked to reconcile a subtree it
+     * did not create. A view without a document mounts nothing.
+     */
+    function mountInto(parent, view) {
+      const doc = parent?.ownerDocument;
+      if (doc === null || doc === undefined || view === null || typeof view !== "object") return null;
+      const build = (node) => {
+        if (node === null || node === undefined || node === false) return null;
+        if (typeof node === "string" || typeof node === "number") return doc.createTextNode(String(node));
+        const element = doc.createElement(node.type ?? "span");
+        for (const [name, value] of Object.entries(node.props ?? {})) {
+          if (value === undefined || value === null || name === "key") continue;
+          if (name === "style" && typeof value === "object") {
+            for (const [property, css] of Object.entries(value)) {
+              if (property.startsWith("--")) element.style.setProperty(property, css);
+              else element.style[property] = css;
+            }
+            continue;
+          }
+          if (name.startsWith("on") && typeof value === "function") {
+            element.addEventListener(name.slice(2).toLowerCase(), value);
+            continue;
+          }
+          if (value === true) element.setAttribute(name, "");
+          else if (value !== false) element.setAttribute(name, String(value));
+        }
+        for (const child of node.children ?? []) {
+          const built = build(child);
+          if (built !== null) element.appendChild(built);
+        }
+        return element;
+      };
+      const element = build(view);
+      if (element !== null) parent.appendChild(element);
+      return element;
+    }
+
+    // The page's one memory store, shared by the chips, the folder colors and
+    // the settings panel. `resolveMainSession` keeps its main session current.
     const memoryStore = createMemoryStore();
 
     // ---- activation -------------------------------------------------------
 
+    /**
+     * Where the launch token is remembered for this origin.
+     *
+     * sessionStorage (not localStorage): the token is a live credential for
+     * one process, so it must not outlive the tab. The exchange deletes it
+     * from the address bar, so without this copy a restart would leave the
+     * page with nothing to re-authenticate with.
+     */
+    const TOKEN_STORE_KEY = "discipline-whale.launch-token";
+
+    /** Read the remembered token, tolerating a browser that forbids storage. */
+    function readStoredToken() {
+      try {
+        const value = window.sessionStorage.getItem(TOKEN_STORE_KEY);
+        return typeof value === "string" ? value : "";
+      } catch (_error) {
+        return "";
+      }
+    }
+
+    /** Remember the token from the current URL, and return what is known. */
+    function rememberToken() {
+      try {
+        const token = new URL(window.location.href).searchParams.get(TOKEN_QUERY);
+        if (typeof token === "string" && token !== "") window.sessionStorage.setItem(TOKEN_STORE_KEY, token);
+      } catch (_error) {
+        // No storage or no URL: the re-auth path falls back to the address bar.
+      }
+      return readStoredToken();
+    }
+
+    /**
+     * Install the restart watch into a live page.
+     *
+     * The page cannot see a restart through its component tree, so the two
+     * observable symptoms are caught where they happen:
+     *
+     *   * `window.fetch` — every /api answer passes through here, because
+     *     plugins and the shell both go through the global.
+     *   * a resource error on a /plugins/ bundle — the stale-rev case, which
+     *     never reaches fetch.
+     *
+     * The `acted` latch lives in `createRestartWatch`, so a repair happens once
+     * and a persistent 401 cannot become a refresh loop.
+     *
+     * @returns {() => void} a disposer for the plugin's effect scope.
+     */
+    function installRestartWatch() {
+      if (typeof window === "undefined" || typeof window.fetch !== "function") return () => {};
+      const boot = globalThis.__DSH_BOOT__;
+      const bootRev = typeof boot?.rev === "string" ? boot.rev : "";
+      const watch = createRestartWatch({
+        bootRev,
+        location: () => window.location,
+        storedToken: readStoredToken,
+        reload: (url) => {
+          // `location.replace` keeps the dead page out of the back stack: the
+          // tab is being repaired, not navigated.
+          window.location.replace(url);
+        },
+        notify: () => {
+          // No token available. The panel shows the paste-the-URL hint; this
+          // event is what makes it appear without a reload.
+          window.dispatchEvent(new CustomEvent("discipline-whale:reauth-needed"));
+        },
+      });
+      const originalFetch = window.fetch;
+      const wrapped = function disciplineWhaleFetch(input, init) {
+        const url = typeof input === "string" ? input : String(input?.url ?? "");
+        return originalFetch.call(this, input, init).then((response) => {
+          watch.observe({ status: response.status, url });
+          return response;
+        }, (error) => {
+          watch.observe({ status: "network", url });
+          throw error;
+        });
+      };
+      window.fetch = wrapped;
+      // A plugin chunk that 404s never reaches fetch: the browser loads it as
+      // a <script>. `error` does not bubble, so it is captured.
+      const onResourceError = (event) => {
+        const target = event.target;
+        const url = typeof target?.src === "string" && target.src !== "" ? target.src : "";
+        if (url === "") return;
+        watch.observe({ status: 404, url });
+      };
+      window.addEventListener("error", onResourceError, true);
+      return () => {
+        if (window.fetch === wrapped) window.fetch = originalFetch;
+        window.removeEventListener("error", onResourceError, true);
+      };
+    }
+
     function apply(ctx) {
+      // Workspace chips sit on the user row that caused the dispatch, painted
+      // by `decorateTurnTags` — not under the assistant reply.
+      // Declared first, because the row watcher below is wired to it. The turnTail
+      // seat is deliberately not registered any more: a turn's tags belong to
+      // the message that opened it.
+      const openSession = (sessionId) => {
+        if (typeof ctx.uiWorkspace?.openSession === "function") ctx.uiWorkspace.openSession(sessionId);
+      };
       ctx.effect(installStyles, "discipline-whale: styles");
       ctx.effect(() => ctx.locale.register(NS, DICTIONARIES), "discipline-whale: dictionaries");
       const t = ctx.locale.bind(NS);
+      // A tab that outlived a restart repairs itself instead of looking broken
+      // until the person refreshes by hand. Installed before anything renders,
+      // so the first 401 of a dead page is already covered.
+      rememberToken();
+      ctx.effect(installRestartWatch, "discipline-whale: restart recovery");
       // Report rows: a pushed Worker report is an ordinary user row, so it is
       // painted where the Host renders it. The observer watches the transcript
       // for new rows and claims the ones that carry a report id. It writes
@@ -4207,7 +6092,7 @@ window.__ModuleLoader__.load({
       // reconciliation of that subtree is untouched. The memory store rides
       // along for the turn tags and for the repaint a tag read triggers.
       ctx.effect(
-        () => watchReportRows({ t, store: memoryStore, reports: reportOriginStore }),
+        () => watchReportRows({ t, store: memoryStore, reports: reportOriginStore, open: openSession }),
         "discipline-whale: message colors",
       );
       const WhalePage = makeWhalePage(ctx, t);
@@ -4226,13 +6111,6 @@ window.__ModuleLoader__.load({
           VoiceDock
         )
       );
-      // Workspace chips sit on the user row that caused the dispatch, painted
-      // by `decorateTurnTags` — not under the assistant reply. The turnTail
-      // seat is deliberately not registered any more: a turn's tags belong to
-      // the message that opened it.
-      const openSession = (sessionId) => {
-        if (typeof ctx.uiWorkspace?.openSession === "function") ctx.uiWorkspace.openSession(sessionId);
-      };
       // "New main session" in the main session's header.
       ctx.slots.inject("conversation.session.header.actions", () =>
         ctx.slots.register(
@@ -4240,12 +6118,19 @@ window.__ModuleLoader__.load({
           makeNewMainAction(memoryStore, t, { fetch: (url, init) => fetch(url, init), openSession })
         )
       );
-      // The workspace-color dot before a dispatched session's sidebar row.
-      ctx.slots.inject("sidebar.session.row.leading", () =>
-        ctx.slots.register(
-          { name: "sidebar.session.row.leading", id: "discipline-whale-workspace", order: SESSION_DOT_ORDER, locale: NS },
-          makeSessionDot(memoryStore, t)
-        )
+      // The sidebar's own rows: the folder's color and the whale logo before a
+      // dispatched session's title. Both are decoration — the Host's folder
+      // row has no slot and the session row's leading seat belongs to the
+      // status dot, which is exactly why the old color dot had to go.
+      ctx.effect(
+        () => watchSidebarRows({ store: memoryStore }),
+        "discipline-whale: sidebar colors",
+      );
+      // The folder "..." menu gains its third row. The Host composes that menu
+      // without a slot, so the row is mounted into the menu once it opens.
+      ctx.effect(
+        () => watchFolderMenus({ store: memoryStore, t }),
+        "discipline-whale: workspace color menu",
       );
     }
 
@@ -4268,6 +6153,9 @@ window.__ModuleLoader__.load({
     module.exports.dockGeometryStyle = dockGeometryStyle;
     module.exports.dockedView = dockedView;
     module.exports.settingsDraftPatch = settingsDraftPatch;
+    module.exports.settingsDraftEdit = settingsDraftEdit;
+    module.exports.isSecretMask = isSecretMask;
+    module.exports.SETTINGS_TEXT_FIELDS = SETTINGS_TEXT_FIELDS;
     module.exports.dockView = dockView;
     module.exports.dockStatusKey = dockStatusKey;
     module.exports.dockStyles = dockStyles;
@@ -4279,12 +6167,27 @@ window.__ModuleLoader__.load({
     module.exports.createReplyFollower = createReplyFollower;
     module.exports.speakable = speakable;
     module.exports.speakReply = speakReply;
+    module.exports.speakViaBackend = speakViaBackend;
+    module.exports.createLatestOnlySlot = createLatestOnlySlot;
+    module.exports.turnBubblePaint = turnBubblePaint;
+    module.exports.whaleLogoPaint = whaleLogoPaint;
+    module.exports.folderTitlePaint = folderTitlePaint;
+    module.exports.mixHex = mixHex;
+    module.exports.contrastOf = contrastOf;
+    module.exports.luminanceOf = luminanceOf;
+    module.exports.ttsFallbackNotice = ttsFallbackNotice;
+    module.exports.EMPTY_SETTINGS_DRAFT = EMPTY_SETTINGS_DRAFT;
     module.exports.speechLanguage = speechLanguage;
     module.exports.makeVoiceDock = makeVoiceDock;
     module.exports.createSessionWatcher = createSessionWatcher;
     module.exports.resolveMainSession = resolveMainSession;
     module.exports.createNewMainSession = createNewMainSession;
     module.exports.newMainActionView = newMainActionView;
+    module.exports.restartActionFor = restartActionFor;
+    module.exports.reauthUrl = reauthUrl;
+    module.exports.isStaleBundleUrl = isStaleBundleUrl;
+    module.exports.createRestartWatch = createRestartWatch;
+    module.exports.whaleFailureCopy = whaleFailureCopy;
     module.exports.WORKSPACE_PALETTE = WORKSPACE_PALETTE;
     module.exports.createMemoryStore = createMemoryStore;
     module.exports.memoryStore = memoryStore;
@@ -4295,11 +6198,21 @@ window.__ModuleLoader__.load({
     module.exports.reportRowStyles = reportRowStyles;
     module.exports.decorateReportRows = decorateReportRows;
     module.exports.decorateTurnTags = decorateTurnTags;
+    module.exports.turnOfUserRow = turnOfUserRow;
+    module.exports.bubbleOfRow = bubbleOfRow;
+    module.exports.markRowBubble = markRowBubble;
+    module.exports.mountTurnChip = mountTurnChip;
     module.exports.turnTagsView = turnTagsView;
-    module.exports.sessionDotView = sessionDotView;
+    module.exports.folderPaint = folderPaint;
+    module.exports.folderStyles = folderStyles;
+    module.exports.setColorMenuItem = setColorMenuItem;
+    module.exports.workspaceColorPicker = workspaceColorPicker;
+    module.exports.whalePrefix = whalePrefix;
+    module.exports.decorateSidebarRows = decorateSidebarRows;
+    module.exports.watchSidebarRows = watchSidebarRows;
+    module.exports.watchFolderMenus = watchFolderMenus;
     module.exports.workspaceColorsSection = workspaceColorsSection;
     module.exports.makeTurnTags = makeTurnTags;
-    module.exports.makeSessionDot = makeSessionDot;
     return module.exports;
   },
 });

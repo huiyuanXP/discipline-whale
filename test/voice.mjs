@@ -14,6 +14,9 @@
  */
 
 import assert from 'node:assert/strict'
+import { mkdtemp } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join as pathJoin } from 'node:path'
 
 import {
   ACCEPTED_AUDIO_TYPES,
@@ -25,6 +28,7 @@ import {
   acceptedTranscript,
   VOICE_ROUTE,
   VOICE_STATUS_ROUTE,
+  VOICE_SPEAK_ROUTE,
   audioSecondsOf,
   baseUrl,
   classifyUpstream,
@@ -78,9 +82,20 @@ function jsonResponse(status, body) {
   })
 }
 
-/** Build one handler over a stub fetch and a stub environment. */
-function handlerWith(fetchImpl, env = { SOCLAAS_API_KEY: 'test-key-not-real' }) {
-  return voiceHandler({ fetch: fetchImpl, env })
+/**
+ * Build one handler over a stub fetch and a stub environment.
+ *
+ * The endpoint is part of the fixture because it has no default: an unset
+ * endpoint is its own refusal, asserted separately below.
+ */
+const TEST_ENDPOINT = 'https://transcribe.invalid/v1'
+// Every handler is pinned to an empty plugin data directory. Without this the
+// route reads the operator's real `~/.dsh/discipline-whale/voice.json`, so a
+// machine with a configured endpoint answered 200 where the test expects "not
+// configured" — a test that passes only on a blank laptop is not a test.
+const TEST_HOME = await mkdtemp(pathJoin(tmpdir(), 'dw-voice-'))
+function handlerWith(fetchImpl, env = { DW_STT_API_KEY: 'test-key-not-real', DW_STT_BASE_URL: TEST_ENDPOINT }) {
+  return voiceHandler({ fetch: fetchImpl, env, homeDir: TEST_HOME })
 }
 
 const post = (body, contentType = 'audio/wav', url = `http://dsh${VOICE_ROUTE}`) =>
@@ -105,11 +120,22 @@ const post = (body, contentType = 'audio/wav', url = `http://dsh${VOICE_ROUTE}`)
 {
   // Missing key: structured 503, no upstream call at all.
   let called = 0
-  const handle = handlerWith(() => { called += 1; return jsonResponse(200, { text: 'x' }) }, {})
+  const handle = handlerWith(() => { called += 1; return jsonResponse(200, { text: 'x' }) }, { DW_STT_BASE_URL: TEST_ENDPOINT })
   const response = await handle(post(wavBytes(1)))
   assert.equal(response.status, 503)
   assert.equal((await response.json()).error.code, VOICE_ERRORS.missingKey)
   assert.equal(called, 0, 'a missing key must not reach the network')
+
+  // No endpoint at all: its own refusal, naming the variable to set, and again
+  // no network call. A published plugin does not guess a transcription host.
+  let endpointCalled = 0
+  const noEndpoint = handlerWith(() => { endpointCalled += 1; return jsonResponse(200, { text: 'x' }) }, { DW_STT_API_KEY: 'test-key-not-real' })
+  const endpointResponse = await noEndpoint(post(wavBytes(1)))
+  assert.equal(endpointResponse.status, 503)
+  const endpointBody = await endpointResponse.json()
+  assert.equal(endpointBody.error.code, VOICE_ERRORS.missingEndpoint)
+  assert.equal(endpointBody.error.baseUrlEnv, 'DW_STT_BASE_URL')
+  assert.equal(endpointCalled, 0, 'an unconfigured endpoint must not reach the network')
 
   // Unsupported container and empty body are refused before forwarding.
   const wrongType = await handle(post(wavBytes(1), 'text/plain'))
@@ -152,7 +178,7 @@ const post = (body, contentType = 'audio/wav', url = `http://dsh${VOICE_ROUTE}`)
   assert.equal(response.status, 200)
   assert.deepEqual((await response.json()), { text: '你好自律鲸鱼', model: MODEL, audioSeconds: 2 })
   assert.equal(seen.length, 1)
-  assert.equal(seen[0].url, `${baseUrl({})}/audio/transcriptions`)
+  assert.equal(seen[0].url, `${TEST_ENDPOINT}/audio/transcriptions`)
   assert.equal(seen[0].init.headers.authorization, 'Bearer test-key-not-real')
   const form = seen[0].init.body
   assert.equal(form.get('model'), MODEL)
@@ -167,7 +193,7 @@ const post = (body, contentType = 'audio/wav', url = `http://dsh${VOICE_ROUTE}`)
   const answer = (body) => handlerWith(async () => jsonResponse(200, body))(post(wavBytes(2)))
   const segment = (text, nsp, logprob = -0.2, ratio = 1.2) => ({ text, no_speech_prob: nsp, avg_logprob: logprob, compression_ratio: ratio })
 
-  // Measured on SoCLaaS: room tone → a subtitle credit with nsp 0.83 and a
+  // Measured on a Whisper backend: room tone → a subtitle credit with nsp 0.83 and a
   // confident logprob. Whisper's own AND-rule would keep it; this route does not.
   const roomTone = await answer({ text: '由 Amara.org 社群提供的字幕', segments: [segment('由 Amara.org 社群提供的字幕', 0.83, -0.27)] })
   assert.equal(roomTone.status, 422)
@@ -232,7 +258,7 @@ const post = (body, contentType = 'audio/wav', url = `http://dsh${VOICE_ROUTE}`)
   }
 
   // A transport failure is a 502 that names the host, never the key.
-  const unreachable = await handlerWith(() => { throw new Error('getaddrinfo ENOTFOUND soclaas-api.comp.nus.edu.sg') })
+  const unreachable = await handlerWith(() => { throw new Error('getaddrinfo ENOTFOUND transcribe.invalid') })
   const response = await unreachable(post(wavBytes(1)))
   assert.equal(response.status, 502)
   const payload = await response.json()
@@ -245,7 +271,7 @@ const post = (body, contentType = 'audio/wav', url = `http://dsh${VOICE_ROUTE}`)
 
   // A timeout aborts rather than hanging the browser (50ms so the test is fast).
   const hanging = voiceHandler({
-    env: { SOCLAAS_API_KEY: 'test-key-not-real' },
+    env: { DW_STT_API_KEY: 'test-key-not-real', DW_STT_BASE_URL: TEST_ENDPOINT },
     timeoutMs: 50,
     fetch: (_url, init) => new Promise((_resolve, reject) => {
       init.signal.addEventListener('abort', () => reject(Object.assign(new Error('aborted'), { name: 'AbortError' })), { once: true })
@@ -271,11 +297,15 @@ const post = (body, contentType = 'audio/wav', url = `http://dsh${VOICE_ROUTE}`)
   // the same path home.js uses, no separate HTTP server.
   const routes = []
   const connection = { fetch: { register: async (route) => { routes.push(route); return async () => {} } } }
-  await registerVoiceRoutes(connection, { env: { SOCLAAS_API_KEY: 'x' } })
-  assert.deepEqual(routes.map((route) => route.path).sort(), [VOICE_ROUTE, VOICE_STATUS_ROUTE].sort())
+  await registerVoiceRoutes(connection, { env: { DW_STT_API_KEY: 'x' } })
+  // Three routes now: speech in (one route serving both methods), the status
+  // read, and speech out. The speech-out route has its own key and endpoint,
+  // so it registers whether or not transcription is configured.
+  assert.deepEqual(routes.map((route) => route.path).sort(), [VOICE_ROUTE, VOICE_STATUS_ROUTE, VOICE_SPEAK_ROUTE].sort())
   assert.ok(routes.every((route) => route.requestBody === 'buffered'))
-  assert.deepEqual(routes[0].methods, ['GET', 'POST'])
-  console.log('ok 6 — both voice routes register on connection.fetch')
+  assert.deepEqual(routes.find((route) => route.path === VOICE_ROUTE).methods, ['GET', 'POST'])
+  assert.deepEqual(routes.find((route) => route.path === VOICE_SPEAK_ROUTE).methods, ['POST'])
+  console.log('ok 6 — speech in, status and speech out all register on connection.fetch')
 }
 
 // --- 2. the turn rules ----------------------------------------------------

@@ -1186,17 +1186,17 @@ const checkpointPath = (workerSessionId) =>
   const credentialStore = new Map()
   const credentials = {
     async describe() {
-      return credentialStore.has('SOCLAAS_API_KEY')
+      return credentialStore.has('DW_STT_API_KEY')
         ? { configured: true, source: 'file', writable: true }
         : { configured: false, writable: true }
     },
     async resolve() {
-      return credentialStore.has('SOCLAAS_API_KEY')
-        ? { value: credentialStore.get('SOCLAAS_API_KEY'), source: 'file' }
+      return credentialStore.has('DW_STT_API_KEY')
+        ? { value: credentialStore.get('DW_STT_API_KEY'), source: 'file' }
         : undefined
     },
-    async set(_ref, value) { credentialStore.set('SOCLAAS_API_KEY', value) },
-    async unset() { credentialStore.delete('SOCLAAS_API_KEY') },
+    async set(_ref, value) { credentialStore.set('DW_STT_API_KEY', value) },
+    async unset() { credentialStore.delete('DW_STT_API_KEY') },
   }
   const ctx = {
     logger: { warn() {} },
