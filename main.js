@@ -120,15 +120,54 @@ function isLive(record) {
  * Decidable, not a judgement call: same workspace, same normalised topic, and
  * still live (never reported, never abandoned). A reported Session is finished
  * work — the user asking for more is a new piece of work, so it starts fresh.
- * Without a topic there is nothing to compare, so nothing is reused.
+ * Without a topic there is nothing to compare, so nothing is reused. The newest
+ * match wins: a Session opened because the previous one was full is the thread's
+ * current home, and the full one must not be picked again.
  */
 function findReusableDispatch(workspace, topic) {
   if (topic === undefined) return undefined
   const workspaceId = String(workspace.id)
-  return listDispatches().find(
+  return listDispatches().findLast(
     (record) =>
       record.workspaceId === workspaceId && record.topic === topic && isLive(record),
   )
+}
+
+/** Default for `workerReuseMaxTokens`: between the median (118k) and the peak (270k) of worker contexts. */
+export const DEFAULT_WORKER_REUSE_MAX_TOKENS = 160000
+
+/** Whether `value` is usable as a token limit: a positive integer. */
+function isTokenLimit(value) {
+  return Number.isInteger(value) && value > 0
+}
+
+/**
+ * How many input tokens the worker's latest request carried.
+ *
+ * `inspect` reads the durable log without resuming an Agent. The last
+ * `assistant/message` holds the provider-reported usage of the most recent
+ * request, which is the size of the context the next prompt would land in.
+ * A Session that has not answered yet carries nothing, so it counts as 0.
+ *
+ * @returns `{ tokens }`, or `{ problem }` when the Host cannot say.
+ */
+async function latestInputTokens(ctx, sessionId, signal) {
+  if (typeof ctx.sessionController?.inspect !== 'function') {
+    return { problem: '`sessionController.inspect` is unavailable' }
+  }
+  try {
+    const inspected = await ctx.sessionController.inspect(sessionId, signal)
+    if (!Array.isArray(inspected?.events)) return { problem: 'the inspected Session carried no event list' }
+    for (let index = inspected.events.length - 1; index >= 0; index -= 1) {
+      const event = inspected.events[index]
+      if (event?.type !== 'assistant/message') continue
+      const tokens = event.data?.usage?.inputTokens
+      if (Number.isFinite(tokens)) return { tokens }
+    }
+    return { tokens: 0 }
+  } catch (error) {
+    return { problem: String(error?.message ?? error) }
+  }
 }
 
 /**
@@ -282,7 +321,7 @@ function dispatchTaskTool(ctx, config) {
         topic: {
           type: 'string',
           description:
-            'Stable name for the thread of work, e.g. "voice-input". Two dispatches in one workspace with the same topic (compared case-insensitively, whitespace collapsed) are the same job: the second continues the first Session instead of creating one. Omit it and every dispatch is a new Session.',
+            'Stable name for the thread of work, e.g. "voice-input". Two dispatches in one workspace with the same topic (compared case-insensitively, whitespace collapsed) are the same job: the second continues the first Session instead of creating one, unless the context of that Session has reached the size limit; then a new Session opens and the result carries `continues`. Omit it and every dispatch is a new Session.',
         },
         at: {
           type: 'string',
@@ -314,6 +353,8 @@ function dispatchTaskTool(ctx, config) {
           },
           /** True when this continued an existing Session instead of creating one. */
           reused: { type: 'boolean' },
+          /** The earlier dispatch this one carries on from, when its Session was too full to reuse. */
+          continues: { type: 'string' },
           /** Timing actually honoured when this continued an existing Session. */
           deliveredAs: { type: 'string', enum: DELIVERY_TIMINGS },
           title: { type: 'string' },
@@ -347,7 +388,24 @@ function dispatchTaskTool(ctx, config) {
       // Route before creating: a live Session on the same thread of work is
       // continued, never duplicated. Two Sessions on one topic in one
       // workspace is exactly the conflict this rule prevents.
-      const live = findReusableDispatch(workspace, topic)
+      let live = findReusableDispatch(workspace, topic)
+      // A Session that no longer fits is not reused: the thread moves to a new
+      // one that starts from the workspace background and the recent reports.
+      let continues
+      let fullTokens
+      if (live !== undefined) {
+        const fit = await latestInputTokens(ctx, live.workerSessionId, signalOf(exec))
+        if (fit.tokens !== undefined && fit.tokens >= config.workerReuseMaxTokens) {
+          continues = live
+          fullTokens = fit.tokens
+          live = undefined
+        } else if (fit.problem !== undefined) {
+          warnings.push(
+            `could not read the context size of worker ${live.workerSessionId} (${fit.problem}); ` +
+              'it was reused without a fit check',
+          )
+        }
+      }
       if (live !== undefined) {
         const delivered = await deliverInstruction(ctx, exec, live.workerSessionId, task, timing)
         live.status = live.status ?? 'running'
@@ -461,6 +519,12 @@ function dispatchTaskTool(ctx, config) {
       // first, so a fresh worker starts from the thread instead of from zero.
       const background = await dispatchBootstrap(workspace)
       const brief = [
+        ...(continues === undefined
+          ? []
+          : [
+              `接续 ${continues.dispatchId}（topic: ${continues.topic}）：上一会话上下文 ${fullTokens} token，已另开`,
+              '',
+            ]),
         'You are a Discipline Whale worker. Complete the task below in this workspace.',
         '',
         ...(background === '' ? [] : [background, '']),
@@ -499,6 +563,7 @@ function dispatchTaskTool(ctx, config) {
         workspaceTitle: workspace.title,
         status,
         reused: false,
+        ...(continues === undefined ? {} : { continues: continues.dispatchId }),
         ...(appliedTitle === undefined ? {} : { title: appliedTitle }),
         ...(warnings.length === 0 ? {} : { warnings }),
       }
@@ -697,7 +762,7 @@ async function deliverInstruction(ctx, exec, sessionId, message, timing) {
   return { sessionId, accepted: true, delivered: timing, aborted }
 }
 
-function sendToSessionTool(ctx) {
+function sendToSessionTool(ctx, config) {
   return {
     name: 'send_to_session',
     description:
@@ -746,8 +811,21 @@ function sendToSessionTool(ctx) {
       }
       const sessionId = String(args.session_id)
       const timing = resolveTiming(args.at)
-      const delivered = await deliverInstruction(ctx, exec, sessionId, message, timing)
       const dispatch = dispatchForWorker(sessionId)
+      // A full worker is not extended: the thread moves to a new Session. A
+      // Session this plugin did not dispatch is not ours to size.
+      if (dispatch !== undefined) {
+        const fit = await latestInputTokens(ctx, sessionId, signalOf(exec))
+        if (fit.tokens !== undefined && fit.tokens >= config.workerReuseMaxTokens) {
+          const topicArg = dispatch.topic === undefined ? '' : `, topic: "${dispatch.topic}"`
+          throw new Error(
+            `worker ${sessionId} 的上下文已有 ${fit.tokens} token（≥${config.workerReuseMaxTokens.toLocaleString('en-US')}）。` +
+              `用 dispatch_task(workspace: "${dispatch.workspaceTitle}"${topicArg}) 另开一个会话；` +
+              '新会话会带上工作区背景和最近 3 份报告。',
+          )
+        }
+      }
+      const delivered = await deliverInstruction(ctx, exec, sessionId, message, timing)
       if (dispatch !== undefined) {
         await noteDispatch({ sessionId: exec.agent?.session?.id, workspaceId: dispatch.workspaceId, dispatchId: dispatch.dispatchId })
       }
@@ -1180,6 +1258,14 @@ export const HOST_TOOL_DENY = Object.freeze([
 export const TOOL_WHITELIST_CONFIG_KEYS = Object.freeze(['toolWhitelist', 'toolDeny'])
 
 /**
+ * Row-config keys that steer dispatch routing.
+ *
+ * `workerReuseMaxTokens`: a worker whose latest request carried at least this
+ * many input tokens is not reused or messaged; the thread moves to a new Session.
+ */
+export const ROUTING_CONFIG_KEYS = Object.freeze(['workerReuseMaxTokens'])
+
+/**
  * Names the main session keeps even when a host tool would otherwise be denied.
  *
  * Kept as an explicit list rather than "everything not denied" so the intent is
@@ -1342,7 +1428,17 @@ export const Config = {
       // list makes that class of omission impossible for a key the resolver
       // reads, and `test/adhd.mjs` ok 13 fails if the two ever diverge.
       const carried = {}
-      for (const key of [...GUARD_CONFIG_KEYS, ...BREVITY_CONFIG_KEYS, ...TOOL_WHITELIST_CONFIG_KEYS]) {
+      for (const key of ROUTING_CONFIG_KEYS) {
+        if (input[key] !== undefined && !isTokenLimit(input[key])) {
+          return { issues: [{ message: `${key} must be a positive integer`, path: [key] }] }
+        }
+      }
+      for (const key of [
+        ...GUARD_CONFIG_KEYS,
+        ...BREVITY_CONFIG_KEYS,
+        ...TOOL_WHITELIST_CONFIG_KEYS,
+        ...ROUTING_CONFIG_KEYS,
+      ]) {
         // `0` and `false` are real values, so the test is `!== undefined`,
         // never truthiness.
         if (input[key] !== undefined) carried[key] = input[key]
@@ -1358,12 +1454,15 @@ export function apply(ctx, config = {}) {
       typeof config.workerPreset === 'string' && config.workerPreset !== ''
         ? config.workerPreset
         : 'discipline-whale-worker',
+    workerReuseMaxTokens: isTokenLimit(config.workerReuseMaxTokens)
+      ? config.workerReuseMaxTokens
+      : DEFAULT_WORKER_REUSE_MAX_TOKENS,
   }
 
   ctx.effect(() => ctx.tools.register(listWorkspacesTool(ctx)))
   ctx.effect(() => ctx.tools.register(dispatchTaskTool(ctx, resolved)))
   ctx.effect(() => ctx.tools.register(readReportTool(ctx)))
-  ctx.effect(() => ctx.tools.register(sendToSessionTool(ctx)))
+  ctx.effect(() => ctx.tools.register(sendToSessionTool(ctx, resolved)))
   ctx.effect(() => ctx.tools.register(listDispatchesTool(ctx)))
   ctx.effect(() => ctx.tools.register(resumeDispatchTool(ctx)))
   ctx.effect(() => ctx.tools.register(abandonDispatchTool()))
