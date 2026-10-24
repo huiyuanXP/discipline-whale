@@ -43,8 +43,10 @@ export function dispatchCheckpointPath(homeDir, workerSessionId) {
  * The durable subset of a dispatch record.
  *
  * Deliberately narrower than the in-memory record: the task brief stays in the
- * Session log, and only the routing facts a restarted worker needs are copied.
- * Both writers produce this exact shape, so either may read the other's file.
+ * Session log, and only the routing facts a restarted worker needs are copied,
+ * plus the dispatch's `topic` and `title`, which label its report after a
+ * restart. Both writers produce this exact shape, so either may read the
+ * other's file.
  */
 export function checkpointRecord(dispatch, workerSessionId) {
   return {
@@ -53,6 +55,8 @@ export function checkpointRecord(dispatch, workerSessionId) {
     mainSessionId: dispatch.mainSessionId,
     workspaceId: dispatch.workspaceId,
     workspaceTitle: dispatch.workspaceTitle,
+    topic: dispatch.topic,
+    title: dispatch.title,
     startedAt: dispatch.startedAt,
     checkpointedAt: new Date().toISOString(),
     checkpointedBy: hostname(),

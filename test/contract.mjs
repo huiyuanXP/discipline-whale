@@ -48,10 +48,11 @@ import {
   readDispatchCheckpoint,
   writeDispatchCheckpoint,
 } from '../checkpoint.js'
-import { HOME_ROUTE, MAIN_PRESET, MAIN_TITLE, WAKE_PROMPT, ensureHome, homeHandler, interruptedNotice, readState, startupCheck } from '../home.js'
+import { HOME_ROUTE, MAIN_PRESET, MAIN_TITLE, WAKE_PROMPT, ensureHome, homeHandler, interruptedNotice, startupCheck } from '../home.js'
 import * as mainRow from '../main.js'
 import { DELIVERY_TIMINGS, resolveTiming } from '../main.js'
 import { RESUME_BRIEF } from '../main.js'
+import { readState } from '../state.js'
 import * as workerRow from '../worker.js'
 import { resetRegistry } from '../registry.js'
 import {

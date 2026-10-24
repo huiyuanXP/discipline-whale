@@ -28,6 +28,9 @@ export const HOME_DIRNAME = 'home'
 /** Every workspace's report folders live under this directory. */
 export const REPORTS_DIRNAME = 'reports'
 
+/** The report index files live under this directory inside the whale's home. */
+export const INDEX_DIRNAME = 'index'
+
 /** Set once a caller pins the store root, so late resolution cannot clobber it. */
 let pinnedRoot
 
@@ -303,6 +306,11 @@ export function dataDir(homeDir) {
 /** The main session's private working directory: `$DSH_HOME/discipline-whale/home`. */
 export function whaleHomeDir(homeDir) {
   return join(dataDir(homeDir), HOME_DIRNAME)
+}
+
+/** One workspace's report index file: `$DSH_HOME/discipline-whale/home/index/<key>.md`. */
+export function reportIndexPath(homeDir, workspaceId) {
+  return join(whaleHomeDir(homeDir), INDEX_DIRNAME, `${workspaceKey(workspaceId)}.md`)
 }
 
 /** The report directory for one workspace. */
