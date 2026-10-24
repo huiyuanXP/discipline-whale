@@ -44,6 +44,7 @@
     "registry.js",
     "state.js",
     "pushes.js",
+    "rotation.js",
     "guard.js",
     "adhd.js",
     "entry.js",
@@ -114,7 +115,8 @@
     "test:fit": "node test/fit.mjs",
     "test:report-index": "node test/report-index.mjs",
     "audit:dedupe": "node scripts/dedupe-replay.mjs",
-    "test:board": "node test/board.mjs"
+    "test:board": "node test/board.mjs",
+    "audit:rotation": "node scripts/rotation-proof.mjs"
   },
   "dsh": {
     "bundle": {

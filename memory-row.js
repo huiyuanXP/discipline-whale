@@ -10,8 +10,9 @@
  *   notes      — each board render writes every active workspace's note to
  *                `home/notes/<key>.md`, where the main session can `read` it
  *   tools      — remember, update_instructions, set_workspace_intro, dream_now
- *   automation — the pre-compaction flush, the ten-turn nudge, and the dream
- *                that runs when the main session goes idle
+ *   automation — the pre-compaction flush, the ten-turn nudge, and, when the
+ *                main session goes idle, the dream and the rotation check
+ *                (rotation.js)
  *   tags       — the current user turn per main Session, so dispatch_task and
  *                send_to_session can tag the message that caused them, and a
  *                mention row for every workspace a human message names
@@ -63,6 +64,8 @@ import {
 import { listDispatches } from './registry.js'
 import { atomicWrite, isoDay } from './entry.js'
 import { isHumanMessage, messageText } from './pushes.js'
+import { ROTATION_DEFAULTS, applyRotationEnv, rotateMain, sessionStats, shouldRotate } from './rotation.js'
+import { readState } from './state.js'
 import { listReports, storeRoot, whaleHomeDir } from './store.js'
 
 export const name = 'discipline-whale-memory'
@@ -89,10 +92,14 @@ export const MEMORY_DEFAULTS = Object.freeze({
   dreamMinEntries: 5,
   compactThresholdRatio: 0.8,
   compactHeadroomTokens: 65536,
+  // Per-route compaction ratios, the same list as the main preset's
+  // compaction-basic `modelPolicies`: `{ provider, model, thresholdRatio }`.
+  compactModelPolicies: Object.freeze([]),
   memoryMaxTokens: 4096,
   memoryProvider: '',
   memoryModel: '',
   migrateAutoMemory: true,
+  ...ROTATION_DEFAULTS,
 })
 
 /** Store functions the flush and the dream write through. */
@@ -116,6 +123,9 @@ const userTurns = new Map()
 
 /** Called when anything the activity board shows has changed. */
 const activityListeners = new Set()
+
+/** The rotation in flight in this process, or null: one at a time across every main agent. */
+let rotating = null
 
 /** The latest real user message of one main Session, or undefined. */
 export function currentUserTurn(sessionId) {
@@ -163,8 +173,22 @@ export function resolveMemoryConfig(input = {}) {
     if (typeof fallback === 'number' && Number.isFinite(value) && value > 0) out[key] = value
     else if (typeof fallback === 'string' && typeof value === 'string') out[key] = value
     else if (typeof fallback === 'boolean' && typeof value === 'boolean') out[key] = value
+    else if (Array.isArray(fallback) && Array.isArray(value)) out[key] = value.filter(isModelPolicy)
   }
   return out
+}
+
+/** A `compactModelPolicies` entry: a provider/model route and a ratio in (0, 1]. */
+function isModelPolicy(policy) {
+  return (
+    typeof policy?.provider === 'string' &&
+    policy.provider !== '' &&
+    typeof policy.model === 'string' &&
+    policy.model !== '' &&
+    Number.isFinite(policy.thresholdRatio) &&
+    policy.thresholdRatio > 0 &&
+    policy.thresholdRatio <= 1
+  )
 }
 
 /**
@@ -294,7 +318,9 @@ const OK_OUTPUT = {
  * @returns a handle with the caches and the internal triggers, for tests.
  */
 export function installMemory(ctx, config = {}, deps = {}) {
-  const resolved = resolveMemoryConfig(config)
+  const resolved = applyRotationEnv(resolveMemoryConfig(config), deps.env ?? process.env, (message) =>
+    ctx.logger?.warn?.(`discipline-whale memory: ${message}`),
+  )
   const root = () => (typeof deps.root === 'function' ? deps.root() : storeRoot())
   const now = () => (typeof deps.now === 'function' ? deps.now() : new Date())
   const service = (key) => {
@@ -458,24 +484,41 @@ export function installMemory(ctx, config = {}, deps = {}) {
   const stateFor = (sessionId) => {
     let state = sessions.get(sessionId)
     if (state === undefined) {
-      state = { nudging: false, flushedThisCycle: false, flushing: null, threshold: undefined }
+      state = { nudging: false, flushedThisCycle: false, flushing: null, threshold: undefined, contextWindow: undefined }
       sessions.set(sessionId, state)
     }
     return state
   }
 
+  /** The provider/model this main session runs on (the compaction route, not the memory model). */
+  function routeOf(agent) {
+    const config = agent?.session?.requestHeader?.()?.config
+    const provider = config?.provider || agent?.options?.provider
+    const model = config?.model || agent?.options?.model
+    return provider && model ? { provider, model } : undefined
+  }
+
+  /**
+   * The compaction trigger of this session's route; also caches its context
+   * window. The ratio is the route's `compactModelPolicies` entry, else
+   * `compactThresholdRatio`.
+   */
   async function thresholdFor(agent, state) {
     if (state.threshold !== undefined) return state.threshold
-    const target = targetOf(agent)
+    const route = routeOf(agent)
     const llm = service('llm')
-    if (target === undefined || llm?.resolveModelInfo === undefined) return undefined
+    if (route === undefined || llm?.resolveModelInfo === undefined) return undefined
     try {
-      const info = await llm.resolveModelInfo(target.provider, target.model)
+      const info = await llm.resolveModelInfo(route.provider, route.model)
       const reservedTokens = agent?.session?.requestHeader?.()?.config?.maxTokens ?? info?.defaultMaxTokens ?? 0
+      const policy = resolved.compactModelPolicies.find(
+        (candidate) => candidate.provider === route.provider && candidate.model === route.model,
+      )
+      state.contextWindow = info?.context?.contextWindow
       state.threshold = compactThreshold({
-        contextWindow: info?.context?.contextWindow,
+        contextWindow: state.contextWindow,
         reservedTokens,
-        ratio: resolved.compactThresholdRatio,
+        ratio: policy?.thresholdRatio ?? resolved.compactThresholdRatio,
         headroom: resolved.compactHeadroomTokens,
       })
     } catch {
@@ -564,6 +607,52 @@ export function installMemory(ctx, config = {}, deps = {}) {
       }
     })()
     return dreaming
+  }
+
+  /**
+   * Rotate this main session when the rule says so (rotation.js).
+   *
+   * Only the current segment (`state.mainSessionId`) rotates, and only one
+   * rotation runs per process at a time: a call while one is in flight joins
+   * it. The rotation flushes memory first and gives up when the agent is busy
+   * again afterwards; the next idle point checks again.
+   */
+  function maybeRotate(agent) {
+    if (resolved.rotateEnabled === false) return Promise.resolve({ skipped: 'disabled' })
+    if (rotating !== null) return rotating
+    const run = (async () => {
+      const sessionId = sessionIdOf(agent)
+      if (sessionId === undefined) return { skipped: 'no-session' }
+      const { mainSessionId } = await readState(root())
+      if (mainSessionId !== sessionId) return { skipped: 'not-current' }
+      const stats = sessionStats(agent.session?.snapshotEvents?.() ?? [])
+      const state = stateFor(sessionId)
+      const threshold = await thresholdFor(agent, state)
+      const decision = shouldRotate(stats, { config: resolved, contextWindow: state.contextWindow, compactThreshold: threshold })
+      if (!decision.rotate) return { skipped: 'not-due' }
+      return rotateMain({
+        sessionController: service('sessionController'),
+        agents: service('agents'),
+        oldSessionId: sessionId,
+        reason: decision.reason,
+        stats,
+        root: root(),
+        flush: () => startFlush(agent, 'pre-rotation'),
+        logger: ctx.logger,
+        agent,
+        config: resolved,
+        now,
+      })
+    })()
+      .catch((error) => {
+        warn(`rotation failed: ${error?.message ?? error}`)
+        return { skipped: 'error', error: String(error?.message ?? error) }
+      })
+      .finally(() => {
+        rotating = null
+      })
+    rotating = run
+    return run
   }
 
   /* -------- hooks -------- */
@@ -665,10 +754,11 @@ export function installMemory(ctx, config = {}, deps = {}) {
     return next()
   })
 
-  // Idle main session: the dream runs when due.
+  // Idle main session: the dream runs when due, then the rotation check.
   ctx.on('agent/status', ({ agent, status }) => {
     if (status !== 'idle' || !isMainAgent(agent)) return
     startDream(agent)
+    maybeRotate(agent)
   })
 
   // `tools/result` is the observe-only feed; the result itself passes through untouched.
@@ -835,7 +925,21 @@ export function installMemory(ctx, config = {}, deps = {}) {
     await refreshActivity()
   })()
 
-  return { config: resolved, cache, board, sessions, ready, refreshMemory, refreshActivity, startFlush, startDream, tools }
+  return {
+    config: resolved,
+    cache,
+    board,
+    sessions,
+    ready,
+    refreshMemory,
+    refreshActivity,
+    startFlush,
+    startDream,
+    maybeRotate,
+    rotation: () => rotating,
+    thresholdFor: (agent) => thresholdFor(agent, stateFor(sessionIdOf(agent))),
+    tools,
+  }
 }
 
 /** Main-session tools whose effect changes the activity board. */

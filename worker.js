@@ -60,8 +60,9 @@ export { dispatchCheckpointPath }
  * They are what separates "a dispatch record was lost in a restart" from "this
  * Session was never dispatched": the brief is written into the worker's own
  * Session log by `main.js`, so it survives exactly as long as the Session does.
+ * The rotation seed finds a running dispatch's brief by the same markers.
  */
-const BRIEF_MARKERS = Object.freeze(['You are a Discipline Whale worker', 'report_to_main'])
+export const BRIEF_MARKERS = Object.freeze(['You are a Discipline Whale worker', 'report_to_main'])
 
 /** Checkpoint writes already issued in this process, so a turn loop writes once. */
 const checkpointed = new Set()
