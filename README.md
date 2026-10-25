@@ -602,7 +602,7 @@ R2 = `max(min(rotateInputTokens, ⌊rotateWindowFraction × W⌋), ⌈1.2 × 压
 | `DW_ROTATE_MIN_HUMAN_TURNS` | 环境变量 | — | 覆盖 `rotateMinHumanTurns`；用于隔离实例验证和现场演示 |
 | `DW_ROTATE_AFTER_COMPACTIONS` | 环境变量 | — | 覆盖 `rotateAfterCompactions`；用于隔离实例验证和现场演示 |
 
-三个环境变量只接受正整数，非法值记一条 warning 并沿用配置值。`node scripts/rotation-proof.mjs` 按谱系逐段列出首末输入、摘要次数、runtime-context 快照数与人类消息数、种子大小，以及续接后报告推送落在哪一段；`--watch` 每 2 s 打印一行当前状态。
+三个环境变量只接受正整数，非法值记一条 warning 并沿用配置值。`node scripts/rotation-proof.mjs` 按谱系逐段列出首末输入、摘要次数、便签板刷新次数与人类消息数（A4）、全部 runtime-context 快照数、种子大小，以及续接后报告推送落在哪一段；`--watch` 每 2 s 打印一行当前状态。
 
 **客户端**：主会话每轮的回复尾部显示彩色工作区标签，点击打开对应的工作会话。派出去的会话在侧栏有工作区色点。工作区颜色在鲸鱼设置面板里修改。数据来自 `/api/discipline-whale/memory/{workspaces,tags,dispatched}`。
 
@@ -733,6 +733,11 @@ node test/rotation.mjs
 - **persona 改动同样要重启，且已存在的主会话仍用旧 prompt**。persona 是 preset 行的一部分，preset 在**会话创建时**装配进 system prompt：改完 `cordis.patch.yml` 后必须重启 `dsh web`，并且**新建**一个主会话（或换用新会话）才会拿到新纪律；已经开着的那个主会话不会中途换人格。验证只做到「组合后的配置树里有这段文本」和「按 Host 的组装方式渲染出的 system prompt 包含这段文本」（`node prompt-probe.mjs discipline-whale`、契约测试 ok 23），**没有**在真机上断言模型的派工行为是否改变——那需要 A/B 观察，本包不做这个声明。
 - **为什么输出纪律没做成第二个 `dsh-persona` 行**。更「干净」的想法是单独注册一个 persona 行、可独立开关。实测不行：同一个 preset 里两行 `dsh-persona` 都要注册 `deployment:persona-prefix` 这个 section，第二行会以 `prompt section "deployment:persona-prefix" is already registered in this scope` 直接让整个 preset 装载失败。所以改用**独立命名的 prompt section**（`discipline-whale:brevity`），紧跟在 persona 之后——同样可独立识别、可独立移除，也不会和 persona 抢槽位。
 - **不用「每轮注入一条提醒」的替代方案**。Host 有 `agent/pre-step` 钩子可以在每个 step 往上下文里插消息（`dsh-time-context` 就是这么做的），但那样每轮都会往**对话历史**里写一条 `user/message`：用户可见、会被压缩、会干扰正常讨论，还得按会话 id 过滤才知道是不是主会话。persona 是每个请求重新组装的 system section，天然只对主会话生效、不进对话正文、不占用户消息位。所以选了 persona。
+
+- **续接通知在宿主里显示成「收到执行请求」**。种子以 notice 投给新会话的 `followup`，它会唤醒一个回合；宿主的阅读视图给「唤醒回合的消息」画触发行，按 `source.kind` 选标题，不认识的 kind 一律是「收到执行请求」（`dsh-client-ui-chat` 的 `turnTriggerDetails`）。`source.summary`（「主会话已续接 · N 个进行中派工 · 最近 5 次交付」）和种子全文都在展开后的正文里，模型看到的是以 `【续接】` 开头的正文。
+- **`dsh-client-auto-continue` 的「继续」算人类回合**。它发的「继续」带 `source.kind: 'user'`，和用户原话分不开，所以会计入 `rotateMinHumanTurns`、便签板的 8 回合窗口和 `tags.jsonl`。它也会唤醒已存档的上一段：上一段收件箱里的消息由上一段处理完，这是设计如此，但上一段的输入会在存档后继续增长。
+- **插件日志在 `dsh web` 的标准输出里看不到**。`rotation: A → B`、flush 失败、续接跳过这些行都走 `ctx.logger`，宿主不把它们打到终端。要确认续接，看 `state.json` 的 `lineage`、`home/rotations/` 的种子文件，或跑 `node scripts/rotation-proof.mjs`。
+- **pre-rotation flush 失败时续接照常进行**。flush 是一次模型调用，遇到限流（实测 SoC 429）会失败；续接按顺序继续，这一段最后几轮的观察没有写进 daily 和 Now。上一段会话完整保留，可以回看。
 
 ## 命名冲突核查
 

@@ -7,8 +7,10 @@
  *
  *   input           first and last `usage.inputTokens` of its assistant messages
  *   compactions     `compaction/summary` events
- *   snapshots       runtime-context snapshots, next to the human messages
- *                   (acceptance A4: snapshots ≤ human messages + 1)
+ *   board refreshes runtime-context snapshots whose `discipline-whale:activity`
+ *                   section changed, next to the human messages (acceptance
+ *                   A4: board refreshes ≤ human messages + 1); other plugins'
+ *                   sections add snapshots of their own, counted beside it
  *   report pushes   worker report pushes in the segment; for an archived
  *                   segment, how many still landed there after it ended
  *   seed            the seed file that opened the segment: characters and the
@@ -46,6 +48,9 @@ const DSH_HOME = process.env.DSH_HOME ?? join(homedir(), '.dsh')
 /** Source kind the agent loop gives runtime-context snapshots. */
 const RUNTIME_CONTEXT_KIND = 'runtime-context'
 
+/** The board's section inside a runtime-context snapshot. */
+const ACTIVITY_SECTION = 'discipline-whale:activity'
+
 /** `$DSH_HOME/sessions/<cwd key>/<sessionId>/session.v4.jsonl.zstd`, or undefined. */
 async function sessionLogPath(sessionId) {
   const root = join(DSH_HOME, 'sessions')
@@ -70,9 +75,11 @@ function measure(records) {
     lastInputTokens: undefined,
     compactions: 0,
     snapshots: 0,
+    boardSnapshots: 0,
     humanMessages: 0,
     reportPushes: [],
   }
+  let board
   for (const record of records) {
     if (record?.type === 'assistant/message') {
       const tokens = record.data?.usage?.inputTokens
@@ -83,7 +90,13 @@ function measure(records) {
     } else if (record?.type === 'compaction/summary') {
       out.compactions += 1
     } else if (record?.type === 'user/message') {
-      if (record.data?.source?.kind === RUNTIME_CONTEXT_KIND) out.snapshots += 1
+      if (record.data?.source?.kind === RUNTIME_CONTEXT_KIND) {
+        out.snapshots += 1
+        // Other plugins add their own sections; A4 is about the whale's board refreshes.
+        const text = record.data.source.sections?.find?.((section) => section.name === ACTIVITY_SECTION)?.text
+        if (text !== undefined && text !== board) out.boardSnapshots += 1
+        if (text !== undefined) board = text
+      }
       else if (isHumanMessage(record.data)) out.humanMessages += 1
       else if (messageText(record.data).startsWith(PUSH_PREFIXES.report)) out.reportPushes.push(Number(record.time))
     }
@@ -139,7 +152,7 @@ export async function collect() {
       reportPushes: segment.reportPushes?.length,
       pushesAfterEnd: Number.isFinite(endedAt) ? (segment.reportPushes ?? []).filter((time) => time > endedAt).length : undefined,
       seed: await seedFacts(opened?.seedFile),
-      a4: Number.isInteger(segment.snapshots) ? segment.snapshots <= segment.humanMessages + 1 : undefined,
+      a4: Number.isInteger(segment.boardSnapshots) ? segment.boardSnapshots <= segment.humanMessages + 1 : undefined,
       pushTimes: segment.reportPushes ?? [],
     })
   }
@@ -170,13 +183,13 @@ function render({ dshHome, mainSessionId, segments, rotations }) {
     '',
     `main session: ${mainSessionId ?? '(none recorded)'} · segments: ${segments.length} · rotations: ${rotations.length}`,
     '',
-    '| # | session | state | input first → last | compactions | snapshots / human (A4) | report pushes | after end | seed chars | seed running |',
-    '|---|---|---|---|---|---|---|---|---|---|',
+    '| # | session | state | input first → last | compactions | board refreshes / human (A4) | all snapshots | report pushes | after end | seed chars | seed running |',
+    '|---|---|---|---|---|---|---|---|---|---|---|',
   ]
   for (const segment of segments) {
     const state = segment.current ? 'current' : `archived (${segment.reason ?? '?'})`
     if (segment.log === undefined || segment.error !== undefined) {
-      lines.push(`| ${segment.number} | ${short(segment.sessionId)} | ${state} | ${segment.error ?? 'no log found'} | | | | | | |`)
+      lines.push(`| ${segment.number} | ${short(segment.sessionId)} | ${state} | ${segment.error ?? 'no log found'} | | | | | | | |`)
       continue
     }
     lines.push(
@@ -187,7 +200,8 @@ function render({ dshHome, mainSessionId, segments, rotations }) {
         state,
         `${num(segment.firstInputTokens)} → ${num(segment.lastInputTokens)}`,
         segment.compactions,
-        `${segment.snapshots} / ${segment.humanMessages} (${segment.a4 ? 'ok' : 'over'})`,
+        `${segment.boardSnapshots} / ${segment.humanMessages} (${segment.a4 ? 'ok' : 'over'})`,
+        segment.snapshots,
         segment.reportPushes,
         segment.pushesAfterEnd ?? '—',
         segment.seed?.chars === undefined ? '—' : num(segment.seed.chars),

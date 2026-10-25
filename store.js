@@ -520,13 +520,14 @@ export async function readReportIndex(homeDir, workspaceId) {
  * Read one workspace's index file, rebuilding it first when it cannot be trusted.
  *
  * The file is trusted when it exists and its header `count` equals the number
- * of `*.json` files in the report folder. A missing file, a hand-edited one, or
- * one written before the newest report landed is rebuilt, and `rebuilt: true`
- * says so.
+ * of readable reports in the folder — the same listing the header was counted
+ * from, so an unreadable `*.json` does not force a rebuild on every read. A
+ * missing file, a hand-edited one, or one written before the newest report
+ * landed is rebuilt, and `rebuilt: true` says so.
  */
 export async function ensureReportIndex(homeDir, workspaceId, workspaceTitle) {
   const path = reportIndexPath(homeDir, workspaceId)
-  const files = await countReportFiles(homeDir, workspaceId)
+  const files = (await listReports(homeDir, workspaceId)).length
   const current = await readReportIndex(homeDir, workspaceId)
   if (current !== undefined && current.count === files) return { ...current, path, rebuilt: false }
   await writeReportIndex(homeDir, workspaceId, workspaceTitle)
