@@ -9,6 +9,7 @@ import { mkdtemp, readFile, rm, writeFile, mkdir } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
+import { PUSH_PREFIXES } from '../pushes.js'
 import {
   PALETTE,
   buildBootstrap,
@@ -216,6 +217,13 @@ try {
     const sums = bullets.filter((line) => line.includes('summary'))
     assert.deepEqual(sums.map((line) => parseEntry(line).meta.report_id), ['r-3', 'r-4', 'r-5'])
     assert.ok(charLength(block) <= 3000)
+
+    // a whale push recorded as a turn by older versions is not a user quote
+    await recordUserTurn(home, { sessionId: 's', turn: 13, messageId: 'm13', text: `${PUSH_PREFIXES.report}blog (done) 已完成`, at: '2026-10-13T10:00:00.000Z' })
+    await tagTurn(home, { sessionId: 's', turn: 13, workspaceId: 'ws-blog', at: '2026-10-13T10:00:00.000Z' })
+    const quoted = (await buildBootstrap(home, { workspace, reports })).split('\n').filter((line) => line.includes('用户消息'))
+    assert.ok(!(await buildBootstrap(home, { workspace, reports })).includes(PUSH_PREFIXES.report), 'pushes are left out')
+    assert.equal(quoted.length, 8, 'still the 8 most recent user messages')
 
     // budget trimming: oldest tags go first, then oldest reports
     const big = await newHome()

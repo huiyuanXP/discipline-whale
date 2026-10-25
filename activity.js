@@ -864,8 +864,10 @@ export async function buildBootstrap(homeDir, { workspace, reports = [] }) {
       ? undefined
       : formatEntry({ text: `${workspace.title ?? workspace.id} · ${intro}`, meta: { updated: card.updatedAt } })
 
-  const tags = (await readTags(homeDir, { workspaceId: workspace.id, limit: 8 }))
-    .filter((tag) => tag.text !== '')
+  // Older tags.jsonl rows recorded whale pushes as turns; only the user's own words go in.
+  const tags = (await readTags(homeDir, { workspaceId: workspace.id }))
+    .filter((tag) => tag.text !== '' && !isWhalePushText(tag.text))
+    .slice(-8)
     .map((tag) => formatEntry({ text: clip(tag.text, 200), meta: { at: localDay(tag.at) } }))
   const recent = reports
     .filter((report) => report?.status !== 'pending' && typeof report?.summary === 'string')
