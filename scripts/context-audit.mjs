@@ -261,15 +261,13 @@ export async function auditSession(path) {
     turns.set(u.turn, t)
   }
 
-  // The messages resident before the first step: everything user/system visible
-  // up to the first assistant message.
+  // The messages resident before the first step: everything user visible up to
+  // the first assistant message. The system prompt is `systemTokens` below.
   const firstAssistantSeq = records.find((r) => r.type === 'assistant/message')?.seq ?? Infinity
   const residentMessages = []
   for (const r of records) {
     if (r.seq >= firstAssistantSeq) break
-    if (r.type === 'system/message') {
-      residentMessages.push({ kind: 'system', tokens: estimateSystemMessage(r.data.message) })
-    } else if (r.type === 'user/message') {
+    if (r.type === 'user/message') {
       residentMessages.push({
         kind: r.data.source?.kind === 'skill-catalog' ? 'skill-catalog' : 'user',
         tokens: estimateMessage(r.data),
