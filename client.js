@@ -514,20 +514,63 @@ window.__ModuleLoader__.load({
     }
 
     /**
+     * The revisions this page booted with, as a lookup.
+     *
+     * MEASURED CORRECTION. `__DSH_BOOT__.rev` is ONE rev for the whole page
+     * (`216d2e17ada0` on the live GUI), and every plugin bundle carries its OWN
+     * rev (`discipline-whale` → `1e182f53c091`, measured on the same boot).
+     * Comparing a bundle's rev against the page rev therefore never matched —
+     * `isStaleBundleUrl` returned true for a *current* bundle and true for a
+     * stale one, so the "is this actually stale?" question was never answered.
+     * The revisions that matter are the per-entry ones in
+     * `__DSH_BOOT__.entries[]`.
+     *
+     * @param {object} boot - `globalThis.__DSH_BOOT__`.
+     * @returns {Map<string, string>} bundle id → rev recorded at boot.
+     */
+    function bootBundleRevs(boot) {
+      const revs = new Map();
+      const entries = Array.isArray(boot?.entries) ? boot.entries : [];
+      for (const entry of entries) {
+        if (typeof entry?.id === "string" && typeof entry?.rev === "string" && entry.rev !== "") {
+          revs.set(entry.id, entry.rev);
+        }
+      }
+      return revs;
+    }
+
+    /**
      * True when a bundle URL names a revision other than the one this page
      * booted with — the reinstall case, where only a reload helps.
      *
+     * A 404 on a *current* bundle is not the stale-rev case: it means the host
+     * refuses to serve a rev it just advertised, which a reload cannot fix and
+     * must not turn into a reload loop.
+     *
      * @param {string} url - a request URL.
-     * @param {string} bootRev - the rev recorded at boot.
+     * @param {Map<string, string>|string} bootRevs - per-entry revs, or a single
+     *   rev used as the fallback when no entry can be identified.
      * @returns {boolean}
      */
-    function isStaleBundleUrl(url, bootRev) {
-      if (typeof url !== "string" || typeof bootRev !== "string" || bootRev === "") return false;
-      // Boot URLs are document-relative (`plugins/??<id>/client.js&rev=...`),
-      // so the marker is the `plugins/` segment, never a leading slash.
-      if (!url.includes("plugins/")) return false;
+    function isStaleBundleUrl(url, bootRevs) {
+      if (typeof url !== "string" || !url.includes("plugins/")) return false;
       const match = /[?&]rev=([0-9a-z]+)/i.exec(url);
-      return match !== null && match[1] !== bootRev;
+      if (match === null) return false;
+      const requested = match[1];
+      if (bootRevs instanceof Map && bootRevs.size > 0) {
+        // The combo form lists ids as `<id>/client.js`, comma separated inside
+        // the `??` search; the single form is `<id>/client.js?rev=`.
+        const bundleId = /plugins\/(?:\?\?)?([^,&?]+)\/client\.js/i.exec(url)?.[1];
+        if (typeof bundleId === "string") {
+          const bootRev = bootRevs.get(bundleId);
+          if (typeof bootRev === "string") return requested !== bootRev;
+        }
+        // No entry named for this URL: it is not one of this page's bundles, so
+        // nothing can be proven stale. Guessing here is what caused the loop.
+        return false;
+      }
+      if (typeof bootRevs !== "string" || bootRevs === "") return false;
+      return requested !== bootRevs;
     }
 
     /**
@@ -549,7 +592,10 @@ window.__ModuleLoader__.load({
       const notify = typeof options.notify === "function" ? options.notify : () => {};
       const location = typeof options.location === "function" ? options.location : () => ({ href: "" });
       const storedToken = typeof options.storedToken === "function" ? options.storedToken : () => "";
-      const bootRev = options.bootRev;
+      // The boot revisions to compare against. A live page passes the per-entry
+      // map; a caller that only knows one rev still passes a string, which the
+      // predicate accepts as the legacy form.
+      const bootRevs = options.bootRevs ?? options.bootRev;
       // "already acted" is a latch, not a counter: one repair per page load.
       let acted = false;
 
@@ -566,7 +612,7 @@ window.__ModuleLoader__.load({
           // A 404 is only the stale-rev case when it landed on a plugin
           // bundle; any other 404 is the host's own answer and means nothing
           // about the restart.
-          if (action === "stale-bundle" && !isStaleBundleUrl(url, bootRev)) action = "ignore";
+          if (action === "stale-bundle" && !isStaleBundleUrl(url, bootRevs)) action = "ignore";
           if (action === "ignore" || action === "retry") return action;
           if (acted) return action;
           acted = true;
@@ -2055,6 +2101,153 @@ window.__ModuleLoader__.load({
         return { kind: "auth", message: strings.authLost, action: strings.authReopen, hint: strings.authPasteHint };
       }
       return { kind: "failed", message: strings.failed.replace("{reason}", reason), action: strings.retry };
+    }
+
+    /**
+     * The unauthenticated route the Host serves this process's launch URL on.
+     * Kept in step with `TOKEN_HANDOFF_ROUTE` in `token-handoff.js`.
+     */
+    const HANDOFF_ROUTE = "/api/discipline-whale/auth-handoff";
+
+    /**
+     * Ask the Host for the URL that would authenticate this browser.
+     *
+     * MEASURED NEED this closes: when the browser has no usable cookie, every
+     * repair the page can do by itself is a no-op —
+     *
+     *   GET /              → 401   (and 401 again on each refresh: measured 3×
+     *                               in a row)
+     *   GET /?token=<dead> → 401   (the token died with the process that made it)
+     *   GET /?token=<live> → 303 → 200
+     *
+     * so "reload" simply re-fetches a known failure. The cookie usually survives
+     * a restart (its signing secret is stored in `$DSH_HOME/.credentials.yaml`),
+     * which is why a manual refresh normally works — but NOT when the cookie is
+     * absent: a new browser, a cleared jar, the 30-day expiry, or the other host
+     * spelling (`localhost:3080` and `127.0.0.1:3080` have different cookie
+     * names, measured). Then the page needs a token it has never held, and only
+     * the Host can supply one.
+     *
+     * Cached: the promise is shared, so a burst of 401s asks once. That is not
+     * laziness — the token is fixed for the life of a process, so re-asking
+     * cannot learn anything new, and a restart storm must not become a request
+     * storm.
+     *
+     * @param {{fetch?: Function, origin?: string}} [options]
+     * @returns {Promise<string|null>} the launch URL, or null when unavailable.
+     */
+    let handoffAsk;
+
+    /**
+     * Forget the cached ask. Called by the page after a reload lands (a new
+     * document starts fresh anyway) and by tests that drive distinct answers.
+     */
+    function forgetLaunchUrlAsk() {
+      handoffAsk = undefined;
+    }
+
+    function askForLaunchUrl(options = {}) {
+      if (handoffAsk !== undefined) return handoffAsk;
+      const request = typeof options.fetch === "function" ? options.fetch : (typeof fetch === "function" ? fetch : undefined);
+      const origin = typeof options.origin === "string" && options.origin !== ""
+        ? options.origin
+        : (typeof location !== "undefined" ? location.origin : "");
+      if (request === undefined || origin === "") {
+        handoffAsk = Promise.resolve(null);
+        return handoffAsk;
+      }
+      handoffAsk = (async () => {
+        try {
+          const response = await request(`${origin}${HANDOFF_ROUTE}`, {
+            method: "GET",
+            // Same-origin so a cookie that DOES work still rides along; the
+            // route needs none, which is what makes it useful here.
+            credentials: "same-origin",
+            // The token changes whenever the process does, so a cached answer
+            // is a dead credential.
+            cache: "no-store",
+            headers: { accept: "application/json" },
+          });
+          if (response?.ok !== true) return null;
+          let body;
+          try {
+            body = await response.json();
+          } catch (_error) {
+            return null;
+          }
+          return typeof body?.url === "string" && body.url !== "" ? body.url : null;
+        } catch (_error) {
+          return null;
+        }
+      })();
+      return handoffAsk;
+    }
+
+    /**
+     * The event a page fires when it cannot repair itself.
+     *
+     * One constant, both sides: `installRestartWatch` dispatches it and the
+     * notice listens for it. They were two independent string literals before,
+     * which is how the dispatch ended up with no listener at all.
+     */
+    const REAUTH_EVENT = "discipline-whale:reauth-needed";
+
+    /**
+     * The on-screen notice for "you must authenticate by hand".
+     *
+     * MEASURED GAP this closes: `installRestartWatch` dispatched
+     * `discipline-whale:reauth-needed` when no reload target existed, and the
+     * shipped 0.7.0 client had zero listeners for it (`grep -c` → 0). A dead
+     * page therefore stayed dead and silent, which is the state the user
+     * reported. This is the listener: it turns the event into visible copy.
+     *
+     * State is read and written through injected accessors rather than closed
+     * over, so a fresh render (or a test) sees the same notice. An offer that
+     * is already up returns false — a restart storm must not stack notices.
+     *
+     * @param {object} strings - resolved copy: authLost, authReopen, authPasteHint.
+     * @param {{read?: () => object, write?: (next: object) => void}} [store] -
+     *   where the shown/dismissed flag lives; a module-level cell by default.
+     * @returns {{visible: () => boolean, current: () => object|null, offer: () => boolean, dismiss: () => void}}
+     */
+    function createReauthNotice(strings, store = {}) {
+      let local = { shown: false };
+      const read = typeof store.read === "function" ? store.read : () => local;
+      const write = typeof store.write === "function" ? store.write : (next) => {
+        local = next;
+      };
+      const copyOf = () => ({
+        message: strings.authLost,
+        action: strings.authReopen,
+        hint: strings.authPasteHint,
+      });
+      return {
+        // The copy itself never changes with the flag, so it rides on the
+        // handle: a render can read `notice.hint` without going through
+        // `current()` first.
+        ...copyOf(),
+        /** Whether the notice is on screen. */
+        visible() {
+          return read()?.shown === true;
+        },
+        /** The copy to render, or null when nothing is shown. */
+        current() {
+          return read()?.shown === true ? copyOf() : null;
+        },
+        /**
+         * Show the notice. Returns whether this call changed anything, so the
+         * caller can skip a re-render when it was already up.
+         */
+        offer() {
+          if (read()?.shown === true) return false;
+          write({ ...read(), shown: true });
+          return true;
+        },
+        /** Hide the notice: the person has read the instruction. */
+        dismiss() {
+          write({ ...read(), shown: false });
+        },
+      };
     }
 
     function makeWhalePage(ctx, t) {
@@ -6148,23 +6341,53 @@ window.__ModuleLoader__.load({
      *
      * @returns {() => void} a disposer for the plugin's effect scope.
      */
-    function installRestartWatch() {
+    function installRestartWatch(options = {}) {
       if (typeof window === "undefined" || typeof window.fetch !== "function") return () => {};
+      // The banner speaks the page's language: `apply` passes the same bound
+      // translator the panel uses, so a broken page is not the one place that
+      // switches to Chinese on an English GUI.
+      const copyOf = typeof options.strings === "function" ? options.strings : undefined;
       const boot = globalThis.__DSH_BOOT__;
-      const bootRev = typeof boot?.rev === "string" ? boot.rev : "";
+      // Per-bundle revisions, not the page-wide `rev`: a bundle is stale when
+      // ITS rev changed, and the page rev would mark every plugin stale.
+      const bootRevs = bootBundleRevs(boot);
       const watch = createRestartWatch({
-        bootRev,
+        bootRevs,
         location: () => window.location,
         storedToken: readStoredToken,
         reload: (url) => {
-          // `location.replace` keeps the dead page out of the back stack: the
-          // tab is being repaired, not navigated.
-          window.location.replace(url);
+          // A page that already HAS a token just reloads: the URL re-mints the
+          // cookie by itself. A page with NO token would reload straight back
+          // into the 401 it just came from (measured: three refreshes, three
+          // 401s), so it asks the Host for this process's launch URL first and
+          // reloads onto that instead. When the Host has none either, it
+          // reloads anyway and the notice explains what to paste.
+          const hasToken = (() => {
+            try {
+              return new URL(url).searchParams.get(TOKEN_QUERY) !== null;
+            } catch (_error) {
+              return false;
+            }
+          })();
+          if (hasToken) {
+            // `location.replace` keeps the dead page out of the back stack: the
+            // tab is being repaired, not navigated.
+            window.location.replace(url);
+            return;
+          }
+          askForLaunchUrl().then((fresh) => {
+            if (typeof fresh === "string" && fresh !== "") {
+              window.location.replace(fresh);
+              return;
+            }
+            window.location.replace(url);
+            window.dispatchEvent(new CustomEvent(REAUTH_EVENT));
+          });
         },
         notify: () => {
-          // No token available. The panel shows the paste-the-URL hint; this
-          // event is what makes it appear without a reload.
-          window.dispatchEvent(new CustomEvent("discipline-whale:reauth-needed"));
+          // No reload target exists (an unparseable location). The notice below
+          // is what turns this into visible copy with the paste instruction.
+          window.dispatchEvent(new CustomEvent(REAUTH_EVENT));
         },
       });
       const originalFetch = window.fetch;
@@ -6188,10 +6411,95 @@ window.__ModuleLoader__.load({
         watch.observe({ status: 404, url });
       };
       window.addEventListener("error", onResourceError, true);
+      // THE MISSING LISTENER. The dispatch above used to land on an empty
+      // window: measured on the shipped 0.7.0 client, zero listeners for
+      // `discipline-whale:reauth-needed`. A page that cannot repair itself must
+      // at least say so, with the one instruction that does work, so the event
+      // now paints a banner in the page itself rather than hoping a component
+      // happens to be mounted.
+      const onReauthNeeded = () => showReauthBanner(copyOf === undefined ? undefined : copyOf());
+      window.addEventListener(REAUTH_EVENT, onReauthNeeded);
       return () => {
         if (window.fetch === wrapped) window.fetch = originalFetch;
         window.removeEventListener("error", onResourceError, true);
+        window.removeEventListener(REAUTH_EVENT, onReauthNeeded);
       };
+    }
+
+    /**
+     * The banner id, so a second event replaces the first instead of stacking.
+     */
+    const REAUTH_BANNER_ID = "discipline-whale-reauth-banner";
+
+    /**
+     * Paint "authenticate again" into the live document.
+     *
+     * Deliberately a plain DOM node appended to `body` rather than a React
+     * tree: the failure it reports is that the page cannot reach the host, so
+     * it must not depend on the page's own data flow still working. It is
+     * `position: fixed` and `z-index`-high so a broken layout cannot hide it.
+     *
+     * @returns {object|null} the notice handle that owns the banner, or null
+     *   when there is no document to paint into.
+     */
+    function showReauthBanner(strings) {
+      if (typeof document === "undefined" || document.body === null) return null;
+      const copy = strings ?? DICTIONARIES.zh;
+      const existing = document.getElementById(REAUTH_BANNER_ID);
+      if (existing !== null) return null;
+      const notice = createReauthNotice(copy);
+      notice.offer();
+      const text = notice.current();
+      if (text === null) return notice;
+      const banner = document.createElement("div");
+      banner.id = REAUTH_BANNER_ID;
+      banner.setAttribute("role", "alert");
+      banner.style.cssText = [
+        "position:fixed",
+        "left:50%",
+        "top:16px",
+        "transform:translateX(-50%)",
+        "z-index:2147483647",
+        "max-width:min(560px,calc(100vw - 32px))",
+        "padding:14px 16px",
+        "border-radius:12px",
+        "background:#fff6e5",
+        "border:1px solid #e8b25a",
+        "box-shadow:0 6px 20px rgba(0,0,0,.16)",
+        "font:14px/1.5 system-ui,-apple-system,'PingFang SC',sans-serif",
+        "color:#4a3410",
+      ].join(";");
+      const title = document.createElement("div");
+      title.style.cssText = "font-weight:600;margin-bottom:6px";
+      title.textContent = text.message;
+      const hint = document.createElement("div");
+      hint.style.cssText = "font-size:13px;opacity:.92";
+      hint.textContent = text.hint;
+      const close = document.createElement("button");
+      close.type = "button";
+      close.textContent = "×";
+      close.setAttribute("aria-label", "关闭");
+      close.style.cssText = [
+        "position:absolute",
+        "right:8px",
+        "top:6px",
+        "border:0",
+        "background:transparent",
+        "font-size:18px",
+        "line-height:1",
+        "cursor:pointer",
+        "color:#4a3410",
+      ].join(";");
+      close.addEventListener("click", () => {
+        notice.dismiss();
+        banner.remove();
+      });
+      banner.style.position = "fixed";
+      banner.appendChild(close);
+      banner.appendChild(title);
+      banner.appendChild(hint);
+      document.body.appendChild(banner);
+      return notice;
     }
 
     function apply(ctx) {
@@ -6210,7 +6518,13 @@ window.__ModuleLoader__.load({
       // until the person refreshes by hand. Installed before anything renders,
       // so the first 401 of a dead page is already covered.
       rememberToken();
-      ctx.effect(installRestartWatch, "discipline-whale: restart recovery");
+      ctx.effect(() => installRestartWatch({
+        strings: () => ({
+          authLost: t("authLost"),
+          authReopen: t("authReopen"),
+          authPasteHint: t("authPasteHint"),
+        }),
+      }), "discipline-whale: restart recovery");
       // Report rows: a pushed Worker report is an ordinary user row, so it is
       // painted where the Host renders it. The observer watches the transcript
       // for new rows and claims the ones that carry a report id. It writes
@@ -6322,8 +6636,15 @@ window.__ModuleLoader__.load({
     module.exports.restartActionFor = restartActionFor;
     module.exports.reauthUrl = reauthUrl;
     module.exports.isStaleBundleUrl = isStaleBundleUrl;
+    module.exports.bootBundleRevs = bootBundleRevs;
     module.exports.createRestartWatch = createRestartWatch;
     module.exports.whaleFailureCopy = whaleFailureCopy;
+    module.exports.createReauthNotice = createReauthNotice;
+    module.exports.REAUTH_EVENT = REAUTH_EVENT;
+    module.exports.showReauthBanner = showReauthBanner;
+    module.exports.askForLaunchUrl = askForLaunchUrl;
+    module.exports.forgetLaunchUrlAsk = forgetLaunchUrlAsk;
+    module.exports.HANDOFF_ROUTE = HANDOFF_ROUTE;
     module.exports.WORKSPACE_PALETTE = WORKSPACE_PALETTE;
     module.exports.createMemoryStore = createMemoryStore;
     module.exports.memoryStore = memoryStore;
