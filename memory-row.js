@@ -95,7 +95,11 @@ export const MEMORY_DEFAULTS = Object.freeze({
   // Per-route compaction ratios, the same list as the main preset's
   // compaction-basic `modelPolicies`: `{ provider, model, thresholdRatio }`.
   compactModelPolicies: Object.freeze([]),
-  memoryMaxTokens: 4096,
+  // A reasoning route spends this budget on reasoning before it answers, so a
+  // dream prompt of ~30k characters needs far more than 4096: at 4096 the model
+  // returned an empty answer with every token spent thinking, which read as
+  // "model answer holds no JSON object" for 18 dreams in a row (2026-10-25).
+  memoryMaxTokens: 16384,
   memoryProvider: '',
   memoryModel: '',
   migrateAutoMemory: true,

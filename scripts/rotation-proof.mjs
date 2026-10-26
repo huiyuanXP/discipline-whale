@@ -51,6 +51,9 @@ const RUNTIME_CONTEXT_KIND = 'runtime-context'
 /** The board's section inside a runtime-context snapshot. */
 const ACTIVITY_SECTION = 'discipline-whale:activity'
 
+/** `source.kind` of the seed notice that opens a rotated segment (rotation.js). */
+const ROTATION_SEED_KIND = 'plugin:discipline-whale:rotation'
+
 /** `$DSH_HOME/sessions/<cwd key>/<sessionId>/session.v4.jsonl.zstd`, or undefined. */
 async function sessionLogPath(sessionId) {
   const root = join(DSH_HOME, 'sessions')
@@ -77,6 +80,10 @@ function measure(records) {
     snapshots: 0,
     boardSnapshots: 0,
     humanMessages: 0,
+    failedCompactions: 0,
+    seedKind: undefined,
+    seedChars: undefined,
+    seedRunning: undefined,
     reportPushes: [],
   }
   let board
@@ -89,6 +96,10 @@ function measure(records) {
       }
     } else if (record?.type === 'compaction/summary') {
       out.compactions += 1
+    } else if (record?.type === 'compaction/end') {
+      // Diagnostic only: a compaction that failed is the third rotation rule's
+      // input, so its count belongs next to the summaries in the report.
+      if (record.data?.error !== undefined) out.failedCompactions += 1
     } else if (record?.type === 'user/message') {
       if (record.data?.source?.kind === RUNTIME_CONTEXT_KIND) {
         out.snapshots += 1
@@ -98,7 +109,14 @@ function measure(records) {
         if (text !== undefined) board = text
       }
       else if (isHumanMessage(record.data)) out.humanMessages += 1
-      else if (messageText(record.data).startsWith(PUSH_PREFIXES.report)) out.reportPushes.push(Number(record.time))
+      else if (record.data?.source?.kind === ROTATION_SEED_KIND) {
+        // Diagnostic only: the seed that opened this segment, as the segment
+        // itself records it. A rotation whose seed never landed has no such row.
+        out.seedKind = record.data.source.kind
+        out.seedChars = Array.from(messageText(record.data)).length
+      } else if (messageText(record.data).startsWith(PUSH_PREFIXES.report)) {
+        out.reportPushes.push(Number(record.time))
+      }
     }
   }
   return out
@@ -183,13 +201,13 @@ function render({ dshHome, mainSessionId, segments, rotations }) {
     '',
     `main session: ${mainSessionId ?? '(none recorded)'} · segments: ${segments.length} · rotations: ${rotations.length}`,
     '',
-    '| # | session | state | input first → last | compactions | board refreshes / human (A4) | all snapshots | report pushes | after end | seed chars | seed running |',
-    '|---|---|---|---|---|---|---|---|---|---|---|',
+    '| # | session | state | input first → last | compactions (failed) | board refreshes / human (A4) | all snapshots | report pushes | after end | seed chars | seed running | seed kind |',
+    '|---|---|---|---|---|---|---|---|---|---|---|---|',
   ]
   for (const segment of segments) {
     const state = segment.current ? 'current' : `archived (${segment.reason ?? '?'})`
     if (segment.log === undefined || segment.error !== undefined) {
-      lines.push(`| ${segment.number} | ${short(segment.sessionId)} | ${state} | ${segment.error ?? 'no log found'} | | | | | | | |`)
+      lines.push(`| ${segment.number} | ${short(segment.sessionId)} | ${state} | ${segment.error ?? 'no log found'} | | | | | | | | |`)
       continue
     }
     lines.push(
@@ -199,13 +217,14 @@ function render({ dshHome, mainSessionId, segments, rotations }) {
         short(segment.sessionId),
         state,
         `${num(segment.firstInputTokens)} → ${num(segment.lastInputTokens)}`,
-        segment.compactions,
+        `${segment.compactions}${segment.failedCompactions > 0 ? ` (${segment.failedCompactions} failed)` : ''}`,
         `${segment.boardSnapshots} / ${segment.humanMessages} (${segment.a4 ? 'ok' : 'over'})`,
         segment.snapshots,
         segment.reportPushes,
         segment.pushesAfterEnd ?? '—',
         segment.seed?.chars === undefined ? '—' : num(segment.seed.chars),
         segment.seed?.running ?? '—',
+        segment.seedKind === undefined ? (segment.number === 1 ? '— (first segment)' : '— (no seed row)') : 'rotation',
         '',
       ].join(' | ').trim(),
     )

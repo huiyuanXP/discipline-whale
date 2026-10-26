@@ -35,7 +35,7 @@ import {
   runDream,
   shouldDream,
 } from '../dream.js'
-import { readCursor, writeCursor } from '../memory-flush.js'
+import { answerPreview, readCursor, writeCursor } from '../memory-flush.js'
 import { whaleHomeDir } from '../store.js'
 
 const USER = [
@@ -352,6 +352,79 @@ try {
     assert.match(await readFile(dreamsLogPath(home), 'utf8'), /error: Error: provider down/)
     assert.equal((await readCursor(home)).lastDreamAt, undefined)
     console.log('ok 10 — a busy lock skips; a failing model returns ok:false and releases the lock')
+  }
+
+  // 11. An empty answer retries once, then the retry's answer is applied.
+  {
+    const home = join(root, 'retry')
+    const store = fakeStore()
+    const ops = [{ op: 'promote', from: ['D2026-10-21#3'], target: 'memory', text: 'The blog builds with bun' }]
+    const answers = ['', JSON.stringify({ ops })]
+    let calls = 0
+    const result = await runDream({
+      homeDir: home,
+      complete: async () => {
+        const answer = answers[Math.min(calls, answers.length - 1)]
+        calls += 1
+        return answer
+      },
+      store,
+      now,
+    })
+    assert.equal(calls, 2, 'an unparsable answer is asked for exactly once more')
+    assert.equal(result.ok, true)
+    assert.equal(result.mode, 'full')
+    assert.ok(store.layers.memory.includes('The blog builds with bun'), 'the retry lands its promotion')
+    const log = await readFile(dreamsLogPath(home), 'utf8')
+    assert.match(log, /attempt 1 unparsable/, 'the failed first attempt is on the record')
+    assert.ok(!log.includes('mode: error'), 'a recovered dream is not logged as an error')
+    console.log('ok 11 — an empty answer (reasoning ate the budget) retries once and the retry is applied')
+  }
+
+  // 12. A plain-text answer with no JSON degrades visibly and writes neither layer.
+  {
+    const home = join(root, 'nojson')
+    const store = fakeStore()
+    const plain = `I reviewed the memory. Everything looks fine, so no operations are needed today. ${'detail '.repeat(60)}`
+    let calls = 0
+    const result = await runDream({
+      homeDir: home,
+      complete: async () => {
+        calls += 1
+        return plain
+      },
+      store,
+      now,
+    })
+    assert.equal(calls, 2, 'a plain-text answer is retried once too')
+    assert.equal(result.ok, false)
+    assert.equal(result.mode, 'error')
+    assert.equal(result.degraded, true, 'the run reports itself as a visible degradation')
+    assert.deepEqual(store.writes, [], 'USER.md and MEMORY.md are untouched')
+    assert.equal(store.layers.user, USER)
+    assert.equal(store.layers.memory, MEMORY)
+
+    const preview = answerPreview(plain)
+    assert.ok(preview.length <= 201, 'the excerpt is bounded')
+    assert.ok(result.error.includes(preview), 'the error carries the answer excerpt, so it proves its own cause')
+
+    const log = await readFile(dreamsLogPath(home), 'utf8')
+    assert.match(log, /mode: error/)
+    assert.match(log, /this dream consolidated nothing/, 'the degradation line is visible in DREAMS.md')
+    assert.ok(log.includes(preview), 'DREAMS.md keeps the excerpt for the next investigation')
+    assert.equal((await readCursor(home)).lastDreamAt, undefined, 'the cursor does not advance')
+    console.log('ok 12 — a plain-text answer retries, then degrades visibly without touching either layer')
+  }
+
+  // 13. Parsing: fences are stripped, and a broken object still reports its cause.
+  {
+    assert.deepEqual(parseDreamOps('```json\n{"ops":[{"op":"rewrite","id":"U1","text":"t"}]}\n```'), [{ op: 'rewrite', id: 'U1', text: 't' }])
+    assert.deepEqual(parseDreamOps('```\n{"ops": []}\n```'), [], 'a bare fence is stripped too')
+    assert.throws(() => parseDreamOps(''), /holds no JSON object \(got: \(empty answer\)\)/, 'an empty answer names itself')
+    assert.throws(() => parseDreamOps('{"ops": [}'), /got: \{"ops": \[}/, 'a malformed object quotes its text')
+    assert.equal(answerPreview('  '), '(empty answer)')
+    assert.equal(answerPreview('a'.repeat(500)).length, 201, 'the excerpt is clipped with an ellipsis')
+    console.log('ok 13 — fenced JSON parses; an unparsable answer now carries its own excerpt')
   }
 } finally {
   await rm(root, { recursive: true, force: true })

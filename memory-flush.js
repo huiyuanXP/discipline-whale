@@ -181,6 +181,23 @@ export function buildFlushPrompt({ transcript, user = '', workspaces = [], now =
   return { system: FLUSH_SYSTEM, user: body.join('\n') }
 }
 
+/** Bound on the answer excerpt an error message carries, in characters. */
+export const ANSWER_PREVIEW_CHARS = 200
+
+/**
+ * The first `chars` characters of a model answer, for error messages.
+ *
+ * A reasoning model can spend its whole token budget on reasoning and stream no
+ * text at all, which reads as `''`. That case is spelled out instead of hidden,
+ * so the next failure proves its own cause without a debugger.
+ */
+export function answerPreview(text, chars = ANSWER_PREVIEW_CHARS) {
+  const body = String(text ?? '').replace(/\s+/g, ' ').trim()
+  if (body === '') return '(empty answer)'
+  const points = Array.from(body)
+  return points.length <= chars ? body : `${points.slice(0, chars).join('')}…`
+}
+
 /**
  * Pull the outermost JSON object out of a model answer.
  *
@@ -189,11 +206,19 @@ export function buildFlushPrompt({ transcript, user = '', workspaces = [], now =
  * @throws {SyntaxError} when the answer holds no parsable object.
  */
 export function extractJsonObject(text) {
-  const body = String(text ?? '').replace(/```[a-zA-Z]*/g, '')
+  const raw = String(text ?? '')
+  const body = raw.replace(/```[a-zA-Z]*/g, '')
   const start = body.indexOf('{')
   const end = body.lastIndexOf('}')
-  if (start === -1 || end <= start) throw new SyntaxError('model answer holds no JSON object')
-  const value = JSON.parse(body.slice(start, end + 1))
+  if (start === -1 || end <= start) {
+    throw new SyntaxError(`model answer holds no JSON object (got: ${answerPreview(raw)})`)
+  }
+  let value
+  try {
+    value = JSON.parse(body.slice(start, end + 1))
+  } catch (error) {
+    throw new SyntaxError(`${error instanceof Error ? error.message : String(error)} (got: ${answerPreview(raw)})`)
+  }
   if (value === null || typeof value !== 'object' || Array.isArray(value)) throw new SyntaxError('model answer is not a JSON object')
   return value
 }

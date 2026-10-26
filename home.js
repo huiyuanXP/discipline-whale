@@ -49,6 +49,7 @@ import { storeRoot, whaleHomeDir } from './store.js'
 import { registerVoiceRoutes } from './voice.js'
 import { registerVoiceSettingsRoutes } from './voice-settings.js'
 import { registerVoiceAssetRoutes } from './voice-assets.js'
+import { publishTokenHandoff, registerTokenHandoffRoute } from './token-handoff.js'
 
 /** Route the Web sidebar entry reads and writes. */
 export const HOME_ROUTE = '/api/discipline-whale/home'
@@ -234,6 +235,29 @@ export function apply(ctx) {
     // must still work off the 0600 plugin file and the environment there.
     // `ctx.get` never throws for a missing service, so this is a plain read.
     const credentials = typeof ctx.get === 'function' ? ctx.get('credentials') : undefined
+    // A 401 page cannot repair itself: the document never loads, so no plugin
+    // script runs. Hand it two things instead — an unauthenticated route that
+    // reports THIS process's launch URL, and a stable file at
+    // `$DSH_HOME/logs/last-token-url.txt` for a person to read. Both carry the
+    // token `dsh web` already prints, so no new secret is exposed; see
+    // `docs/restart-and-token.md`. Registered before the authenticated routes
+    // so a broken cookie still has somewhere to ask.
+    try {
+      const origin = c.webServer.getOrigin()
+      // `authenticatedUrl` is the connection's own public API: it appends this
+      // process's launch token to the base URL the listener actually bound.
+      const launchUrl = c.connection.authenticatedUrl(origin)
+      const home = storeRoot()
+      publishTokenHandoff({ dshHome: home, url: launchUrl, logger: ctx.logger }).catch(() => {})
+      ctx.effect(
+        () => registerTokenHandoffRoute(c.webServer, { url: () => launchUrl, logger: ctx.logger }),
+        'discipline-whale: auth handoff route',
+      )
+    } catch (error) {
+      // A profile without a bound listener (or one whose origin cannot be
+      // expressed as a URL) simply gets no handoff route; nothing else changes.
+      ctx.logger?.warn?.(`discipline-whale: could not publish the auth handoff: ${error?.message ?? error}`)
+    }
     // Voice rides this same connection: transcription on one route, the
     // transcript handed to the recorded main session on another, and the
     // settings pair (read/write the key-free description, probe the backend).

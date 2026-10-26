@@ -37,7 +37,7 @@ import {
   sectionEntries,
   withSource,
 } from './entry.js'
-import { extractJsonObject, MEMORY_STATE_DIRNAME, readCursor, writeCursor } from './memory-flush.js'
+import { answerPreview, extractJsonObject, MEMORY_STATE_DIRNAME, readCursor, writeCursor } from './memory-flush.js'
 import { dataDir, whaleHomeDir } from './store.js'
 
 /** Character budgets of the two layers dream rewrites. */
@@ -270,6 +270,37 @@ export function parseDreamOps(text) {
   const ops = value.ops ?? []
   if (!Array.isArray(ops)) throw new TypeError('"ops" must be an array')
   return ops
+}
+
+/** How many attempts one dream makes at the model before it degrades. */
+export const DREAM_ATTEMPTS = 2
+
+/**
+ * Ask the model for ops, retrying once when the answer does not parse.
+ *
+ * A reasoning route can spend its whole `maxTokens` budget on reasoning and
+ * stream no text, and the second ask usually answers: the retry turns a silent
+ * `mode: error` into a landed dream. A parse or type failure is the only thing
+ * retried — a transport error propagates, since asking again will not help.
+ *
+ * @returns {Promise<{ ops: Array<object>, answers: string[] }>} the parsed ops and every raw answer.
+ * @throws the last parse/type error once every attempt has failed.
+ */
+async function askDreamOps({ complete, prompt, signal, attempts = DREAM_ATTEMPTS }) {
+  const answers = []
+  let lastError
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    const answer = await complete({ ...prompt, signal })
+    answers.push(String(answer ?? ''))
+    try {
+      return { ops: parseDreamOps(answer), answers }
+    } catch (error) {
+      const retryable = error instanceof SyntaxError || error instanceof TypeError
+      lastError = error
+      if (!retryable || attempt === attempts) break
+    }
+  }
+  throw lastError
 }
 
 /** Distinct sources of several entries, in order, joined with ', '. */
@@ -614,7 +645,10 @@ export async function runDream({ homeDir, complete, store, now = new Date(), wor
     const cardList = ids.map((id) => ({ id, title: titles.get(id), intro: cards[id]?.intro ?? '' }))
 
     const prompt = buildDreamPrompt({ user: userLayer.text, memory: memoryLayer.text, workspaces: cardList, daily, now })
-    const ops = parseDreamOps(await complete({ ...prompt, signal }))
+    const { ops, answers } = await askDreamOps({ complete, prompt, signal })
+    for (let index = 0; index < answers.length - 1; index += 1) {
+      log.push(`attempt ${index + 1} unparsable, asked again: ${answerPreview(answers[index])}`)
+    }
     const before = { user: userLayer.text, memory: memoryLayer.text }
     const after = applyDreamOps({ ...before, daily, ops, now })
     const gates = checkGates({ before, after, ops })
@@ -680,8 +714,13 @@ export async function runDream({ homeDir, complete, store, now = new Date(), wor
   } catch (error) {
     result.ok = false
     result.mode = 'error'
+    // A dream that consolidated nothing degrades visibly: both layers are left
+    // exactly as they were, the cursor stays put so the next idle check retries,
+    // and DREAMS.md says so in words instead of one bare error line.
+    result.degraded = true
     result.error = error instanceof Error ? `${error.name}: ${error.message}` : String(error)
     log.push(`error: ${result.error}`)
+    log.push('this dream consolidated nothing: USER.md and MEMORY.md are unchanged, the daily notes stay queued')
   } finally {
     try {
       await appendDreamLog(homeDir, now, [`mode: ${result.mode}; daily entries read: ${result.dailyEntries}`, ...log])

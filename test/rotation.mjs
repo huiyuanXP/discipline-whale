@@ -704,6 +704,60 @@ try {
     console.log('ok 8 — undelivered seed: state.json stays on the old segment; failed create or delivery holds auto-rotation off 10 minutes')
   }
 
+  // --- 9. a stale checkpoint written back after the rotation --------------
+  //
+  // The production timeline this pins: the manual rotation at 03:10:13Z
+  // retargeted the checkpoints, and 41 s later one of them was written back
+  // naming the OLD segment. The write-back is real (the worker row runs in its
+  // own plugin instance, so its in-memory dispatch still names the old
+  // segment), but it is harmless because routing resolves through the
+  // append-only lineage on every read — not through the checkpoint's field.
+  {
+    await resetData()
+    await writeState({ mainSessionId: 'main-old' })
+    const live = recordDispatch({
+      dispatchId: 'dispatch-stale',
+      mainSessionId: 'main-old',
+      workerSessionId: 'worker-stale',
+      workspaceId: WS.id,
+      workspaceTitle: WS.title,
+      startedAt: '2026-10-24T18:32:27.032Z',
+    })
+    await writeDispatchCheckpoint(root, 'worker-stale', live)
+    const staleCopy = { ...live }
+
+    const host = controller({ ids: ['main-next'] })
+    const rotated = await rotateMain({ sessionController: host, oldSessionId: 'main-old', reason: 'manual', root })
+    assert.equal(rotated.newSessionId, 'main-next')
+    assert.equal((await readDispatchCheckpoint(root, 'worker-stale')).mainSessionId, 'main-next', 'step 8 retargeted it')
+
+    // The write-back that production shows at 03:10:54Z.
+    await writeDispatchCheckpoint(root, 'worker-stale', staleCopy)
+    const stale = await readDispatchCheckpoint(root, 'worker-stale')
+    assert.equal(stale.mainSessionId, 'main-old', 'the disk copy really does go back to the old segment')
+
+    // Harmless: every reader resolves that id through the lineage.
+    assert.equal(await currentMainFor('main-old', root), 'main-next', 'a report still lands on the new segment')
+    const state = await readState()
+    assert.deepEqual(state.lineage.map((entry) => entry.sessionId), ['main-old'], 'the old segment stays in the lineage')
+
+    // The guarantee this rests on: the lineage is append-only. `recentLineage`
+    // trims only the HTTP response, never the stored state, so a second
+    // rotation keeps the first old segment resolvable too.
+    const second = controller({ ids: ['main-third'] })
+    await rotateMain({
+      sessionController: second,
+      oldSessionId: 'main-next',
+      reason: 'manual',
+      root,
+      now: () => new Date(Date.now() + 60_000),
+    })
+    assert.deepEqual((await readState()).lineage.map((entry) => entry.sessionId), ['main-old', 'main-next'])
+    assert.equal(await currentMainFor('main-old', root), 'main-third', 'two segments back still resolves')
+    assert.equal(await currentMainFor('main-next', root), 'main-third')
+    console.log('ok 9 — a stale checkpoint written back after the rotation is harmless: routing resolves through the append-only lineage')
+  }
+
   console.log('All rotation checks passed.')
 } finally {
   clearStoreRoot()

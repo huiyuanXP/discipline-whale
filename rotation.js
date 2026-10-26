@@ -745,6 +745,20 @@ export async function rotateMain({
     }
 
     // 8. Pending dispatches now answer to the new segment.
+    //
+    // This retarget is a convenience, not the correctness guarantee. The worker
+    // row runs in its own plugin instance with its own in-memory dispatch, so it
+    // can write a checkpoint naming the OLD segment back to disk after this loop
+    // ran (observed in production: the manual rotation at 03:10:13Z retargeted,
+    // and at 03:10:54Z one still-running dispatch's checkpoint named the old
+    // segment again). Nothing breaks, because every reader resolves the recorded
+    // id through the append-only `state.lineage` — `currentMainFor` in the
+    // worker's push path and `resolveMainTarget` behind it. The cost of a stale
+    // field is one extra lineage lookup per report; the moment it would matter
+    // is a truncated lineage, which `recentLineage` does only on the HTTP
+    // response and never on disk. `test/rotation.mjs` ok 9 pins this: a
+    // write-back of the old segment still delivers to the new one, two
+    // rotations deep.
     for (const record of await listDispatchCheckpoints(root)) {
       if (record.mainSessionId !== oldSessionId) continue
       await writeDispatchCheckpoint(root, record.workerSessionId, { ...record, mainSessionId: newSessionId }).catch((error) =>

@@ -289,7 +289,11 @@ try {
   const forced = await h.tools.get('dream_now').execute({}, { agent })
   assert.equal(forced.ok, true)
   assert.match(await readFile(join(whaleHomeDir(root), 'memory', 'DREAMS.md'), 'utf8'), /no changes/)
-  console.log('ok 9 — the idle dream waits until due; dream_now runs it')
+  // A reasoning route spends the budget on reasoning first: 4096 left the answer
+  // empty ("model answer holds no JSON object", 18 dreams in a row on 2026-10-25).
+  const dreamCall = h.llmCalls[h.llmCalls.length - 1]
+  assert.ok(dreamCall.maxTokens >= 16384, `the dream call leaves room to reason and answer, got ${dreamCall.maxTokens}`)
+  console.log('ok 9 — the idle dream waits until due; dream_now runs it with room to reason')
 
   // 10
   const routes = memoryRoutesHandler({ workspaces: () => workspaces, root: () => root })
